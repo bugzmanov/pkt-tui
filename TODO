@@ -1,0 +1,56 @@
+Features
+ [x] Better stats
+ [x] Search by tags
+ [x] Date jumps
+ [x] quick manual title rename
+ [x] refresh on shift-q
+ [x] Show all items for the same youtube channel/site/creator
+ [x] Help Screen
+ [x] logo
+ [x] On-boarding on clean state
+   [x] Auth token retrieval
+   [x] first snapshot download
+ [ ] Hide archieved by default (Figure out design for archived, deleted and favourite)
+     [ ] Local archieve of the actual articles/videos and fuzzy search in archieves
+     [ ] integration with yt-dlp
+     [ ] PDFs title parser
+ [ ] Fuzzy search
+ [ ] Figure out viewport parameters automatically (instead of current hardcode)
+ [ ] Command mode ":" like in vim
+     [ ] display modes: don't show favs & reads, show top only, etc
+ [ ] Save marks
+ [ ] sneaky jumps
+ BIG:
+   [ ] rss feed
+
+Tech Dept:
+ [ ] Proper exit instead of panic
+ [ ] Error handling
+ [ ] Logging of http requests
+ [ ] Integration tests (oof)
+
+
+Low priority:
+ [ ] Enable mouse for jumps and copy-pasting
+ [ ] /search should jump not filter(maybe)
+ [ ] Status line
+ [ ] "In-progress" for long running stuff
+ [ ] Item stats: video length, article length, PDF pages
+ [ ] copy-paste
+ [ ] record notes (using nvim)
+ [ ] article preview of the article
+
+Bugs:
+ [ ] Filter and search behaviour '/' is somewhat confusing
+ [ ] Weekly starts shows no data in a blank state mode - when delta is empty.
+     The counters for added items might use ts from snapshots
+ [ ] Dup rows in delta
+ [ ] Scroll state shows bogus info for the main window
+ [ ] articles with title "[empty]" panics when trying to open then up
+ [ ] adding completely new tag in pocket-web to an article doesn't update it in  pocket-tui after refresh
+     (i.e. update is being lost somewhere)
+
+ideas:
+- tui UI designer
+- replicate pkt-tui as a website (wasm?)
+- sync TODO list file with github project (using github actions?)

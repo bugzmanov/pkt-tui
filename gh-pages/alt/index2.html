@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Terminal UI Feed</title>
+    <style>
+        body {
+            background-color: #1a2027;
+            color: #c5c8c6;
+            font-family: 'Menlo', 'Monaco', monospace;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        .date {
+            color: #969896;
+        }
+        .tag {
+            color: #87c38a;
+            font-style: italic;
+        }
+        .tag-label {
+            color: #969896;
+        }
+        .title {
+            color: #c5c8c6;
+            text-decoration: none;
+        }
+        .title:hover {
+            text-decoration: underline;
+        }
+        .entry {
+            margin: 10px 0;
+        }
+        .stats {
+            float: right;
+            color: #969896;
+        }
+        .command-bar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background-color: #1a2027;
+            padding: 10px;
+            border-top: 1px solid #373b41;
+        }
+        .star {
+            color: #f0c674;
+        }
+        a {
+            color: inherit;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="entry">
+            <span class="date">2025-01-30</span>
+            <div>
+                <a href="#" class="title">How we accidentally built a better build system for OCaml</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">ocaml</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <a href="#" class="title">Balaraman Ravindran - Reinforcement Learning (NPTEL Courses)</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">courses, math, ml, read</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <a href="#" class="title">Give Engineers Problems, Not Solutions - ACM Queue</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">sw engineering</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <span>&gt;</span>
+                <a href="#" class="title">Deep Specifications and Certified Abstraction Layers</a><br>
+                <span class="tag-label">[pdf]:</span> <span class="tag">read, sw engineering</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <a href="#" class="title">Adversarial Misuse of Generative AI | Google Cloud Blog</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">ml</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <span class="date">2025-01-29</span>
+            <span class="stats">Text: 7 | PDFs: 0 | Vids: 1</span>
+            <div>
+                <a href="#" class="title">Why reasoning models will generalize</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">ml</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <a href="#" class="title">Clojure in product. Would you do it again? Episode 7. Nathan Marz, Red Plan</a><br>
+                <span class="tag-label">[video]:</span> <span class="tag">podcast</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <a href="#" class="title">The missing tier for query compilers</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">languages</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <a href="#" class="title">Import AI 397: DeepSeek means AI proliferation is guaranteed; maritime ward</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">ml</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <a href="#" class="title">Writing a .NET Garbage Collector in C# - Part 1</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">languages, lowlevel</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <a href="#" class="title">In Zig, What's a Writer?</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">zig</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <span class="star">★</span>
+                <a href="#" class="title">Data-oriented design for functional programmers</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">functional programming, top</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <a href="#" class="title">Architecture Weekly #153</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">distributed systems, list</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <span class="date">2025-01-28</span>
+            <span class="stats">Text: 2 | PDFs: 1 | Vids: 3</span>
+            <div>
+                <a href="#" class="title">Gamedev in Zig is actually pretty good... - YouTube</a><br>
+                <span class="tag-label">[video]:</span> <span class="tag">games, zig</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="command-bar">
+        (ZZ) quit | gg/G/j/k - start,end,↓,↑ | z - tags, i - types
+    </div>
+</body>
+</html>

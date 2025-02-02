@@ -1,0 +1,27 @@
+
+  ┌─ Navigation ─────────────────┐  ┌─ Actions ───────────────────┐
+  │ j/k, ↑/↓    Move selection   │  │ Enter    Open in browser    │
+  │ Ctrl+d      Page down        │  │ t/T      Toggle "top" tag   │
+  │ Ctrl+u      Page up          │  │ f/F      Favorite & archive │
+  │ gg          Jump to start    │  │ d        Delete article     │
+  │ G           Jump to end      │  │ r/R      Rename article     │
+  │ gd          Jump to date     │  │ Q        Refresh data       │
+  └──────────────────────────────┘  └─────────────────────────────┘
+                                                                   
+  ┌─ Filters ────────────────────┐  ┌─ Item Indicators ───────────┐
+  │ /     Search title/URL       │  │ ⭐      Top article         │
+  │ z     Show tags popup        │  │ [dim]   Read article        │
+  │ i     Filter by type         │  │ Day stats shown per group   │
+  │ s     Filter by domain       │  └─────────────────────────────┘
+  │ S     Domain statistics      │                                 
+  │ Esc   Clear filter           │  ┌─ Document Types ────────────┐
+  └──────────────────────────────┘  │ 1 - All Items               │
+                                    │ 2 - Articles                │
+  ┌─ Tag Popup ──────────────────┐  │ 3 - Videos                  │
+  │ j/k      Move selection      │  │ 4 - PDFs                    │
+  │ Enter    Apply tag filter    │  └─────────────────────────────┘
+  │ Type     Filter tags         │                                 
+  │ Esc      Exit popup          │  ┌─ Exit ──────────────────────┐
+  └──────────────────────────────┘  │ ZZ    Save and quit         │
+                                    └─────────────────────────────┘
+  

@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Terminal UI Feed with Tags</title>
+    <style>
+        body {
+            background-color: #1a2027;
+            color: #c5c8c6;
+            font-family: 'Menlo', 'Monaco', monospace;
+            padding: 20px;
+            line-height: 1.6;
+            position: relative;
+        }
+        .date {
+            color: #969896;
+        }
+        .tag {
+            color: #87c38a;
+            font-style: italic;
+        }
+        .tag-label {
+            color: #969896;
+        }
+        .title {
+            color: #c5c8c6;
+            text-decoration: none;
+        }
+        .title:hover {
+            text-decoration: underline;
+        }
+        .entry {
+            margin: 10px 0;
+        }
+        .stats {
+            float: right;
+            color: #969896;
+        }
+        .command-bar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background-color: #1a2027;
+            padding: 10px;
+            border-top: 1px solid #373b41;
+        }
+        .star {
+            color: #f0c674;
+        }
+        .modal-overlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: #1a2027;
+            border: 1px solid #373b41;
+            padding: 10px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.5);
+            min-width: 300px;
+        }
+        .tag-count {
+            display: flex;
+            justify-content: space-between;
+            padding: 2px 5px;
+        }
+        .tag-count:hover {
+            background-color: #2d3239;
+        }
+        .highlight {
+            background-color: #2d3239;
+        }
+        .selected {
+            background-color: #4a4f57;
+        }
+        a {
+            color: inherit;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="entry">
+            <div>
+                <a href="#" class="title">Great Founder Theory by Samo Burja</a><br>
+                <span class="tag-label">[pdf]:</span> <span class="tag">book</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <div>
+                <a href="#" class="title">C stdlib isn't threadsafe and even safe Rust didn't save us</a><br>
+                <span class="tag-label">[article]:</span> <span class="tag">concurrency, lowlevel</span>
+            </div>
+        </div>
+
+        <div class="entry">
+            <span class="date">2025-01-23</span>
+            <span class="stats">Text: 4 | PDFs: 3 | Vids: 4</span>
+            <div>
+                <a href="#" class="title">Mock Interview with Shawn McGrath</a><br>
+                <span class="tag-label">[video]:</span> <span class="tag">read, sw engineering</span>
+            </div>
+        </div>
+
+        <div class="modal-overlay">
+            <div class="tag-count selected">
+                <span>architecture</span>
+                <span>159</span>
+            </div>
+            <div class="tag-count">
+                <span>art</span>
+                <span>2</span>
+            </div>
+            <div class="tag-count">
+                <span>benchmarking</span>
+                <span>3</span>
+            </div>
+            <div class="tag-count">
+                <span>book</span>
+                <span>39</span>
+            </div>
+            <div class="tag-count">
+                <span>business</span>
+                <span>13</span>
+            </div>
+            <div class="tag-count">
+                <span>clojure</span>
+                <span>34</span>
+            </div>
+            <div class="tag-count">
+                <span>concurrency</span>
+                <span>109</span>
+            </div>
+            <div class="tag-count">
+                <span>consensus</span>
+                <span>60</span>
+            </div>
+            <div class="tag-count">
+                <span>courses</span>
+                <span>62</span>
+            </div>
+            <div class="tag-count">
+                <span>crypto</span>
+                <span>1</span>
+            </div>
+            <div class="tag-count">
+                <span>database</span>
+                <span>412</span>
+            </div>
+            <div class="tag-count">
+                <span>datastructures</span>
+                <span>199</span>
+            </div>
+            <div class="tag-count">
+                <span>devlife</span>
+                <span>316</span>
+            </div>
+            <div class="tag-count">
+                <span>devops</span>
+                <span>18</span>
+            </div>
+            <div class="tag-count">
+                <span>distributed systems</span>
+                <span>504</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="command-bar">
+        (ZZ) quit | gg/G/j/k - start,end,↓,↑ | z - tags, i - types
+    </div>
+</body>
+</html>
