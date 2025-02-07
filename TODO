@@ -10,10 +10,10 @@ Features
  [x] On-boarding on clean state
    [x] Auth token retrieval
    [x] first snapshot download
- [ ] Hide archieved by default (Figure out design for archived, deleted and favourite)
+ [.] Hide archieved by default (Figure out design for archived, deleted and favourite)
      [ ] Local archieve of the actual articles/videos and fuzzy search in archieves
      [ ] integration with yt-dlp
-     [ ] PDFs title parser
+     [x] PDFs title parser
  [ ] Fuzzy search
  [ ] Figure out viewport parameters automatically (instead of current hardcode)
  [ ] Command mode ":" like in vim
@@ -26,7 +26,7 @@ Features
 Tech Dept:
  [ ] Proper exit instead of panic
  [ ] Error handling
- [ ] Logging of http requests
+ [ ] Logging of http requests/responses
  [ ] Integration tests (oof)
 
 

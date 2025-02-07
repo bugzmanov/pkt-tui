@@ -321,10 +321,16 @@ impl GetPocketSync {
             .context(format!("Faile to mark as read Item {}", item_id))
     }
 
+    pub fn mark_as_downloaded(&self, item_id: usize) -> Result<SendResponse> {
+        self.runtime
+            .block_on(self.get_pocket.add_tag(item_id, "downloaded"))
+            .context(format!("Failed to mark as downloaded Item {}", item_id))
+    }
+
     pub fn mark_as_top(&self, item_id: usize) -> Result<SendResponse> {
         self.runtime
             .block_on(self.get_pocket.add_tag(item_id, "top"))
-            .context(format!("Faile to mark as read Item {}", item_id))
+            .context(format!("Faile to mark as top Item {}", item_id))
     }
 
     pub fn unmark_as_top(&self, item_id: usize) -> Result<SendResponse> {

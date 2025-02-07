@@ -6,6 +6,7 @@ mod pocket;
 mod readingstats;
 pub mod storage;
 mod tokenstorage;
+mod utils;
 
 use anyhow::Context;
 use chrono::{DateTime, Local, Utc};
@@ -22,6 +23,7 @@ use log::{error, LevelFilter};
 use pocket::GetPocketSync;
 use ratatui::{prelude::*, widgets::*};
 use readingstats::{render_stats, TotalStats};
+use reqwest::blocking::Client;
 use serde_json::json;
 use std::{
     error::Error,
@@ -304,18 +306,25 @@ impl DocTypePopupState {
     }
 }
 
+enum LoadingType {
+    Refresh,
+    Download,
+}
+
 struct RefreshingPopup {
     text: String,
     was_redered: bool,
+    refresh_type: LoadingType,
     _last_update: Instant, //todo
 }
 
 impl RefreshingPopup {
-    fn new(text: String) -> Self {
+    fn new(text: String, refresh_type: LoadingType) -> Self {
         Self {
             text,
             was_redered: false,
             _last_update: Instant::now(),
+            refresh_type,
         }
     }
 }
@@ -416,6 +425,7 @@ enum AppMode {
     MulticharNormalModeEnter(String),
     CommandEnter(CommandEnterMode),
     Refreshing(RefreshingPopup),
+    Error(String),
 }
 
 struct FilteredItems<T> {
@@ -556,6 +566,7 @@ struct App {
     last_click_position: Option<(u16, u16)>,
     domain_stats_popup_state: Option<DomainStatsPopupState>,
     help_popup_state: Option<HelpPopupState>,
+    download_client: Client,
 }
 
 impl App {
@@ -584,7 +595,50 @@ impl App {
             last_click_position: None,
             domain_stats_popup_state: None,
             help_popup_state: None,
+            download_client: Client::new(),
         }
+    }
+
+    fn download_current_pdf(&mut self) -> anyhow::Result<()> {
+        if let Some(idx) = self.virtual_state.selected() {
+            if let Some(item) = self.items.get(idx) {
+                if item.item_type() == "pdf" {
+                    // Create pdfs directory if it doesn't exist
+                    fs::create_dir_all("pdfs")?;
+
+                    // Extract filename from URL
+                    let url = item.url();
+                    let filename = url
+                        .split('/')
+                        .last()
+                        .unwrap_or("download.pdf")
+                        .replace("%20", "_");
+
+                    // Construct full path
+                    let mut path = std::path::PathBuf::from("pdfs");
+                    path.push(&filename);
+
+                    // Download the file in a separate thread
+                    let download_url = url.to_string();
+                    let path_clone = path.clone();
+                    let client = self.download_client.clone();
+
+                    // thread::spawn(move || -> anyhow::Result<()> {
+                    let response = client.get(&download_url).send()?;
+                    let content = response.bytes()?;
+                    std::fs::write(path_clone, content)?;
+                    //
+                    self.pocket_client
+                        .mark_as_downloaded(item.id().parse::<usize>()?)?;
+
+                    let pdf_info = utils::extract_pdf_title(path.as_path())?;
+                    if let Some(title) = pdf_info.and_then(|info| info.title) {
+                        self.rename_current_item(title)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn show_help_popup(&mut self) -> anyhow::Result<()> {
@@ -1334,10 +1388,30 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
             }
             AppMode::Refreshing(ref mut pop) => {
                 if pop.was_redered {
-                    app.refresh_data()?;
-                    app.switch_to_normal_mode();
+                    let refresh_result = match pop.refresh_type {
+                        LoadingType::Refresh => app.refresh_data(),
+                        LoadingType::Download => app.download_current_pdf(),
+                    };
+
+                    match refresh_result {
+                        Ok(_) => {
+                            app.switch_to_normal_mode();
+                        }
+                        Err(err) => {
+                            app.app_mode = AppMode::Error(err.to_string());
+                        }
+                    }
                 } else {
                     pop.was_redered = true;
+                }
+            }
+            AppMode::Error(err) => {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        if KeyCode::Esc == key.code {
+                            app.switch_to_normal_mode();
+                        }
+                    }
                 }
             }
         }
@@ -1637,9 +1711,23 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                             app.tag_popup_state = None;
                         }
                     }
+                    Char('w') => {
+                        if let Some(idx) = app.virtual_state.selected() {
+                            if let Some(item) = app.items.get(idx) {
+                                if item.item_type() == "pdf" {
+                                    app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
+                                        "Downloading pdf ⏳".to_string(),
+                                        LoadingType::Download,
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     Char('Q') => {
-                        app.app_mode =
-                            AppMode::Refreshing(RefreshingPopup::new("Refreshing ⏳".to_string()));
+                        app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
+                            "Refreshing ⏳".to_string(),
+                            LoadingType::Refresh,
+                        ));
                     }
                     Char('s') => {
                         app.filter_by_current_domain()?;
@@ -1679,6 +1767,10 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_domain_stats_popup(f, app, rects[0]);
 
     render_help_popup(f, app, rects[0]);
+
+    if let AppMode::Error(message) = &app.app_mode {
+        render_error_popup(f, message, f.size(), &app.colors);
+    }
 
     // After tag popup rendering, add:
     if let Some(doc_popup_state) = &app.doc_type_popup_state {
@@ -2083,10 +2175,48 @@ fn render_logo(f: &mut Frame, area: Rect) {
     f.render_widget(help_widget, popup_area);
 }
 
+fn render_error_popup(f: &mut Frame, message: &str, area: Rect, colors: &TableColors) {
+    let popup_area = centered_rect(60, 20, area);
+    f.render_widget(Clear, popup_area);
+
+    let text = Text::from(vec![
+        Line::from(vec![Span::styled(
+            "Error",
+            Style::default()
+                .fg(OCEANIC_NEXT.base_08)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            message,
+            Style::default().fg(colors.row_fg),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Press ESC to dismiss",
+            Style::default().fg(OCEANIC_NEXT.base_03),
+        )]),
+    ]);
+
+    let error_widget = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(OCEANIC_NEXT.base_08))
+                .border_type(BorderType::Rounded),
+        )
+        .style(Style::new().bg(Color::Black))
+        .alignment(Alignment::Center);
+
+    f.render_widget(error_widget, popup_area);
+}
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     match &app.app_mode {
         AppMode::Initialize => panic!("Should not get here!"),
-        AppMode::Normal | AppMode::MulticharNormalModeEnter(_) | AppMode::Refreshing(_) => {
+        AppMode::Normal
+        | AppMode::MulticharNormalModeEnter(_)
+        | AppMode::Refreshing(_)
+        | AppMode::Error(_) => {
             let is_filtered = app.selected_tag_filter.is_some()
                 || app.item_type_filter != ItemTypeFilter::All
                 || app.domain_filter.is_some()

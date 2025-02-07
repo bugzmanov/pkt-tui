@@ -1,5 +1,6 @@
 /target
 temp
+pdfs/
 log.txt
 snapshot_updates.db
 snapshot.db
