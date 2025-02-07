@@ -54,3 +54,5 @@ ideas:
 - tui UI designer
 - replicate pkt-tui as a website (wasm?)
 - sync TODO list file with github project (using github actions?)
+
+- study code: https://github.com/FedericoBruzzone/tgt/tree/main

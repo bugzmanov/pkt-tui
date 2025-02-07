@@ -125,9 +125,10 @@ pub fn render_stats(_today_stats: &Stats, week_stats: &Stats, _month_stats: &Sta
 
     let progress_bar =
         |label: &str, read: usize, added: usize, output: &mut String, draw_notch: bool| {
-            let progress_added =
-                "■".repeat(std::cmp::min(added, 45)) + &" ".repeat(0.max(30 - added)); // todo empty space should depend on screen size
-            let progress_read = "■".repeat(std::cmp::min(read, 45)) + &" ".repeat(0.max(30 - read)); //todo empty space should depend on screen size
+            let progress_added = "■".repeat(std::cmp::min(added, 45))
+                + &" ".repeat(0.max(30_usize.saturating_sub(added))); // todo empty space should depend on screen size
+            let progress_read = "■".repeat(std::cmp::min(read, 45))
+                + &" ".repeat(0.max(30_usize.saturating_sub(read))); //todo empty space should depend on screen size
             let notch = if draw_notch { "_" } else { " " };
             write!(
                 output,
