@@ -43,8 +43,8 @@ A feature-rich terminal user interface for managing your Pocket reading list wit
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/pocket-tui
-cd pocket-tui
+git clone https://github.com/bugzmanov/pkt-tui
+cd pkt-tui
 
 # Build and install
 cargo install --path .
