@@ -484,7 +484,9 @@ mod tests {
     #[tokio::test]
     async fn basic_pocket_tests() -> anyhow::Result<()> {
         let get_pocket = GetPocket::new(CONSUMER_KEY.to_string(), ACCESS_TOKEN.to_string());
-        let result = get_pocket.retrieve(Some("1709824779000")).await?;
+        let result = get_pocket
+            .retrieve(Some("1709824779000"), None, true)
+            .await?;
         // assert_eq!(format!("{:?}", result), "sss".to_string());
         Ok(())
     }
@@ -501,7 +503,9 @@ mod tests {
     #[tokio::test]
     async fn fetch_delta() -> anyhow::Result<()> {
         let get_pocket = GetPocket::new(CONSUMER_KEY.to_string(), ACCESS_TOKEN.to_string());
-        let result = get_pocket.retrieve(Some("1709824779000")).await?;
+        let result = get_pocket
+            .retrieve(Some("1709824779000"), None, true)
+            .await?;
         let path = Path::new("temp"); //file.as_ref();
         storage::append_to_delta(path, &result)?;
         Ok(())

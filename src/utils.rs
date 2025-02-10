@@ -1,6 +1,6 @@
 use anyhow::Context;
 use extractous::Extractor;
-use log::error;
+use log::{debug, error};
 use std::path::Path;
 
 pub struct PDFData {
@@ -18,12 +18,14 @@ pub fn extract_pdf_title(path: &Path) -> anyhow::Result<Option<PDFData>> {
         .unwrap();
 
     let mut title_opt: Option<String> = None;
-    if None == metadata.get("pdf:PDFVersio") {
+    if None == metadata.get("pdf:PDFVersion") {
+        error!("PDF Metadate that doesn't have PDFVersion: {:?}", metadata);
         return anyhow::Result::Err(anyhow::anyhow!(
             "No pdf metadata found. The file is not a pdf file."
         ));
     }
 
+    //todo: sometimes title metadata contains garbage
     if let Some(title) = metadata.get("dc:title") {
         title_opt = title
             .first()
@@ -44,9 +46,11 @@ pub fn extract_pdf_title(path: &Path) -> anyhow::Result<Option<PDFData>> {
         }
     }
 
-    error!(
-        "Meta: {:?},\nTitle: {:?},\nText: {:?}",
-        metadata, title_opt, text
+    debug!(
+        "PDF Meta: {:?},\nTitle: {:?},\nText: {:?}",
+        metadata,
+        title_opt,
+        &text[0..500]
     );
     // Ok(None)
 
@@ -57,10 +61,16 @@ pub fn extract_pdf_title(path: &Path) -> anyhow::Result<Option<PDFData>> {
 }
 
 fn extract_title(text: &str) -> Option<String> {
+    let min_words = 3;
+    let max_words = 50;
+
     let by_paragraphs = text
         .trim_start()
         .split("\n\n")
-        .find(|s| !s.trim().is_empty())
+        .find(|s| {
+            let words = s.split_whitespace().count();
+            words >= min_words && words <= max_words
+        })
         .map(|s| s.replace('\n', " ").trim().to_string());
 
     match by_paragraphs {

@@ -10,16 +10,29 @@ Features
  [x] On-boarding on clean state
    [x] Auth token retrieval
    [x] first snapshot download
- [.] Hide archieved by default (Figure out design for archived, deleted and favourite)
-     [ ] Local archieve of the actual articles/videos and fuzzy search in archieves
-     [ ] integration with yt-dlp
+ [x] replicate pkt-tui as a website - pkt-tui-web
+ [ ] Sharing snapshot file via icloud
+ [ ] "Bump to top" - old article that i think needs to be read sooner than later
+ [.] Figure out design for archived, deleted and favourite
+     [x] PDF downloads
+        [ ] Better file naming ?
      [x] PDFs title parser
+     [ ] Show/hide favourites/archived
+       [ ] Status line
+     [ ] index for fuzzy searching
+     [ ] Local archieve of the actual articles/videos and fuzzy search in archieves
+     [ ] VIDEO downloads - integration with yt-dlp
+     [ ] Articles downloads
  [ ] Fuzzy search
  [ ] Figure out viewport parameters automatically (instead of current hardcode)
  [ ] Command mode ":" like in vim
      [ ] display modes: don't show favs & reads, show top only, etc
  [ ] Save marks
  [ ] sneaky jumps
+ [ ] White papers domains (https://arxiv.org/ https://dl.acm.org/doi/) should mark item type as pdf
+    [ ] Downloading those becomes more painful
+ MEDIUM:
+   [ ] Tag editing
  BIG:
    [ ] rss feed
 
@@ -28,17 +41,20 @@ Tech Dept:
  [ ] Error handling
  [ ] Logging of http requests/responses
  [ ] Integration tests (oof)
-
+ [ ] Simplify App modes (some of popups represented both as a mode and status in App{})
 
 Low priority:
  [ ] Enable mouse for jumps and copy-pasting
  [ ] /search should jump not filter(maybe)
- [ ] Status line
  [ ] "In-progress" for long running stuff
  [ ] Item stats: video length, article length, PDF pages
  [ ] copy-paste
  [ ] record notes (using nvim)
  [ ] article preview of the article
+ [ ] release binaries on github
+ [ ] reading/watching time
+ [ ] related articles grouping
+ [ ] auto-tagging
 
 Bugs:
  [ ] Filter and search behaviour '/' is somewhat confusing
@@ -48,11 +64,15 @@ Bugs:
  [ ] Scroll state shows bogus info for the main window
  [ ] articles with title "[empty]" panics when trying to open then up
  [ ] adding completely new tag in pocket-web to an article doesn't update it in  pocket-tui after refresh
-     (i.e. update is being lost somewhere)
+    tags only from delta file are not being recorded as tags
+ [ ] Favouriting one of the latest items wont remove it from the list. After refresh - it will come back
+     - favourites in delta got inserted in the list as is
+ [ ] f and d are to close to each other - possible to fav article that was planning to delete
 
 ideas:
 - tui UI designer
-- replicate pkt-tui as a website (wasm?)
 - sync TODO list file with github project (using github actions?)
-
+- read ratatui docs about architecture and philosophy
 - study code: https://github.com/FedericoBruzzone/tgt/tree/main
+
+- tag cloud visualizer (might be fun to do in TUI)

@@ -5,23 +5,24 @@
   │ Ctrl+u      Page up          │  │ f/F      Favorite & archive │
   │ gg          Jump to start    │  │ d        Delete article     │
   │ G           Jump to end      │  │ r/R      Rename article     │
-  │ gd          Jump to date     │  │ Q        Refresh data       │
-  └──────────────────────────────┘  └─────────────────────────────┘
-                                                                   
-  ┌─ Filters ────────────────────┐  ┌─ Item Indicators ───────────┐
-  │ /     Search title/URL       │  │ ⭐      Top article         │
-  │ z     Show tags popup        │  │ [dim]   Read article        │
-  │ i     Filter by type         │  │ Day stats shown per group   │
-  │ s     Filter by domain       │  └─────────────────────────────┘
-  │ S     Domain statistics      │                                 
-  │ Esc   Clear filter           │  ┌─ Document Types ────────────┐
-  └──────────────────────────────┘  │ 1 - All Items               │
-                                    │ 2 - Articles                │
-  ┌─ Tag Popup ──────────────────┐  │ 3 - Videos                  │
-  │ j/k      Move selection      │  │ 4 - PDFs                    │
-  │ Enter    Apply tag filter    │  └─────────────────────────────┘
-  │ Type     Filter tags         │                                 
-  │ Esc      Exit popup          │  ┌─ Exit ──────────────────────┐
-  └──────────────────────────────┘  │ ZZ    Save and quit         │
+  │ gd          Jump to date     │  │ Q        Refresh data       │ 
+  └──────────────────────────────┘  │ w        Download pdf       │ 
+                                    └─────────────────────────────┘
+  ┌─ Filters ────────────────────┐                                                                 
+  │ /     Search title/URL       │  ┌─ Item Indicators ───────────┐
+  │ z     Show tags popup        │  │ ⭐      Top article         │
+  │ i     Filter by type         │  │ [dim]   Read article        │
+  │ s     Filter by domain       │  │ Day stats shown per group   │
+  │ S     Domain statistics      │  └─────────────────────────────┘
+  │ Esc   Clear filter           │                                 
+  └──────────────────────────────┘  ┌─ Document Types ────────────┐
+                                    │ 1 - All Items               │
+  ┌─ Tag Popup ──────────────────┐  │ 2 - Articles                │
+  │ j/k      Move selection      │  │ 3 - Videos                  │
+  │ Enter    Apply tag filter    │  │ 4 - PDFs                    │
+  │ Type     Filter tags         │  └─────────────────────────────┘
+  │ Esc      Exit popup          │                                 
+  └──────────────────────────────┘  ┌─ Exit ──────────────────────┐
+                                    │ ZZ    Save and quit         │
                                     └─────────────────────────────┘
   
