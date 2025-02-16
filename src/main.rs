@@ -22,6 +22,7 @@ use itertools::Itertools;
 use log::{error, LevelFilter};
 use pocket::GetPocketSync;
 use ratatui::{prelude::*, widgets::*};
+use rayon::prelude::*;
 use readingstats::{render_stats, TotalStats};
 use reqwest::blocking::Client;
 use rss::Channel;
@@ -32,6 +33,7 @@ use std::{
     io::{self, Write},
     ops::Range,
     path::Path,
+    sync::{Arc, Mutex},
     thread::{self},
     time::{Duration, Instant},
 };
@@ -179,12 +181,75 @@ trait TableRow {
     fn rename_title_to(&mut self, new_title: String);
 }
 
+mod hidden_items {
+    use std::collections::HashSet;
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, BufRead, BufReader, Write};
+    use std::path::Path;
+
+    const HIDDEN_ITEMS_FILE: &str = "hidden_rss_items.txt";
+
+    pub struct HiddenItems {
+        items: HashSet<String>,
+    }
+
+    impl HiddenItems {
+        pub fn new() -> Self {
+            Self {
+                items: HashSet::new(),
+            }
+        }
+
+        pub fn load() -> anyhow::Result<Self> {
+            let mut items = HashSet::new();
+
+            if Path::new(HIDDEN_ITEMS_FILE).exists() {
+                let file = File::open(HIDDEN_ITEMS_FILE)?;
+                let reader = BufReader::new(file);
+
+                for line in reader.lines() {
+                    let line = line?;
+                    if !line.trim().is_empty() {
+                        items.insert(line);
+                    }
+                }
+            }
+
+            Ok(Self { items })
+        }
+
+        // No need for full save, we'll just append new items
+        pub fn hide_item(&mut self, item_id: String) -> anyhow::Result<()> {
+            if !self.items.contains(&item_id) {
+                // Open file in append mode, create if doesn't exist
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(HIDDEN_ITEMS_FILE)?;
+
+                // Write the new item with a newline
+                writeln!(file, "{}", item_id)?;
+
+                // Add to our in-memory set
+                self.items.insert(item_id);
+            }
+            Ok(())
+        }
+
+        pub fn is_hidden(&self, item_id: &str) -> bool {
+            self.items.contains(item_id)
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RssFeedItem {
     pub title: String,
     pub link: String,
+    pub source: String,
     pub description: Option<String>,
     pub pub_date: Option<String>,
+    pub item_id: String, // Add this field
 }
 
 pub struct RssFeedPopupState {
@@ -192,56 +257,70 @@ pub struct RssFeedPopupState {
     pub selected_index: usize,
     pub scroll_offset: usize,
     pub visible_items: usize,
+    hidden_items: hidden_items::HiddenItems,
+    status_message: Option<(String, Instant)>, // Message and timestamp
 }
 
 impl RssFeedPopupState {
-    pub fn new(items: Vec<RssFeedItem>, visible_items: usize) -> Self {
-        Self {
+    pub fn new(mut items: Vec<RssFeedItem>, visible_items: usize) -> anyhow::Result<Self> {
+        let hidden_items = hidden_items::HiddenItems::load()?;
+        items.retain(|item| !hidden_items.is_hidden(&item.item_id));
+
+        Ok(Self {
             items,
             selected_index: 0,
             scroll_offset: 0,
             visible_items,
-        }
+            hidden_items,
+            status_message: None,
+        })
     }
 
     pub fn move_selection(&mut self, delta: isize) {
         let new_index = self.selected_index as isize + delta;
         self.selected_index = new_index.clamp(0, self.items.len() as isize - 1) as usize;
-
         if self.selected_index < self.scroll_offset {
             self.scroll_offset = self.selected_index;
         } else if self.selected_index >= self.scroll_offset + self.visible_items {
             self.scroll_offset = self.selected_index - self.visible_items + 1;
         }
     }
-}
+    pub fn hide_current_item(&mut self) -> anyhow::Result<()> {
+        if let Some(item) = self.items.get(self.selected_index) {
+            self.hidden_items.hide_item(item.item_id.clone())?;
+            self.items.remove(self.selected_index);
+            if self.selected_index >= self.items.len() && self.items.len() > 0 {
+                self.selected_index = self.items.len() - 1;
+            }
+        }
+        Ok(())
+    }
+    pub fn set_status(&mut self, message: String) {
+        self.status_message = Some((message, Instant::now()));
+    }
 
-pub async fn fetch_rss_feed() -> anyhow::Result<Vec<RssFeedItem>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    // Add method to handle adding current item to Pocket
+    pub fn add_current_to_pocket(&mut self, pocket_client: &GetPocketSync) -> anyhow::Result<()> {
+        if let Some(selected_item) = self.items.get(self.selected_index) {
+            // Add to Pocket
+            pocket_client.add(&selected_item.link)?;
 
-    let feed_content = client
-        .get("https://matklad.github.io/feed.xml")
-        .send()
-        .await?
-        .bytes()
-        .await?;
+            // Hide the item
+            self.hidden_items.hide_item(selected_item.item_id.clone())?;
 
-    let channel = Channel::read_from(&feed_content[..])?;
+            // Remove from current list
+            self.items.remove(self.selected_index);
+            if self.selected_index >= self.items.len() && self.items.len() > 0 {
+                self.selected_index = self.items.len() - 1;
+            }
 
-    let items = channel
-        .items()
-        .iter()
-        .map(|item| RssFeedItem {
-            title: item.title().unwrap_or("Untitled").to_string(),
-            link: item.link().unwrap_or("").to_string(),
-            description: item.description().map(String::from),
-            pub_date: item.pub_date().map(String::from),
-        })
-        .collect();
-
-    Ok(items)
+            // Set success message
+            self.set_status("✓ Added to Pocket successfully".to_string());
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("No item selected"))
+        }
+    }
 }
 
 struct ReadingStats {
@@ -667,6 +746,13 @@ impl App {
         }
     }
 
+    pub fn add_rss_item_to_pocket(&mut self) -> anyhow::Result<()> {
+        if let Some(popup_state) = &mut self.rss_feed_popup_state {
+            popup_state.add_current_to_pocket(&self.pocket_client)?;
+        }
+        Ok(())
+    }
+
     fn download_current_pdf(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
@@ -709,43 +795,141 @@ impl App {
         Ok(())
     }
 
+    fn format_pub_date(date_str: &str) -> Option<String> {
+        // Try to parse the RFC 2822 date format used by RSS feeds
+        if let Ok(datetime) = DateTime::parse_from_rfc2822(date_str) {
+            let utc_dt: DateTime<Utc> = datetime.to_utc();
+            Some(format!("{:?}", utc_dt)) // This will output in RFC 3339 format
+        } else {
+            error!("Failed to parse date: {}", date_str);
+            None
+        }
+    }
+
+    fn fetch_and_parse_feed(
+        client: &reqwest::blocking::Client,
+        url: &str,
+    ) -> anyhow::Result<Vec<RssFeedItem>> {
+        let response = client
+                .get(url)
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                )
+                .send()?;
+
+        if !response.status().is_success() {
+            error!("Failed to fetch {}: Status {}", url, response.status());
+            return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
+        }
+
+        let content = response.text()?;
+        error!("Successfully fetched {} bytes from {}", content.len(), url);
+
+        // Try parsing as Atom first
+        if let Ok(atom_feed) = atom_syndication::Feed::read_from(content.as_bytes()) {
+            let source_name = atom_feed.title().to_string();
+            return Ok(atom_feed
+                .entries()
+                .iter()
+                .map(|entry| {
+                    let item_id = format!("{}:{}", source_name, entry.id());
+                    RssFeedItem {
+                        title: entry.title().to_string(),
+                        link: entry
+                            .links()
+                            .first()
+                            .map(|l| l.href().to_string())
+                            .unwrap_or_default(),
+                        description: entry.content().and_then(|c| c.value()).map(String::from),
+                        pub_date: Some(
+                            entry
+                                .published()
+                                .unwrap_or_else(|| entry.updated())
+                                .to_string(),
+                        ),
+                        source: source_name.clone(),
+                        item_id,
+                    }
+                })
+                .collect());
+        }
+
+        // Try parsing as RSS
+        match rss::Channel::read_from(content.as_bytes()) {
+            Ok(rss_feed) => {
+                let source_name = rss_feed.title().to_string();
+                Ok(rss_feed
+                    .items()
+                    .iter()
+                    .map(|item| {
+                        let item_id = format!(
+                            "{}:{}",
+                            source_name,
+                            item.guid()
+                                .map(|g| g.value().to_string())
+                                .or_else(|| item.link().map(String::from))
+                                .unwrap_or_else(|| item.title().unwrap_or("unknown").to_string())
+                        );
+                        RssFeedItem {
+                            title: item.title().unwrap_or("Untitled").to_string(),
+                            link: item.link().unwrap_or_default().to_string(),
+                            description: item.description().map(String::from),
+                            pub_date: item
+                                .pub_date()
+                                .and_then(|date| Self::format_pub_date(&date))
+                                .or(item.pub_date().map(String::from)),
+                            source: source_name.clone(),
+                            item_id,
+                        }
+                    })
+                    .collect())
+            }
+            Err(e) => {
+                error!("Failed to parse feed from {}: {}", url, e);
+                Err(anyhow::anyhow!("Invalid feed format: {}", e))
+            }
+        }
+    }
+
     pub fn show_rss_feed_popup(&mut self) -> anyhow::Result<()> {
-        let visible_items = 20;
+        let visible_items = 33;
+        let feeds = vec![
+            "https://matklad.github.io/feed.xml",
+            "https://buttondown.com/hillelwayne/rss",
+            "https://jack-vanlightly.com/blog?format=rss",
+            "https://johnnysswlab.com/rss",
+            // "https://notes.eatonphil.com/rss.xml",
+            "https://magazine.sebastianraschka.com/feed",
+        ];
 
-        // For now, we'll use blocking request since the app is currently sync
-        let items = reqwest::blocking::Client::builder()
+        // Create a client with reasonable defaults
+        let client = reqwest::blocking::ClientBuilder::new()
             .timeout(Duration::from_secs(10))
-            .build()?
-            .get("https://matklad.github.io/feed.xml")
-            .send()?
-            .text()?;
+            .build()?;
 
-        error!("{}", items);
+        let results = Arc::new(Mutex::new(Vec::new()));
 
-        // let channel = Channel::read_from(&items[..])?;
-        let feed = atom_syndication::Feed::read_from(items.as_bytes())?;
-        let feed_items: Vec<RssFeedItem> = feed
-            .entries()
-            .iter()
-            .map(|entry| RssFeedItem {
-                title: entry.title().to_string(),
-                link: entry
-                    .links()
-                    .first()
-                    .map(|l| l.href().to_string())
-                    .unwrap_or_default(),
-                description: entry.content().and_then(|c| c.value()).map(String::from),
-                pub_date: Some(
-                    entry
-                        .published()
-                        .unwrap_or_else(|| entry.updated())
-                        .to_string(),
-                ),
-            })
-            .collect();
+        feeds.par_iter().for_each(|url| {
+            match Self::fetch_and_parse_feed(&client, url) {
+                Ok(items) => {
+                    if let Ok(mut results_guard) = results.lock() {
+                        results_guard.extend(items);
+                    }
+                }
+                Err(e) => error!("Error fetching {}: {}", url, e),
+            }
+            // Small delay between requests
+            std::thread::sleep(Duration::from_millis(100));
+        });
 
-        error!("RSS added : {}", feed_items.len());
-        self.rss_feed_popup_state = Some(RssFeedPopupState::new(feed_items, visible_items));
+        let mut all_items = if let Ok(results_guard) = results.lock() {
+            results_guard.to_vec()
+        } else {
+            Vec::new()
+        };
+
+        self.rss_feed_popup_state = Some(RssFeedPopupState::new(all_items, visible_items)?);
         Ok(())
     }
 
@@ -1766,6 +1950,18 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                 match key.code {
                     Char('j') | Down => popup_state.move_selection(1),
                     Char('k') | Up => popup_state.move_selection(-1),
+                    KeyCode::Char('d') => {
+                        popup_state.hide_current_item()?;
+                        return Ok(());
+                    }
+                    Char('a') => {
+                        if let Err(e) = app.add_rss_item_to_pocket() {
+                            if let Some(popup_state) = &mut app.rss_feed_popup_state {
+                                popup_state.set_status(format!("Error: {}", e));
+                            }
+                        }
+                        return Ok(());
+                    }
                     Enter => app.handle_rss_feed_selection()?,
                     Esc => app.rss_feed_popup_state = None,
                     _ => {}
@@ -2346,28 +2542,46 @@ fn render_error_popup(f: &mut Frame, message: &str, area: Rect, colors: &TableCo
     f.render_widget(error_widget, popup_area);
 }
 
-pub fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(popup_state) = &app.rss_feed_popup_state {
         let popup_area = centered_rect(80, 80, area);
         f.render_widget(Clear, popup_area);
+        // Calculate areas for main content and status bar
+        let chunks = Layout::vertical([
+            Constraint::Min(3),    // Main content
+            Constraint::Length(1), // Status bar
+        ])
+        .split(popup_area);
+        // Group items by source and count them
+        let mut source_counts = std::collections::HashMap::new();
+        for item in &popup_state.items {
+            *source_counts.entry(&item.source).or_insert(0) += 1;
+        }
+
+        // Keep track of which sources we've seen while rendering
+        let mut seen_sources = std::collections::HashSet::new();
 
         let items: Vec<ListItem> = popup_state
             .items
             .iter()
+            .skip(popup_state.scroll_offset)
+            .take(popup_state.visible_items)
             .enumerate()
             .map(|(i, item)| {
-                let source_column = if i == 0 {
-                    // Show source info only for the first row
-                    format!("{:<20}", "matklad's blog (1)")
+                // Show source info only if we haven't seen this source yet
+                let source_column = if !seen_sources.contains(&item.source) {
+                    seen_sources.insert(&item.source);
+                    let count = source_counts.get(&item.source).unwrap_or(&0);
+                    format!(" {} ({})", item.source, count)
                 } else {
-                    format!("{:<20}", "")
+                    String::new()
                 };
 
                 let date_and_title = if let Some(pub_date) = &item.pub_date {
                     vec![
                         Span::styled(
                             format!("{:<10}", &pub_date[0..10]),
-                            Style::default().fg(OCEANIC_NEXT.base_03), // Gray color for date
+                            Style::default().fg(OCEANIC_NEXT.base_03), // Gray for date
                         ),
                         Span::raw(": "),
                         Span::styled(
@@ -2386,14 +2600,23 @@ pub fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
                     ]
                 };
 
-                let content = Line::from(vec![
-                    Span::raw(source_column),
-                    Span::raw("│ "), // Table separator
-                ]);
+                let source_span = Span::styled(
+                    format!("{:<25}", source_column),
+                    Style::default().fg(OCEANIC_NEXT.base_0d), // Distinct color for source
+                );
 
-                let content = Line::from([content.spans, date_and_title].concat());
+                let content = Line::from(
+                    [
+                        vec![
+                            source_span,
+                            Span::raw("│ "), // Table separator
+                        ],
+                        date_and_title,
+                    ]
+                    .concat(),
+                );
 
-                let style = if i == popup_state.selected_index {
+                let style = if i + popup_state.scroll_offset == popup_state.selected_index {
                     Style::default().fg(Color::Black).bg(Color::White)
                 } else {
                     Style::default()
@@ -2424,59 +2647,24 @@ pub fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
             ScrollbarState::new(popup_state.items.len()).position(popup_state.scroll_offset);
 
         f.render_stateful_widget(scrollbar, popup_area, &mut scroll_state);
+
+        if let Some((message, timestamp)) = &popup_state.status_message {
+            if timestamp.elapsed() < Duration::from_secs(5) {
+                // Show message for 5 seconds
+                let status_text = Text::from(Line::from(vec![Span::styled(
+                    message,
+                    Style::default().fg(OCEANIC_NEXT.base_0b), // Green for success
+                )]));
+
+                let status_widget = Paragraph::new(status_text)
+                    .style(Style::default().bg(Color::Black))
+                    .alignment(Alignment::Center);
+
+                f.render_widget(status_widget, chunks[1]);
+            }
+        }
     }
 }
-
-// pub fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
-//     if let Some(popup_state) = &app.rss_feed_popup_state {
-//         let popup_area = centered_rect(80, 80, area);
-//         f.render_widget(Clear, popup_area);
-
-//         let items: Vec<ListItem> = popup_state
-//             .items
-//             .iter()
-//             // .skip(popup_state.scroll_offset)
-//             // .take(popup_state.visible_items)
-//             .enumerate()
-//             .map(|(i, item)| {
-//                 let content = if let Some(pub_date) = &item.pub_date {
-//                     format!("{}: {}\n", &pub_date[0..10], item.title,)
-//                 } else {
-//                     format!("{}: {}", "dateunknwn", item.title,)
-//                 };
-
-//                 let style = if i + popup_state.scroll_offset == popup_state.selected_index {
-//                     Style::default().fg(Color::Black).bg(Color::White)
-//                 } else {
-//                     Style::default().fg(app.colors.row_fg)
-//                 };
-
-//                 ListItem::new(Text::from(content)).style(style)
-//             })
-//             .collect();
-//         let feed_list = List::new(items)
-//             .block(
-//                 Block::default()
-//                     .borders(Borders::ALL)
-//                     .title(" matklad's Blog Feed ")
-//                     .border_style(Style::new().fg(app.colors.footer_border_color))
-//                     .border_type(BorderType::Rounded),
-//             )
-//             .style(Style::new().bg(Color::Black));
-
-//         f.render_widget(feed_list, popup_area);
-
-//         let scrollbar = Scrollbar::default()
-//             .orientation(ScrollbarOrientation::VerticalRight)
-//             .begin_symbol(Some("↑".into()))
-//             .end_symbol(Some("↓".into()));
-
-//         let mut scroll_state =
-//             ScrollbarState::new(popup_state.items.len()).position(popup_state.scroll_offset);
-
-//         f.render_stateful_widget(scrollbar, popup_area, &mut scroll_state);
-//     }
-// }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     match &app.app_mode {

@@ -108,6 +108,15 @@ impl GetPocket {
         }
     }
 
+    pub async fn add(&self, url: &str) -> Result<SendResponse> {
+        self.send(json!([{
+            "action": "add",
+            "url": url,
+            "timestamp": chrono::Utc::now().timestamp().to_string()
+        }]))
+        .await
+    }
+
     async fn send<T>(&self, params: T) -> Result<SendResponse>
     where
         T: Serialize,
@@ -343,6 +352,11 @@ impl GetPocketSync {
         self.runtime
             .block_on(self.get_pocket.fav_and_archive(item_id))
             .context(format!("Faile to fav_and_archive an Item {}", item_id))
+    }
+    pub fn add(&self, url: &str) -> Result<SendResponse> {
+        self.runtime
+            .block_on(self.get_pocket.add(url))
+            .context(format!("Failed to add URL: {}", url))
     }
 
     //todo: this might blow up if pocket list size is very long
