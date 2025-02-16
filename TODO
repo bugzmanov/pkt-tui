@@ -11,6 +11,8 @@ Features
    [x] Auth token retrieval
    [x] first snapshot download
  [x] replicate pkt-tui as a website - pkt-tui-web
+ [ ] MEDIUM: Tag editing
+   [ ] it should be possible to recotegorize article type
  [ ] Sharing snapshot file via icloud
  [ ] "Bump to top" - old article that i think needs to be read sooner than later
  [.] Figure out design for archived, deleted and favourite
@@ -31,8 +33,6 @@ Features
  [ ] sneaky jumps
  [ ] White papers domains (https://arxiv.org/ https://dl.acm.org/doi/) should mark item type as pdf
     [ ] Downloading those becomes more painful
- MEDIUM:
-   [ ] Tag editing
  BIG:
    [ ] rss feed
 
@@ -68,6 +68,13 @@ Bugs:
  [ ] Favouriting one of the latest items wont remove it from the list. After refresh - it will come back
      - favourites in delta got inserted in the list as is
  [ ] f and d are to close to each other - possible to fav article that was planning to delete
+ [ ] PDF parsers: Sometimes meta-title contains garbage. meanwhile normal title can and should be parsed from the text:
+    http://www.rdrop.com/users/paulmck/RCU/hart_ipdps06.pdf
+    PDF Meta: {"access_permission:fill_in_form": ["true"], "X-TIKA:Parsed-By": ["org.apache.tika.parser.DefaultParser", "org.apache.tika.parser.pdf.PDFParser"], "access_permission:extract_content": ["true"], "pdf:docinfo:created": ["2006-05-05T19:07:28Z"], "X-TIKA:EXCEPTION:write_limit_reached": ["true"], "access_permission:extract_for_accessibility": ["true"], "pdf:unmappedUnicodeCharsPerPage": ["1", "0"], "pdf:docinfo:title": ["untitled"], "dc:title": ["untitled"], "Content-Type": ["application/pdf"], "access_permission:assemble_document": ["true"], "pdf:hasXMP": ["false"], "pdf:docinfo:modified": ["2006-05-05T19:07:28Z"], "X-TIKA:Parsed-By-Full-Set": ["org.apache.tika.parser.DefaultParser", "org.apache.tika.parser.pdf.PDFParser"], "Content-Length": ["494436"], "pdf:hasMarkedContent": ["false"], "pdf:charsPerPage": ["3225", "3141"], "resourceName": ["hart_ipdps06.pdf"], "dcterms:created": ["2006-05-05T19:07:28Z"], "pdf:docinfo:producer": ["Mac OS X 10.4.6 Quartz PDFContext"], "access_permission:modify_annotations": ["true"], "xmpTPg:NPages": ["10"], "access_permission:can_modify": ["true"], "dcterms:modified": ["2006-05-05T19:07:28Z"], "dc:format": ["application/pdf; version=1.3"], "pdf:PDFVersion": ["1.3"], "access_permission:can_print_degraded": ["true"], "access_permission:can_print": ["true"], "pdf:encrypted": ["false"], "pdf:hasCollection": ["false"], "pdf:producer": ["Mac OS X 10.4.6 Quartz PDFContext"], "pdf:hasXFA": ["false"]},
+    Title: Some("untitled"),
+    Text: "\nMaking Lockless Synchronization Fast:\nPerformance Implications of Memory Reclamation\n\nThomas E. Hart1∗, Paul E. McKenney2, and Angela Demke Brown1\n\n1University of Toronto 2IBM Beaverton\nDept. of Computer Science Linux Technology Center\n\nToronto, ON M5S 2E4 CAN Beaverton, OR 97006 USA\n{tomhart, demke}@cs.toronto.edu paulmck@us.ibm.com\n\nAbstract\n\nAchieving high performance for concurrent applications\non modern multiprocessors remains challenging. Many pro-\ngrammers avoid locking to improve perf"
+    (2025-02-12 05:01:47.645 TRACE /Users/rafaelbagmanov/.cargo/registry/src/index.crates.io-6f17d22bba15001f/reqwest-0.12.12/src/connect.rs:1301) d20dc3b0 write: b"POST /v3/send HTTP/1.1\r\naccept: */*\r\ncontent-type: application/json; charset=UTF-8\r\nx-accept: application/json\r\nhost: getpocket.com\r\ncontent-length: 249\r\n\r\n{\"consumer_key\":\"110856-cba018037b073c92d23edc4\",\"access_token\":\"be853232-3011-ddfa-b974-fccbb9\",\"actions\":[{\"action\":\"add\",\"item_id\":\"591878615\",\"time\":1739354459,\"title\":\"untitled\",\"url\":\"http://www.rdrop.com/users/paulmck/RCU/hart_ipdps06.pdf\"}]}"
+ [ ]  filter by domain -> drop filter -> the cursor jumps to the beginning of the list
 
 ideas:
 - tui UI designer
