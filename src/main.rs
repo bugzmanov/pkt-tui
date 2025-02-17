@@ -260,6 +260,7 @@ pub struct RssFeedPopupState {
     hidden_items: hidden_items::HiddenItems,
     status_message: Option<(String, Instant)>, // Message and timestamp
     pending_pocket_item: Option<RssFeedItem>,  // Store item waiting for tags
+    show_description: bool,
 }
 
 impl RssFeedPopupState {
@@ -275,6 +276,7 @@ impl RssFeedPopupState {
             hidden_items,
             status_message: None,
             pending_pocket_item: None,
+            show_description: false,
         })
     }
 
@@ -2105,6 +2107,7 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                 match key.code {
                     Char('j') | Down => popup_state.move_selection(1),
                     Char('k') | Up => popup_state.move_selection(-1),
+                    Char('p') => popup_state.show_description = !popup_state.show_description,
                     KeyCode::Char('d') => {
                         popup_state.hide_current_item()?;
                         return Ok(());
@@ -2798,7 +2801,77 @@ fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
             ScrollbarState::new(popup_state.items.len()).position(popup_state.scroll_offset);
 
         f.render_stateful_widget(scrollbar, popup_area, &mut scroll_state);
+        if popup_state.show_description {
+            if let Some(selected_item) = popup_state.items.get(popup_state.selected_index) {
+                let desc_popup_area = centered_rect(70, 40, f.size());
+                f.render_widget(Clear, desc_popup_area);
 
+                let description = selected_item
+                    .description
+                    .as_deref()
+                    .unwrap_or("No description available");
+
+                // Wrap text to fit popup width
+                let max_width = (desc_popup_area.width as usize).saturating_sub(4);
+                // let wrapped_text = textwrap::fill(description, max_width);
+
+                let wrapped_text = description
+                    .split_whitespace()
+                    .fold((String::new(), 0), |(mut text, len), word| {
+                        if len + word.len() + 1 > max_width {
+                            text.push('\n');
+                            (text + word, word.len())
+                        } else if text.is_empty() {
+                            (word.to_string(), word.len())
+                        } else {
+                            (text + " " + word, len + word.len() + 1)
+                        }
+                    })
+                    .0;
+
+                let text = Text::from(vec![
+                    Line::from(vec![
+                        Span::styled("Title: ", Style::default().fg(OCEANIC_NEXT.base_0d)),
+                        Span::styled(
+                            &selected_item.title,
+                            Style::default().fg(OCEANIC_NEXT.base_05),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Source: ", Style::default().fg(OCEANIC_NEXT.base_0d)),
+                        Span::styled(
+                            &selected_item.source,
+                            Style::default().fg(OCEANIC_NEXT.base_05),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        "Description:",
+                        Style::default().fg(OCEANIC_NEXT.base_0d),
+                    )]),
+                    Line::from(""),
+                    Line::from(vec![Span::styled(
+                        wrapped_text,
+                        Style::default().fg(OCEANIC_NEXT.base_05),
+                    )]),
+                ]);
+
+                let description_widget = Paragraph::new(text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Article Preview ")
+                            .border_style(Style::new().fg(app.colors.footer_border_color))
+                            .border_type(BorderType::Rounded),
+                    )
+                    .style(Style::new().bg(Color::Black))
+                    .wrap(Wrap { trim: true })
+                    .scroll((0, 0));
+
+                f.render_widget(description_widget, desc_popup_area);
+            }
+        }
         if let Some((message, timestamp)) = &popup_state.status_message {
             if timestamp.elapsed() < Duration::from_secs(5) {
                 // Show message for 5 seconds
