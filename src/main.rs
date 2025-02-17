@@ -3,6 +3,7 @@
 mod auth;
 mod errors;
 mod pocket;
+mod prss;
 mod readingstats;
 pub mod storage;
 mod tokenstorage;
@@ -21,11 +22,11 @@ use crossterm::{
 use itertools::Itertools;
 use log::{error, LevelFilter};
 use pocket::{GetPocketSync, SendResponse};
+use prss::{RssFeedItem, RssManager};
 use ratatui::{prelude::*, widgets::*};
 use rayon::prelude::*;
 use readingstats::{render_stats, TotalStats};
 use reqwest::blocking::Client;
-use rss::Channel;
 use serde_json::json;
 use std::{
     error::Error,
@@ -187,7 +188,7 @@ mod hidden_items {
     use std::io::{self, BufRead, BufReader, Write};
     use std::path::Path;
 
-    const HIDDEN_ITEMS_FILE: &str = "hidden_rss_items.txt";
+    const HIDDEN_ITEMS_FILE: &str = "rss/hidden_rss_items.txt";
 
     pub struct HiddenItems {
         items: HashSet<String>,
@@ -242,15 +243,6 @@ mod hidden_items {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct RssFeedItem {
-    pub title: String,
-    pub link: String,
-    pub source: String,
-    pub description: Option<String>,
-    pub pub_date: Option<String>,
-    pub item_id: String, // Add this field
-}
 pub struct RssFeedState {
     pub items: Arc<Mutex<Vec<RssFeedItem>>>,
     pub is_loading: Arc<Mutex<bool>>,
@@ -886,6 +878,12 @@ impl App {
     }
 
     pub fn start_rss_feed_loading(&mut self) -> anyhow::Result<()> {
+        let subscription_manager = RssManager::new();
+        let feeds = subscription_manager.load_subscriptions()?;
+        if feeds.is_empty() {
+            return Ok(());
+        }
+
         if let Ok(mut is_loading) = self.rss_feed_state.is_loading.lock() {
             if *is_loading {
                 return Ok(());
@@ -893,15 +891,6 @@ impl App {
                 *is_loading = true;
             }
         }
-
-        let feeds = vec![
-            "https://matklad.github.io/feed.xml",
-            "https://www.scattered-thoughts.net/atom.xml",
-            // "https://buttondown.com/hillelwayne/rss",
-            // "https://jack-vanlightly.com/blog?format=rss",
-            // "https://johnnysswlab.com/rss",
-            // "https://magazine.sebastianraschka.com/feed",
-        ];
 
         let client = reqwest::blocking::ClientBuilder::new()
             .timeout(Duration::from_secs(10))
@@ -914,7 +903,7 @@ impl App {
             let results = Arc::new(Mutex::new(Vec::new()));
 
             feeds.par_iter().for_each(|url| {
-                match Self::fetch_and_parse_feed(&client, url) {
+                match RssManager::fetch_and_parse_feed(&client, url) {
                     Ok(items) => {
                         if let Ok(mut results_guard) = results.lock() {
                             results_guard.extend(items);
@@ -1041,13 +1030,6 @@ impl App {
         Ok(())
     }
 
-    // pub fn add_rss_item_to_pocket(&mut self) -> anyhow::Result<()> {
-    //     if let Some(popup_state) = &mut self.rss_feed_popup_state {
-    //         popup_state.add_current_to_pocket(&self.pocket_client)?;
-    //     }
-    //     Ok(())
-    // }
-
     fn download_current_pdf(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
@@ -1088,102 +1070,6 @@ impl App {
             }
         }
         Ok(())
-    }
-
-    fn format_pub_date(date_str: &str) -> Option<String> {
-        // Try to parse the RFC 2822 date format used by RSS feeds
-        if let Ok(datetime) = DateTime::parse_from_rfc2822(date_str) {
-            let utc_dt: DateTime<Utc> = datetime.to_utc();
-            Some(format!("{:?}", utc_dt)) // This will output in RFC 3339 format
-        } else {
-            error!("Failed to parse date: {}", date_str);
-            None
-        }
-    }
-
-    fn fetch_and_parse_feed(
-        client: &reqwest::blocking::Client,
-        url: &str,
-    ) -> anyhow::Result<Vec<RssFeedItem>> {
-        let response = client
-                .get(url)
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                )
-                .send()?;
-
-        if !response.status().is_success() {
-            error!("Failed to fetch {}: Status {}", url, response.status());
-            return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
-        }
-
-        let content = response.text()?;
-
-        // Try parsing as Atom first
-        if let Ok(atom_feed) = atom_syndication::Feed::read_from(content.as_bytes()) {
-            let source_name = atom_feed.title().to_string();
-            return Ok(atom_feed
-                .entries()
-                .iter()
-                .map(|entry| {
-                    let item_id = format!("{}:{}", source_name, entry.id());
-                    RssFeedItem {
-                        title: entry.title().to_string(),
-                        link: entry
-                            .links()
-                            .first()
-                            .map(|l| l.href().to_string())
-                            .unwrap_or_default(),
-                        description: entry.content().and_then(|c| c.value()).map(String::from),
-                        pub_date: Some(
-                            entry
-                                .published()
-                                .unwrap_or_else(|| entry.updated())
-                                .to_string(),
-                        ),
-                        source: source_name.clone(),
-                        item_id,
-                    }
-                })
-                .collect());
-        }
-
-        // Try parsing as RSS
-        match rss::Channel::read_from(content.as_bytes()) {
-            Ok(rss_feed) => {
-                let source_name = rss_feed.title().to_string();
-                Ok(rss_feed
-                    .items()
-                    .iter()
-                    .map(|item| {
-                        let item_id = format!(
-                            "{}:{}",
-                            source_name,
-                            item.guid()
-                                .map(|g| g.value().to_string())
-                                .or_else(|| item.link().map(String::from))
-                                .unwrap_or_else(|| item.title().unwrap_or("unknown").to_string())
-                        );
-                        RssFeedItem {
-                            title: item.title().unwrap_or("Untitled").to_string(),
-                            link: item.link().unwrap_or_default().to_string(),
-                            description: item.description().map(String::from),
-                            pub_date: item
-                                .pub_date()
-                                .and_then(|date| Self::format_pub_date(&date))
-                                .or(item.pub_date().map(String::from)),
-                            source: source_name.clone(),
-                            item_id,
-                        }
-                    })
-                    .collect())
-            }
-            Err(e) => {
-                error!("Failed to parse feed from {}: {}", url, e);
-                Err(anyhow::anyhow!("Invalid feed format: {}", e))
-            }
-        }
     }
 
     pub fn show_rss_feed_popup(&mut self) -> anyhow::Result<()> {
@@ -2268,7 +2154,11 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                     }
                     Enter => app.handle_rss_feed_selection()?,
                     Esc => {
-                        app.close_rss_feed_popup()?;
+                        if (popup_state.show_description) {
+                            popup_state.show_description = false;
+                        } else {
+                            app.close_rss_feed_popup()?;
+                        }
                         // app.rss_feed_popup_state = None;
                     }
                     _ => {}
@@ -3062,6 +2952,32 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                 vec![Span::raw(INFO_TEXT)]
             };
 
+            if let Some(search) = &app.active_search_filter {
+                spans.extend_from_slice(&[Span::raw(" | /"), Span::raw(search)]);
+            }
+            if let Some(tag) = &app.selected_tag_filter {
+                spans.extend_from_slice(&[Span::raw(" | Tag: "), Span::raw(tag)]);
+            }
+            if let Some(domain) = &app.domain_filter {
+                spans.extend_from_slice(&[Span::raw(" | Site : "), Span::raw(domain)]);
+            }
+            if app.item_type_filter != ItemTypeFilter::All {
+                let filter_text = match app.item_type_filter {
+                    ItemTypeFilter::All => unreachable!(),
+                    ItemTypeFilter::Article => "Articles",
+                    ItemTypeFilter::Video => "Videos",
+                    ItemTypeFilter::PDF => "PDFs",
+                };
+                spans.extend_from_slice(&[Span::raw(" | Doc type : "), Span::raw(filter_text)]);
+            }
+
+            if app.item_type_filter != ItemTypeFilter::All
+                || app.selected_tag_filter.is_some()
+                || app.active_search_filter.is_some()
+            {
+                let text = format!("[Showing {} items]", app.items.len());
+                spans.extend_from_slice(&[Span::raw(" ('ESC` to clear) | "), Span::raw(text)]);
+            }
             if let Ok(items) = app.rss_feed_state.items.lock() {
                 if !items.is_empty() {
                     spans.extend_from_slice(&[
@@ -3076,54 +2992,6 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                     ]);
                 }
             }
-            if let Some(search) = &app.active_search_filter {
-                // info_text = format!("{} | /'{}'", info_text, search);
-                spans.extend_from_slice(&[Span::raw(" | /"), Span::raw(search)]);
-            }
-            if let Some(tag) = &app.selected_tag_filter {
-                // info_text = format!("{} | Tag: '{}' ", info_text, tag);
-                spans.extend_from_slice(&[Span::raw(" | Tag: "), Span::raw(tag)]);
-            }
-            if let Some(domain) = &app.domain_filter {
-                // info_text = format!("{} | Site: '{}' ", info_text, domain);
-                spans.extend_from_slice(&[Span::raw(" | Site : "), Span::raw(domain)]);
-            }
-            if app.item_type_filter != ItemTypeFilter::All {
-                let filter_text = match app.item_type_filter {
-                    ItemTypeFilter::All => unreachable!(),
-                    ItemTypeFilter::Article => "Articles",
-                    ItemTypeFilter::Video => "Videos",
-                    ItemTypeFilter::PDF => "PDFs",
-                };
-                // info_text = format!("{} | Doc type: {}", info_text, filter_text);
-                spans.extend_from_slice(&[Span::raw(" | Doc type : "), Span::raw(filter_text)]);
-            }
-
-            if app.item_type_filter != ItemTypeFilter::All
-                || app.selected_tag_filter.is_some()
-                || app.active_search_filter.is_some()
-            {
-                // info_text = format!(
-                //     "{} ('ESC' to clear) | [Showing {} items]",
-                //     info_text,
-                //     app.items.len()
-                // );
-                let text = format!("[Showing {} items]", app.items.len());
-                spans.extend_from_slice(&[Span::raw(" ('ESC` to clear) | "), Span::raw(text)]);
-            }
-            // let info_footer = Paragraph::new(Line::from(info_text))
-            //     .style(Style::new().fg(app.colors.row_fg).bg(app.colors.buffer_bg))
-            //     .alignment(if is_filtered {
-            //         Alignment::Left
-            //     } else {
-            //         Alignment::Center
-            //     })
-            //     .block(
-            //         Block::default()
-            //             .borders(Borders::ALL)
-            //             .border_style(Style::new().fg(app.colors.footer_border_color))
-            //             .border_type(BorderType::Double),
-            //     );
             let info_footer = Paragraph::new(Line::from(spans))
                 .style(Style::new().fg(app.colors.row_fg).bg(app.colors.buffer_bg))
                 .alignment(if is_filtered {

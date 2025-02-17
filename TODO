@@ -12,6 +12,9 @@ Features
    [x] first snapshot download
  [x] replicate pkt-tui as a website - pkt-tui-web
  [x] MEDIUM: Tag editing
+ [.] BIG: rss feeds queue
+   [ ] non-blocking adding to pocket (the operation is supricingly slow)
+   [ ] Optimization: Use HTTP headers like If-Modified-Since or ETag when requesting the feed, to avoid reloading same stuff
  [ ] it should be possible to recotegorize article type
  [ ] Sharing snapshot file via icloud
  [ ] "Bump to top" - old article that i think needs to be read sooner than later
@@ -33,9 +36,6 @@ Features
  [ ] sneaky jumps
  [ ] White papers domains (https://arxiv.org/ https://dl.acm.org/doi/) should mark item type as pdf
     [ ] Downloading those becomes more painful
- BIG:
-   [ ] rss feed
-      [ ] Optimization: Use HTTP headers like If-Modified-Since or ETag when requesting the feed, to avoid reloading same stuff
 
 Tech Dept:
  [ ] Proper exit instead of panic
