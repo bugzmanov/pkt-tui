@@ -20,7 +20,7 @@ use crossterm::{
 };
 use itertools::Itertools;
 use log::{error, LevelFilter};
-use pocket::GetPocketSync;
+use pocket::{GetPocketSync, SendResponse};
 use ratatui::{prelude::*, widgets::*};
 use rayon::prelude::*;
 use readingstats::{render_stats, TotalStats};
@@ -259,6 +259,7 @@ pub struct RssFeedPopupState {
     pub visible_items: usize,
     hidden_items: hidden_items::HiddenItems,
     status_message: Option<(String, Instant)>, // Message and timestamp
+    pending_pocket_item: Option<RssFeedItem>,  // Store item waiting for tags
 }
 
 impl RssFeedPopupState {
@@ -273,9 +274,18 @@ impl RssFeedPopupState {
             visible_items,
             hidden_items,
             status_message: None,
+            pending_pocket_item: None,
         })
     }
 
+    pub fn prepare_add_to_pocket(&mut self) -> Option<RssFeedItem> {
+        if let Some(selected_item) = self.items.get(self.selected_index).cloned() {
+            self.pending_pocket_item = Some(selected_item.clone());
+            Some(selected_item)
+        } else {
+            None
+        }
+    }
     pub fn move_selection(&mut self, delta: isize) {
         let new_index = self.selected_index as isize + delta;
         self.selected_index = new_index.clamp(0, self.items.len() as isize - 1) as usize;
@@ -299,14 +309,24 @@ impl RssFeedPopupState {
         self.status_message = Some((message, Instant::now()));
     }
 
-    // Add method to handle adding current item to Pocket
-    pub fn add_current_to_pocket(&mut self, pocket_client: &GetPocketSync) -> anyhow::Result<()> {
-        if let Some(selected_item) = self.items.get(self.selected_index) {
-            // Add to Pocket
-            pocket_client.add(&selected_item.link)?;
+    pub fn add_current_to_pocket(
+        &mut self,
+        pocket_client: &GetPocketSync,
+        tags_input: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(item) = self.pending_pocket_item.take() {
+            // Parse tags in the application code
+            let tags: Vec<String> = tags_input
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+
+            // Add to Pocket with parsed tags
+            pocket_client.add(&item.link, &tags)?;
 
             // Hide the item
-            self.hidden_items.hide_item(selected_item.item_id.clone())?;
+            self.hidden_items.hide_item(item.item_id.clone())?;
 
             // Remove from current list
             self.items.remove(self.selected_index);
@@ -315,7 +335,7 @@ impl RssFeedPopupState {
             }
 
             // Set success message
-            self.set_status("✓ Added to Pocket successfully".to_string());
+            self.set_status(format!("✓ Added to Pocket with {} tags", tags.len()));
             Ok(())
         } else {
             Err(anyhow::anyhow!("No item selected"))
@@ -532,6 +552,13 @@ impl SearchMode {
 enum CommandType {
     RenameItem,
     JumpToDate,
+    AddTags,
+}
+
+#[derive(Clone)]
+struct TextSuggestion {
+    full_text: String,
+    completion: String,
 }
 
 #[derive(Clone)]
@@ -540,6 +567,7 @@ pub struct CommandEnterMode {
     current_enter: String,
     cursor_pos: usize,
     command_type: CommandType,
+    current_suggestion: Option<TextSuggestion>,
 }
 
 impl CommandEnterMode {
@@ -549,6 +577,7 @@ impl CommandEnterMode {
             current_enter: String::new(),
             cursor_pos: 0,
             command_type,
+            current_suggestion: None,
         }
     }
     fn new(prompt: String, current_enter: String, command_type: CommandType) -> Self {
@@ -558,6 +587,78 @@ impl CommandEnterMode {
             current_enter,
             cursor_pos,
             command_type,
+            current_suggestion: None,
+        }
+    }
+    fn update_suggestion(&mut self, suggestions: &[String]) {
+        // Get the current text being typed
+        let current_text = match self.command_type {
+            CommandType::AddTags => {
+                // For tags, look at text after the last comma
+                self.current_enter
+                    .split(',')
+                    .last()
+                    .map(|s| s.trim())
+                    .unwrap_or("")
+            }
+            _ => &self.current_enter,
+        };
+
+        error!("Tag: {}, suggestions: {:?}", current_text, suggestions);
+        if current_text.len() >= 2 {
+            // Find matching suggestions
+            let matching_texts: Vec<&String> = suggestions
+                .iter()
+                .filter(|text| {
+                    text.to_lowercase()
+                        .starts_with(&current_text.to_lowercase())
+                        && text.len() > current_text.len()
+                })
+                .collect();
+
+            // Take the first matching tag as suggestion
+            if let Some(suggestion) = matching_texts.first() {
+                let completion = suggestion[current_text.len()..].to_string();
+                self.current_suggestion = Some(TextSuggestion {
+                    full_text: suggestion.to_string(),
+                    completion,
+                });
+            } else {
+                self.current_suggestion = None;
+            }
+        } else {
+            self.current_suggestion = None;
+        }
+    }
+
+    fn complete_suggestion(&mut self) -> bool {
+        if let Some(suggestion) = &self.current_suggestion {
+            // Get everything before the current tag
+            let prefix = self
+                .current_enter
+                .rsplit_once(',')
+                .map(|(before, _)| format!("{},", before))
+                .unwrap_or_default();
+
+            // Get the current incomplete tag
+            let current_tag = self
+                .current_enter
+                .split(',')
+                .last()
+                .map(|s| s.trim())
+                .unwrap_or("");
+
+            // Complete the tag
+            self.current_enter = if prefix.is_empty() {
+                format!("{}, ", suggestion.full_text)
+            } else {
+                format!("{} {}, ", prefix, suggestion.full_text)
+            };
+            self.cursor_pos = self.current_enter.len();
+            self.current_suggestion = None;
+            true
+        } else {
+            false
         }
     }
 }
@@ -713,10 +814,17 @@ struct App {
     help_popup_state: Option<HelpPopupState>,
     rss_feed_popup_state: Option<RssFeedPopupState>,
     download_client: Client,
+    cached_tags: Vec<String>,
 }
 
 impl App {
     fn new(data_vec: Vec<PocketItem>, pocket_client: GetPocketSync, stats: TotalStats) -> App {
+        let cached_tags = data_vec
+            .iter()
+            .flat_map(|item| item.tags().map(|tag| tag.to_string()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
         App {
             virtual_state: TableState::default().with_selected(0),
             state: TableState::default().with_selected(0),
@@ -743,15 +851,36 @@ impl App {
             help_popup_state: None,
             download_client: Client::new(),
             rss_feed_popup_state: None,
+            cached_tags,
         }
     }
-
-    pub fn add_rss_item_to_pocket(&mut self) -> anyhow::Result<()> {
+    fn process_add_to_pocket_with_tags(&mut self) -> anyhow::Result<()> {
         if let Some(popup_state) = &mut self.rss_feed_popup_state {
-            popup_state.add_current_to_pocket(&self.pocket_client)?;
+            if let Some(_item) = popup_state.prepare_add_to_pocket() {
+                self.app_mode = AppMode::CommandEnter(CommandEnterMode::new_empty(
+                    "Enter tags (comma separated): ".to_string(),
+                    CommandType::AddTags,
+                ));
+            }
         }
         Ok(())
     }
+
+    fn complete_add_to_pocket(&mut self, tags: String) -> anyhow::Result<()> {
+        if let Some(popup_state) = &mut self.rss_feed_popup_state {
+            if let Err(e) = popup_state.add_current_to_pocket(&self.pocket_client, &tags) {
+                popup_state.set_status(format!("Error: {}", e));
+            }
+        }
+        Ok(())
+    }
+
+    // pub fn add_rss_item_to_pocket(&mut self) -> anyhow::Result<()> {
+    //     if let Some(popup_state) = &mut self.rss_feed_popup_state {
+    //         popup_state.add_current_to_pocket(&self.pocket_client)?;
+    //     }
+    //     Ok(())
+    // }
 
     fn download_current_pdf(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
@@ -942,7 +1071,7 @@ impl App {
                 }
             }
         }
-        self.rss_feed_popup_state = None;
+        // self.rss_feed_popup_state = None;
         Ok(())
     }
     fn show_help_popup(&mut self) -> anyhow::Result<()> {
@@ -955,6 +1084,12 @@ impl App {
         let delta_file = Path::new("snapshot_updates.db");
         let mut stats = TotalStats::new();
         let items = reload_data(delta_file, &self.pocket_client, &mut stats)?;
+        self.cached_tags = items
+            .iter()
+            .flat_map(|item| item.tags().map(|tag| tag.to_string()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
         self.stats = stats;
         self.items = FilteredItems::new(items);
         self.apply_filter();
@@ -1728,6 +1863,11 @@ fn process_command_mode(app: &mut App, mut cur_state: CommandEnterMode) -> anyho
             use KeyCode::*;
             match key.code {
                 Esc => app.switch_to_normal_mode(),
+                Tab => {
+                    if cur_state.complete_suggestion() {
+                        app.app_mode = AppMode::CommandEnter(cur_state);
+                    }
+                }
                 Char(ch) => {
                     if (key.modifiers.contains(KeyModifiers::CONTROL)
                         || key.modifiers.contains(KeyModifiers::SUPER))
@@ -1742,6 +1882,8 @@ fn process_command_mode(app: &mut App, mut cur_state: CommandEnterMode) -> anyho
                         cur_state.current_enter.insert(cur_state.cursor_pos, ch);
                         cur_state.cursor_pos += 1;
                     }
+                    cur_state.update_suggestion(&app.cached_tags);
+
                     app.app_mode = AppMode::CommandEnter(cur_state);
 
                     // cur_state.current_enter.push(ch);
@@ -1751,6 +1893,16 @@ fn process_command_mode(app: &mut App, mut cur_state: CommandEnterMode) -> anyho
                     if cur_state.cursor_pos > 0 {
                         cur_state.current_enter.remove(cur_state.cursor_pos - 1);
                         cur_state.cursor_pos -= 1;
+
+                        if let Some(tag_popup_state) = &app.tag_popup_state {
+                            cur_state.update_suggestion(
+                                &tag_popup_state
+                                    .tags
+                                    .iter()
+                                    .map(|x| x.0.clone())
+                                    .collect::<Vec<String>>(),
+                            );
+                        }
                     }
                     app.app_mode = AppMode::CommandEnter(cur_state);
                 }
@@ -1772,6 +1924,9 @@ fn process_command_mode(app: &mut App, mut cur_state: CommandEnterMode) -> anyho
                             app.rename_current_item(cur_state.current_enter)?
                         }
                         CommandType::JumpToDate => app.jump_to_date(cur_state.current_enter)?,
+                        CommandType::AddTags => {
+                            app.complete_add_to_pocket(cur_state.current_enter)?
+                        }
                     }
                     app.switch_to_normal_mode();
                 }
@@ -1955,11 +2110,7 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                         return Ok(());
                     }
                     Char('a') => {
-                        if let Err(e) = app.add_rss_item_to_pocket() {
-                            if let Some(popup_state) = &mut app.rss_feed_popup_state {
-                                popup_state.set_status(format!("Error: {}", e));
-                            }
-                        }
+                        app.process_add_to_pocket_with_tags()?;
                         return Ok(());
                     }
                     Enter => app.handle_rss_feed_selection()?,
@@ -2758,10 +2909,11 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(&textarea, area);
         }
         AppMode::CommandEnter(x) => {
-            let mut final_string = x.prompt.clone();
-            final_string.push_str(&x.current_enter);
+            let area_with_margin = area.inner(Margin::new(1, 1));
 
-            let mut textarea = TextArea::new(vec![final_string]);
+            // Create the base TextArea for input
+            let input_text = format!("{}{}", x.prompt, x.current_enter);
+            let mut textarea = TextArea::new(vec![input_text]);
             textarea.set_style(Style::new().fg(app.colors.row_fg).bg(app.colors.buffer_bg));
             textarea.set_block(
                 Block::default()
@@ -2774,7 +2926,33 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             let cursor_pos = (x.cursor_pos + prompt_len).try_into().unwrap();
             textarea.move_cursor(CursorMove::Jump(0, cursor_pos));
 
+            // Render the base TextArea
             f.render_widget(&textarea, area);
+
+            // If there's a suggestion, render it as a separate dimmed text
+            if let Some(suggestion) = &x.current_suggestion {
+                // let suggestion = TextSuggestion {
+                //     completion: "Popa".to_string(),
+                //     full_text: "Popa!".to_string(),
+                // };
+                let suggestion_x = (prompt_len + x.current_enter.len() + 1) as u16;
+                if suggestion_x < area_with_margin.width {
+                    let suggestion_area = Rect::new(
+                        area_with_margin.x + suggestion_x,
+                        area_with_margin.y,
+                        area_with_margin.width - suggestion_x,
+                        1,
+                    );
+
+                    let suggestion_text = Paragraph::new(suggestion.completion.as_str()).style(
+                        Style::new()
+                            .fg(OCEANIC_NEXT.base_03)
+                            .add_modifier(Modifier::DIM),
+                    );
+
+                    f.render_widget(suggestion_text, suggestion_area);
+                }
+            }
         }
     }
 }

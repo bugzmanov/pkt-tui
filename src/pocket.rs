@@ -108,10 +108,11 @@ impl GetPocket {
         }
     }
 
-    pub async fn add(&self, url: &str) -> Result<SendResponse> {
+    pub async fn add(&self, url: &str, tags: &[String]) -> Result<SendResponse> {
         self.send(json!([{
             "action": "add",
             "url": url,
+            "tags": tags.join(","),
             "timestamp": chrono::Utc::now().timestamp().to_string()
         }]))
         .await
@@ -353,9 +354,9 @@ impl GetPocketSync {
             .block_on(self.get_pocket.fav_and_archive(item_id))
             .context(format!("Faile to fav_and_archive an Item {}", item_id))
     }
-    pub fn add(&self, url: &str) -> Result<SendResponse> {
+    pub fn add(&self, url: &str, tags: &[String]) -> Result<SendResponse> {
         self.runtime
-            .block_on(self.get_pocket.add(url))
+            .block_on(self.get_pocket.add(url, tags))
             .context(format!("Failed to add URL: {}", url))
     }
 
