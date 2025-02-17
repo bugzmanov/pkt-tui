@@ -2,6 +2,7 @@
 
 mod auth;
 mod errors;
+mod logo;
 mod pocket;
 mod prss;
 mod readingstats;
@@ -103,10 +104,10 @@ struct TableColors {
 impl TableColors {
     const fn new(color: &tailwind::Palette) -> Self {
         Self {
-            buffer_bg: OCEANIC_NEXT.base_00, //tailwind::SLATE.c950,
+            buffer_bg: OCEANIC_NEXT.base_00,
             header_fg: tailwind::SLATE.c200,
             row_fg: tailwind::SLATE.c200,
-            selected_style_fg: OCEANIC_NEXT.base_0a, //color.c300,
+            selected_style_fg: OCEANIC_NEXT.base_0a,
             _alt_row_color: tailwind::SLATE.c900,
             footer_border_color: color.c400,
         }
@@ -2219,7 +2220,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             Block::default().style(Style::default().bg(OCEANIC_NEXT.base_00)), //app.colors.buffer_bg)),
             f.area(),
         );
-        render_logo(f, rects[0]);
+        logo::render(f, rects[0]);
         return;
     }
 
@@ -2541,105 +2542,6 @@ fn render_help_popup(f: &mut Frame, app: &mut App, area: Rect) {
 
         f.render_widget(help_widget, popup_area);
     }
-}
-
-fn render_logo(f: &mut Frame, area: Rect) {
-    let mut lines = Vec::new();
-
-    // Title section with red blocks
-    let title_lines = vec![
-        "    _______   __    __  ________           __     ________  __    __  ______    ",
-        "   |       \\ |  \\  /  \\|        \\         /  \\   |        \\|  \\  |  \\|      \\   ",
-        "   | ░▒▒▒▓▓░\\| ░░ /  ░▒ \\░▒▒▒▒▒░░        /  ░░    \\░░▓▓▓▓▒░| ▒░  | ░▒ \\░▒▓▓▓▒  ",
-        "   | ▒▒__/ ▒░| ▓▓/  ░▓    | ▒▓ ______   /  ░░______ | ▒▒   | ▒▒  | ▒▓  | ▓▒    ",
-        "   | ▓▓    ░▒| ██  ░▓     | ▒▓|      \\ /  ░░|      \\| ░▒   | ▓▓  | ▒█  | ▓▓    ",
-        "   | ██▒▒▓▒▒ | ▓█▓▓█\\     | ▒▓ \\░░░░░░/  ░░  \\░░░░░░| ░▓   | ▒▓  | ▓█  | ▓█    ",
-        "   | ▒▒      | ▒▓ \\▒▒\\    | ░▓       /  ░░          | ▒▓   | ▒▒__/ ▒▒ _| ▒█_   ",
-        "   | ▓▒      | ▒▓  \\░░\\   | ▒░      |  ░░           | ▓░    \\░▒    ░▒|   ░▒ \\  ",
-        "    \\░░       \\░░   \\░░    \\▒░       \\░░             \\▒░     \\░▒▓▓▒░  \\░░▒▒░░  ",
-        "",
-    ];
-
-    // Process title lines
-    for line in title_lines {
-        let mut styled_spans = Vec::new();
-        let mut current_text = String::new();
-
-        for c in line.chars() {
-            if "░▒▓█".contains(c) {
-                if !current_text.is_empty() {
-                    styled_spans.push(Span::raw(current_text.clone()));
-                    current_text.clear();
-                }
-                styled_spans.push(Span::styled(
-                    c.to_string(),
-                    Style::default().fg(OCEANIC_NEXT.base_08),
-                ));
-            } else {
-                current_text.push(c);
-            }
-        }
-        if !current_text.is_empty() {
-            styled_spans.push(Span::raw(current_text));
-        }
-        lines.push(Line::from(styled_spans));
-    }
-
-    // Dino section with light green blocks
-    let dino_lines = vec![
-        "                         ░▒▒░                    _______                        ",
-        "                         ░▒▓▓▒▒▒▒▒░     ░▒▒▒░   /      /,░▒▒▒▒▒▒▒▒▒░          ",
-        "                           ░▒▒▒▒▒▒░░▒▒▒▒▒▒▒▒░  / wait // ░▒▒▒▒▒▒▒▒▒▒▒░        ",
-        "                             ░▒▒▒▒░░▒▒▒▒░     /______//           ░▓█▓▒▒▒░     ",
-        "                            ░▓▓▒▒▒░░▒▒▒▒░    (______(/          ░▒▒▒▒▒▒▒▓▓▒░   ",
-        "                            ░▒░    ░▒▒▒▒▒▒▒░                   ░▒▒░     ░▒▒░   ",
-        "                                        ░▒▒▒░                 ░▓▒              ",
-        "                                           ░▒░               ░██░              ",
-        "                                            ▒▒  ░▒▒▒▒▒▒▒▒▒▒▒▒▓█▓              ",
-        "                                            ▒▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒░              ",
-        "                                            ░▓▓▒░                              ",
-        "                                             ▒▒                                ",
-        "                                             ░░                                ",
-    ];
-
-    // Process dino lines
-    for line in dino_lines {
-        let mut styled_spans = Vec::new();
-        let mut current_text = String::new();
-
-        for c in line.chars() {
-            if "░▒▓█".contains(c) {
-                if !current_text.is_empty() {
-                    styled_spans.push(Span::raw(current_text.clone()));
-                    current_text.clear();
-                }
-                styled_spans.push(Span::styled(
-                    c.to_string(),
-                    Style::default().fg(OCEANIC_NEXT.base_0b),
-                ));
-            } else {
-                current_text.push(c);
-            }
-        }
-        if !current_text.is_empty() {
-            styled_spans.push(Span::raw(current_text));
-        }
-        lines.push(Line::from(styled_spans));
-    }
-
-    let popup_area = centered_rect(50, 65, area);
-    f.render_widget(Clear, popup_area);
-
-    let help_widget = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::NONE)
-                .border_type(BorderType::Rounded),
-        )
-        .style(Style::new().bg(OCEANIC_NEXT.base_00))
-        .alignment(Alignment::Left);
-
-    f.render_widget(help_widget, popup_area);
 }
 
 fn render_error_popup(f: &mut Frame, message: &str, area: Rect, colors: &TableColors) {
