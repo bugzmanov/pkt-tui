@@ -180,3 +180,65 @@ impl RssManager {
         }
     }
 }
+
+//this needs to be encapsulated and hidden
+pub mod hidden_items {
+    use std::collections::HashSet;
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, BufRead, BufReader, Write};
+    use std::path::Path;
+
+    const HIDDEN_ITEMS_FILE: &str = "rss/hidden_rss_items.txt";
+
+    pub struct HiddenItems {
+        items: HashSet<String>,
+    }
+
+    impl HiddenItems {
+        pub fn new() -> Self {
+            Self {
+                items: HashSet::new(),
+            }
+        }
+
+        pub fn load() -> anyhow::Result<Self> {
+            let mut items = HashSet::new();
+
+            if Path::new(HIDDEN_ITEMS_FILE).exists() {
+                let file = File::open(HIDDEN_ITEMS_FILE)?;
+                let reader = BufReader::new(file);
+
+                for line in reader.lines() {
+                    let line = line?;
+                    if !line.trim().is_empty() {
+                        items.insert(line);
+                    }
+                }
+            }
+
+            Ok(Self { items })
+        }
+
+        // No need for full save, we'll just append new items
+        pub fn hide_item(&mut self, item_id: String) -> anyhow::Result<()> {
+            if !self.items.contains(&item_id) {
+                // Open file in append mode, create if doesn't exist
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(HIDDEN_ITEMS_FILE)?;
+
+                // Write the new item with a newline
+                writeln!(file, "{}", item_id)?;
+
+                // Add to our in-memory set
+                self.items.insert(item_id);
+            }
+            Ok(())
+        }
+
+        pub fn is_hidden(&self, item_id: &str) -> bool {
+            self.items.contains(item_id)
+        }
+    }
+}
