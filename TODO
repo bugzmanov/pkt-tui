@@ -35,6 +35,7 @@ Features
     [ ] Downloading those becomes more painful
  BIG:
    [ ] rss feed
+      [ ] Optimization: Use HTTP headers like If-Modified-Since or ETag when requesting the feed, to avoid reloading same stuff
 
 Tech Dept:
  [ ] Proper exit instead of panic

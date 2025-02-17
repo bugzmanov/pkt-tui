@@ -242,7 +242,7 @@ mod hidden_items {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RssFeedItem {
     pub title: String,
     pub link: String,
@@ -250,6 +250,29 @@ pub struct RssFeedItem {
     pub description: Option<String>,
     pub pub_date: Option<String>,
     pub item_id: String, // Add this field
+}
+pub struct RssFeedState {
+    pub items: Arc<Mutex<Vec<RssFeedItem>>>,
+    pub is_loading: Arc<Mutex<bool>>,
+    pub has_updates: bool,
+    pub error: Option<String>,
+    pub items_processed: bool,
+}
+
+impl RssFeedState {
+    pub fn new() -> Self {
+        Self {
+            items: Arc::new(Mutex::new(Vec::new())),
+            is_loading: Arc::new(Mutex::new(false)),
+            has_updates: false,
+            error: None,
+            items_processed: false,
+        }
+    }
+    pub fn mark_items_processed(&mut self) {
+        self.items_processed = true;
+        self.has_updates = false; // Clear the updates flag
+    }
 }
 
 pub struct RssFeedPopupState {
@@ -261,6 +284,7 @@ pub struct RssFeedPopupState {
     status_message: Option<(String, Instant)>, // Message and timestamp
     pending_pocket_item: Option<RssFeedItem>,  // Store item waiting for tags
     show_description: bool,
+    pub changes_made: bool,
 }
 
 impl RssFeedPopupState {
@@ -277,6 +301,7 @@ impl RssFeedPopupState {
             status_message: None,
             pending_pocket_item: None,
             show_description: false,
+            changes_made: false,
         })
     }
 
@@ -338,6 +363,7 @@ impl RssFeedPopupState {
 
             // Set success message
             self.set_status(format!("✓ Added to Pocket with {} tags", tags.len()));
+            self.changes_made = true;
             Ok(())
         } else {
             Err(anyhow::anyhow!("No item selected"))
@@ -817,6 +843,7 @@ struct App {
     rss_feed_popup_state: Option<RssFeedPopupState>,
     download_client: Client,
     cached_tags: Vec<String>,
+    rss_feed_state: RssFeedState,
 }
 
 impl App {
@@ -854,7 +881,93 @@ impl App {
             download_client: Client::new(),
             rss_feed_popup_state: None,
             cached_tags,
+            rss_feed_state: RssFeedState::new(),
         }
+    }
+
+    pub fn start_rss_feed_loading(&mut self) -> anyhow::Result<()> {
+        if let Ok(mut is_loading) = self.rss_feed_state.is_loading.lock() {
+            if *is_loading {
+                return Ok(());
+            } else {
+                *is_loading = true;
+            }
+        }
+
+        let feeds = vec![
+            "https://matklad.github.io/feed.xml",
+            "https://www.scattered-thoughts.net/atom.xml",
+            // "https://buttondown.com/hillelwayne/rss",
+            // "https://jack-vanlightly.com/blog?format=rss",
+            // "https://johnnysswlab.com/rss",
+            // "https://magazine.sebastianraschka.com/feed",
+        ];
+
+        let client = reqwest::blocking::ClientBuilder::new()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        let items_arc = self.rss_feed_state.items.clone();
+        let hidden_items = hidden_items::HiddenItems::load()?;
+        let is_loading_arc = self.rss_feed_state.is_loading.clone();
+        thread::spawn(move || {
+            let results = Arc::new(Mutex::new(Vec::new()));
+
+            feeds.par_iter().for_each(|url| {
+                match Self::fetch_and_parse_feed(&client, url) {
+                    Ok(items) => {
+                        if let Ok(mut results_guard) = results.lock() {
+                            results_guard.extend(items);
+                        }
+                    }
+                    Err(e) => error!("Error fetching {}: {}", url, e),
+                }
+                thread::sleep(Duration::from_millis(100));
+            });
+
+            if let Ok(mut items_guard) = items_arc.lock() {
+                if let Ok(results_guard) = results.lock() {
+                    // Filter out hidden items
+                    let new_items: Vec<RssFeedItem> = results_guard
+                        .iter()
+                        .filter(|item| !hidden_items.is_hidden(&item.item_id))
+                        .cloned()
+                        .collect();
+                    error!("ITEMS UPDATE:{}", new_items.len());
+                    *items_guard = new_items;
+
+                    if let Ok(mut is_loading) = is_loading_arc.lock() {
+                        *is_loading = false;
+                    } else {
+                        panic!("is_loading lock error"); //todo
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+    pub fn close_rss_feed_popup(&mut self) -> anyhow::Result<()> {
+        if let Some(popup_state) = &self.rss_feed_popup_state {
+            // Check if any changes were made
+            if popup_state.changes_made {
+                // Switch to refreshing mode with proper loading message
+                self.app_mode = AppMode::Refreshing(RefreshingPopup::new(
+                    "Refreshing Pocket data ⏳".to_string(),
+                    LoadingType::Refresh,
+                ));
+
+                // Mark RSS items as processed
+                self.rss_feed_state.mark_items_processed();
+            }
+
+            // Start a new RSS feed check in the background
+            self.start_rss_feed_loading()?;
+        }
+
+        // Clear the popup state
+        self.rss_feed_popup_state = None;
+        Ok(())
     }
     fn switch_to_tags_mode(&mut self, initial_tags: Option<String>) {
         self.app_mode = AppMode::CommandEnter(CommandEnterMode::new(
@@ -1006,7 +1119,6 @@ impl App {
         }
 
         let content = response.text()?;
-        error!("Successfully fetched {} bytes from {}", content.len(), url);
 
         // Try parsing as Atom first
         if let Ok(atom_feed) = atom_syndication::Feed::read_from(content.as_bytes()) {
@@ -1075,43 +1187,33 @@ impl App {
     }
 
     pub fn show_rss_feed_popup(&mut self) -> anyhow::Result<()> {
-        let visible_items = 33;
-        let feeds = vec![
-            "https://matklad.github.io/feed.xml",
-            "https://buttondown.com/hillelwayne/rss",
-            "https://jack-vanlightly.com/blog?format=rss",
-            "https://johnnysswlab.com/rss",
-            // "https://notes.eatonphil.com/rss.xml",
-            "https://magazine.sebastianraschka.com/feed",
-        ];
-
-        // Create a client with reasonable defaults
-        let client = reqwest::blocking::ClientBuilder::new()
-            .timeout(Duration::from_secs(10))
-            .build()?;
-
-        let results = Arc::new(Mutex::new(Vec::new()));
-
-        feeds.par_iter().for_each(|url| {
-            match Self::fetch_and_parse_feed(&client, url) {
-                Ok(items) => {
-                    if let Ok(mut results_guard) = results.lock() {
-                        results_guard.extend(items);
-                    }
-                }
-                Err(e) => error!("Error fetching {}: {}", url, e),
+        if let Ok(is_loading) = self.rss_feed_state.is_loading.lock() {
+            if (*is_loading) {
+                self.app_mode = AppMode::Error("RSS feed is being updated.".to_string());
+                return Ok(());
             }
-            // Small delay between requests
-            std::thread::sleep(Duration::from_millis(100));
-        });
-
-        let mut all_items = if let Ok(results_guard) = results.lock() {
-            results_guard.to_vec()
+        }
+        if let Ok(items_guard) = self.rss_feed_state.items.lock() {
+            if items_guard.is_empty() {
+                self.app_mode = AppMode::Error("No RSS updates available (yet)".to_string());
+                return Ok(());
+            }
+        }
+        let visible_items = 33;
+        let items = if let Ok(items_guard) = self.rss_feed_state.items.lock() {
+            items_guard.to_vec()
         } else {
             Vec::new()
         };
 
-        self.rss_feed_popup_state = Some(RssFeedPopupState::new(all_items, visible_items)?);
+        // Create popup state with current items
+        self.rss_feed_popup_state = Some(RssFeedPopupState::new(items, visible_items)?);
+
+        // If we need to refresh the items, do it in the background
+        if !self.rss_feed_state.items_processed {
+            self.start_rss_feed_loading()?;
+        }
+
         Ok(())
     }
 
@@ -1600,7 +1702,6 @@ impl App {
     }
 
     fn handle_mouse_event(&mut self, mouse_event: MouseEvent) -> anyhow::Result<()> {
-        error!("ololo {:?}", mouse_event);
         match mouse_event.kind {
             MouseEventKind::Down(event::MouseButton::Left) => {
                 let current_time = std::time::Instant::now();
@@ -1831,7 +1932,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let stats = TotalStats::new();
     let list = Vec::new(); //reload_data(&delta_file, &pocket_client, &mut stats)?;
 
-    let app: App = App::new(list, pocket_client, stats);
+    let mut app: App = App::new(list, pocket_client, stats);
+    app.start_rss_feed_loading()?;
     let res = run_app(&mut terminal, app);
 
     // restore terminal
@@ -2072,7 +2174,6 @@ fn process_search_mode(app: &mut App, mut sstr: SearchMode) -> anyhow::Result<()
             }
             _ => {
                 // todo: proper logging
-                error!("asdasdas");
                 ()
             }
         }
@@ -2166,7 +2267,10 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                         return Ok(());
                     }
                     Enter => app.handle_rss_feed_selection()?,
-                    Esc => app.rss_feed_popup_state = None,
+                    Esc => {
+                        app.close_rss_feed_popup()?;
+                        // app.rss_feed_popup_state = None;
+                    }
                     _ => {}
                 }
             } else {
@@ -2952,20 +3056,37 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                 || app.domain_filter.is_some()
                 || app.active_search_filter.is_some();
 
-            let mut info_text = if is_filtered {
-                "[Filter]".to_string()
+            let mut spans = if is_filtered {
+                vec![Span::raw("[Filter]")]
             } else {
-                INFO_TEXT.to_string()
+                vec![Span::raw(INFO_TEXT)]
             };
 
+            if let Ok(items) = app.rss_feed_state.items.lock() {
+                if !items.is_empty() {
+                    spans.extend_from_slice(&[
+                        Span::raw(" | "),
+                        Span::styled(
+                            " RSS updates ",
+                            Style::default()
+                                .bg(OCEANIC_NEXT.base_0e) // Pink background
+                                .fg(OCEANIC_NEXT.base_00) // Dark text for contrast
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]);
+                }
+            }
             if let Some(search) = &app.active_search_filter {
-                info_text = format!("{} | /'{}'", info_text, search);
+                // info_text = format!("{} | /'{}'", info_text, search);
+                spans.extend_from_slice(&[Span::raw(" | /"), Span::raw(search)]);
             }
             if let Some(tag) = &app.selected_tag_filter {
-                info_text = format!("{} | Tag: '{}' ", info_text, tag);
+                // info_text = format!("{} | Tag: '{}' ", info_text, tag);
+                spans.extend_from_slice(&[Span::raw(" | Tag: "), Span::raw(tag)]);
             }
             if let Some(domain) = &app.domain_filter {
-                info_text = format!("{} | Site: '{}' ", info_text, domain);
+                // info_text = format!("{} | Site: '{}' ", info_text, domain);
+                spans.extend_from_slice(&[Span::raw(" | Site : "), Span::raw(domain)]);
             }
             if app.item_type_filter != ItemTypeFilter::All {
                 let filter_text = match app.item_type_filter {
@@ -2974,21 +3095,36 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                     ItemTypeFilter::Video => "Videos",
                     ItemTypeFilter::PDF => "PDFs",
                 };
-                info_text = format!("{} | Doc type: {}", info_text, filter_text);
+                // info_text = format!("{} | Doc type: {}", info_text, filter_text);
+                spans.extend_from_slice(&[Span::raw(" | Doc type : "), Span::raw(filter_text)]);
             }
 
             if app.item_type_filter != ItemTypeFilter::All
                 || app.selected_tag_filter.is_some()
                 || app.active_search_filter.is_some()
             {
-                // format!("[Showing {} items]", app.items.len())
-                info_text = format!(
-                    "{} ('ESC' to clear) | [Showing {} items]",
-                    info_text,
-                    app.items.len()
-                );
+                // info_text = format!(
+                //     "{} ('ESC' to clear) | [Showing {} items]",
+                //     info_text,
+                //     app.items.len()
+                // );
+                let text = format!("[Showing {} items]", app.items.len());
+                spans.extend_from_slice(&[Span::raw(" ('ESC` to clear) | "), Span::raw(text)]);
             }
-            let info_footer = Paragraph::new(Line::from(info_text))
+            // let info_footer = Paragraph::new(Line::from(info_text))
+            //     .style(Style::new().fg(app.colors.row_fg).bg(app.colors.buffer_bg))
+            //     .alignment(if is_filtered {
+            //         Alignment::Left
+            //     } else {
+            //         Alignment::Center
+            //     })
+            //     .block(
+            //         Block::default()
+            //             .borders(Borders::ALL)
+            //             .border_style(Style::new().fg(app.colors.footer_border_color))
+            //             .border_type(BorderType::Double),
+            //     );
+            let info_footer = Paragraph::new(Line::from(spans))
                 .style(Style::new().fg(app.colors.row_fg).bg(app.colors.buffer_bg))
                 .alignment(if is_filtered {
                     Alignment::Left
