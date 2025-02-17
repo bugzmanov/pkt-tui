@@ -118,6 +118,19 @@ impl GetPocket {
         .await
     }
 
+    pub async fn update_tags(
+        &self,
+        item_id: usize,
+        tags: &[String],
+    ) -> anyhow::Result<SendResponse> {
+        self.send(json!([{
+            "action": "tags_replace",
+            "item_id": item_id.to_string(),
+            "tags": tags.join(",")
+        }]))
+        .await
+    }
+
     async fn send<T>(&self, params: T) -> Result<SendResponse>
     where
         T: Serialize,
@@ -358,6 +371,11 @@ impl GetPocketSync {
         self.runtime
             .block_on(self.get_pocket.add(url, tags))
             .context(format!("Failed to add URL: {}", url))
+    }
+    pub fn update_tags(&self, item_id: usize, tags: &[String]) -> anyhow::Result<SendResponse> {
+        self.runtime
+            .block_on(self.get_pocket.update_tags(item_id, tags))
+            .context(format!("Failed to update tags: {}", tags.join(",")))
     }
 
     //todo: this might blow up if pocket list size is very long

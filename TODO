@@ -11,8 +11,8 @@ Features
    [x] Auth token retrieval
    [x] first snapshot download
  [x] replicate pkt-tui as a website - pkt-tui-web
- [ ] MEDIUM: Tag editing
-   [ ] it should be possible to recotegorize article type
+ [x] MEDIUM: Tag editing
+ [ ] it should be possible to recotegorize article type
  [ ] Sharing snapshot file via icloud
  [ ] "Bump to top" - old article that i think needs to be read sooner than later
  [.] Figure out design for archived, deleted and favourite

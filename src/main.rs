@@ -554,7 +554,7 @@ impl SearchMode {
 enum CommandType {
     RenameItem,
     JumpToDate,
-    AddTags,
+    Tags,
 }
 
 #[derive(Clone)]
@@ -595,7 +595,7 @@ impl CommandEnterMode {
     fn update_suggestion(&mut self, suggestions: &[String]) {
         // Get the current text being typed
         let current_text = match self.command_type {
-            CommandType::AddTags => {
+            CommandType::Tags => {
                 // For tags, look at text after the last comma
                 self.current_enter
                     .split(',')
@@ -856,22 +856,73 @@ impl App {
             cached_tags,
         }
     }
+    fn switch_to_tags_mode(&mut self, initial_tags: Option<String>) {
+        self.app_mode = AppMode::CommandEnter(CommandEnterMode::new(
+            "Enter tags (comma separated): ".to_string(),
+            initial_tags.unwrap_or_default(),
+            CommandType::Tags,
+        ));
+    }
     fn process_add_to_pocket_with_tags(&mut self) -> anyhow::Result<()> {
         if let Some(popup_state) = &mut self.rss_feed_popup_state {
             if let Some(_item) = popup_state.prepare_add_to_pocket() {
-                self.app_mode = AppMode::CommandEnter(CommandEnterMode::new_empty(
-                    "Enter tags (comma separated): ".to_string(),
-                    CommandType::AddTags,
-                ));
+                self.switch_to_tags_mode(None);
             }
         }
         Ok(())
+    }
+    fn switch_to_edit_tags_mode(&mut self) {
+        if let Some(idx) = self.virtual_state.selected() {
+            if let Some(item) = self.items.get(idx) {
+                // Get current tags and join them with commas
+                let current_tags = item.tags().join(", ");
+                self.switch_to_tags_mode(Some(current_tags));
+            }
+        }
     }
 
     fn complete_add_to_pocket(&mut self, tags: String) -> anyhow::Result<()> {
         if let Some(popup_state) = &mut self.rss_feed_popup_state {
             if let Err(e) = popup_state.add_current_to_pocket(&self.pocket_client, &tags) {
                 popup_state.set_status(format!("Error: {}", e));
+            }
+        }
+        Ok(())
+    }
+
+    fn update_tags(&mut self, tags: String) -> anyhow::Result<()> {
+        // Handle RSS item tags
+        if let Some(popup_state) = &mut self.rss_feed_popup_state {
+            popup_state.add_current_to_pocket(&self.pocket_client, &tags)?;
+            return Ok(());
+        }
+
+        // Handle pocket item tags
+        if let Some(idx) = self.virtual_state.selected() {
+            if let Some(item) = self.items.get_mut(idx) {
+                let item_id = item.id().parse::<usize>()?;
+
+                // Parse the new tags
+                let new_tag_set: Vec<String> = tags
+                    .split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+
+                // Update tags in Pocket
+                self.pocket_client.update_tags(item_id, &new_tag_set)?;
+
+                // Update local item
+                // First, remove all existing tags
+                let existing_tags: Vec<String> = item.tags().map(|t| t.to_string()).collect();
+                for tag in existing_tags {
+                    item.remove_tag(&tag);
+                }
+
+                // Then add the new tags
+                for tag in new_tag_set {
+                    item.add_tag(&tag);
+                }
             }
         }
         Ok(())
@@ -1926,9 +1977,7 @@ fn process_command_mode(app: &mut App, mut cur_state: CommandEnterMode) -> anyho
                             app.rename_current_item(cur_state.current_enter)?
                         }
                         CommandType::JumpToDate => app.jump_to_date(cur_state.current_enter)?,
-                        CommandType::AddTags => {
-                            app.complete_add_to_pocket(cur_state.current_enter)?
-                        }
+                        CommandType::Tags => app.update_tags(cur_state.current_enter)?,
                     }
                     app.switch_to_normal_mode();
                 }
@@ -2162,7 +2211,8 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                         }
                     }
                     Char('/') => app.switch_to_search_mode(),
-                    Char('t') | Char('T') => app.toggle_top_tag()?,
+                    Char('t') => app.toggle_top_tag()?,
+                    Char('T') => app.switch_to_edit_tags_mode(),
                     Char('f') | Char('F') => app.fav_and_archive_article()?,
                     Char('d') => {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {

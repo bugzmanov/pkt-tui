@@ -1,12 +1,13 @@
 
   ┌─ Navigation ─────────────────┐  ┌─ Actions ───────────────────┐
-  │ j/k, ↑/↓    Move selection   │  │ Enter    Open in browser    │
-  │ Ctrl+d      Page down        │  │ t/T      Toggle "top" tag   │
-  │ Ctrl+u      Page up          │  │ f/F      Favorite & archive │
-  │ gg          Jump to start    │  │ d        Delete article     │
-  │ G           Jump to end      │  │ r/R      Rename article     │
-  │ gd          Jump to date     │  │ Q        Refresh data       │ 
-  └──────────────────────────────┘  │ w        Download pdf       │ 
+  │ j/k, ↑/↓    Move selection   │  │ Enter Open in browser       │
+  │ Ctrl+d      Page down        │  │  T    edit tags             │
+  │ Ctrl+u      Page up          │  │  t    Toggle "top" tag      │
+  │ gg          Jump to start    │  │  f/F  Favorite & archive    │
+  │ G           Jump to end      │  │  d    Delete article        │
+  │ gd          Jump to date     │  │  r/R  Rename article        │ 
+  └──────────────────────────────┘  │  Q    Refresh data          │ 
+                                    │  w    Download & rename pdf │
                                     └─────────────────────────────┘
   ┌─ Filters ────────────────────┐                                                                 
   │ /     Search title/URL       │  ┌─ Item Indicators ───────────┐
