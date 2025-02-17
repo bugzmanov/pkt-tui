@@ -12,7 +12,7 @@ Features
    [x] first snapshot download
  [x] replicate pkt-tui as a website - pkt-tui-web
  [x] MEDIUM: Tag editing
- [.] BIG: rss feeds queue
+ [x] BIG: rss feeds queue
    [ ] non-blocking adding to pocket (the operation is supricingly slow)
    [ ] Optimization: Use HTTP headers like If-Modified-Since or ETag when requesting the feed, to avoid reloading same stuff
  [ ] it should be possible to recotegorize article type
