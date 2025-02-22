@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use log::error;
 
 use crate::{storage::PocketItem, TableRow};
 //----
@@ -123,6 +124,7 @@ pub fn render_stats(_today_stats: &Stats, week_stats: &Stats, _month_stats: &Sta
         std::cmp::max(week_stats.videos_added, week_stats.pdfs_added),
     );
 
+    let wdth = std::cmp::max(std::cmp::min(45, max_added), std::cmp::min(45, max_read));
     let progress_bar =
         |label: &str, read: usize, added: usize, output: &mut String, draw_notch: bool| {
             let progress_added = "■".repeat(std::cmp::min(added, 45))
@@ -139,7 +141,7 @@ pub fn render_stats(_today_stats: &Stats, week_stats: &Stats, _month_stats: &Sta
                 progress_read,
                 read,
                 notch = notch,
-                width = max_added.max(max_read)
+                width = wdth //max_added.max(max_read)
             )
             .unwrap();
         };

@@ -13,8 +13,10 @@ Features
  [x] replicate pkt-tui as a website - pkt-tui-web
  [x] MEDIUM: Tag editing
  [x] BIG: rss feeds queue
-   [ ] non-blocking adding to pocket (the operation is supricingly slow)
+   [ ] non-blocking adding to pocket (the operation is suprisingly slow)
    [ ] Optimization: Use HTTP headers like If-Modified-Since or ETag when requesting the feed, to avoid reloading same stuff
+   [ ] rss source finder given site url
+ [ ] Favs authors(sites & youtube channels)
  [ ] it should be possible to recotegorize article type
  [ ] Sharing snapshot file via icloud
  [ ] "Bump to top" - old article that i think needs to be read sooner than later
@@ -28,6 +30,7 @@ Features
      [ ] Local archieve of the actual articles/videos and fuzzy search in archieves
      [ ] VIDEO downloads - integration with yt-dlp
      [ ] Articles downloads
+        [ ] Text to audio
  [ ] Fuzzy search
  [ ] Figure out viewport parameters automatically (instead of current hardcode)
  [ ] Command mode ":" like in vim
@@ -36,6 +39,7 @@ Features
  [ ] sneaky jumps
  [ ] White papers domains (https://arxiv.org/ https://dl.acm.org/doi/) should mark item type as pdf
     [ ] Downloading those becomes more painful
+ [ ] BIG: mailing lists reader
 
 Tech Dept:
  [ ] Proper exit instead of panic
@@ -58,6 +62,7 @@ Low priority:
  [ ] auto-tagging
 
 Bugs:
+ [ ] add timeouts to pocket requests
  [ ] Filter and search behaviour '/' is somewhat confusing
  [ ] Weekly starts shows no data in a blank state mode - when delta is empty.
      The counters for added items might use ts from snapshots
@@ -76,6 +81,7 @@ Bugs:
     Text: "\nMaking Lockless Synchronization Fast:\nPerformance Implications of Memory Reclamation\n\nThomas E. Hart1∗, Paul E. McKenney2, and Angela Demke Brown1\n\n1University of Toronto 2IBM Beaverton\nDept. of Computer Science Linux Technology Center\n\nToronto, ON M5S 2E4 CAN Beaverton, OR 97006 USA\n{tomhart, demke}@cs.toronto.edu paulmck@us.ibm.com\n\nAbstract\n\nAchieving high performance for concurrent applications\non modern multiprocessors remains challenging. Many pro-\ngrammers avoid locking to improve perf"
     (2025-02-12 05:01:47.645 TRACE /Users/rafaelbagmanov/.cargo/registry/src/index.crates.io-6f17d22bba15001f/reqwest-0.12.12/src/connect.rs:1301) d20dc3b0 write: b"POST /v3/send HTTP/1.1\r\naccept: */*\r\ncontent-type: application/json; charset=UTF-8\r\nx-accept: application/json\r\nhost: getpocket.com\r\ncontent-length: 249\r\n\r\n{\"consumer_key\":\"110856-cba018037b073c92d23edc4\",\"access_token\":\"be853232-3011-ddfa-b974-fccbb9\",\"actions\":[{\"action\":\"add\",\"item_id\":\"591878615\",\"time\":1739354459,\"title\":\"untitled\",\"url\":\"http://www.rdrop.com/users/paulmck/RCU/hart_ipdps06.pdf\"}]}"
  [ ]  filter by domain -> drop filter -> the cursor jumps to the beginning of the list
+ [ ]  search by '/', remove an item => the list now shows unrelated to search articles
 
 ideas:
 - tui UI designer

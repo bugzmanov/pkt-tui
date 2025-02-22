@@ -641,6 +641,19 @@ struct FilteredItems<T> {
 }
 
 impl<T> FilteredItems<T> {
+    pub fn non_archived(data: Vec<PocketItem>) -> FilteredItems<PocketItem> {
+        let filtered = data
+            .into_iter()
+            .filter(|x| x.status != "1")
+            .collect::<Vec<PocketItem>>();
+        let data_vec_size = filtered.len();
+        FilteredItems {
+            items: filtered,
+            is_filter_on: false,
+            filtered: Vec::with_capacity(data_vec_size),
+        }
+    }
+
     pub fn new(data: Vec<T>) -> Self {
         let data_vec_size = data.len();
         FilteredItems {
@@ -794,7 +807,7 @@ impl App {
             scroll_state: ScrollbarState::new(1), //todo: fix this
             colors: TableColors::new(&PALETTES[0]),
             color_index: 0,
-            items: FilteredItems::new(data_vec),
+            items: FilteredItems::<PocketItem>::non_archived(data_vec),
             app_mode: AppMode::Initialize,
             pocket_client,
             stats,
@@ -815,6 +828,115 @@ impl App {
             cached_tags,
             rss_feed_state: RssFeedState::new(),
         }
+    }
+
+    fn handle_neovim_edit(&mut self) -> anyhow::Result<Option<String>> {
+        // Create a temporary file
+        let temp_path = format!("/tmp/pocket_tui_{}.txt", std::process::id());
+        File::create(&temp_path)?;
+
+        // Save terminal state and switch to normal mode for neovim
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        // Launch neovim
+        let status = std::process::Command::new("nvim")
+            .arg(&temp_path)
+            .status()
+            .context("Failed to start neovim")?;
+
+        // Restore terminal state for Ratatui
+        enable_raw_mode()?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+
+        let result = if status.success() {
+            let content = fs::read_to_string(&temp_path)?;
+            fs::remove_file(&temp_path)?;
+            Ok(Some(content))
+        } else {
+            Ok(None)
+        };
+
+        // Clean up temp file if it still exists
+        if Path::new(&temp_path).exists() {
+            fs::remove_file(&temp_path)?;
+        }
+
+        // Queue a redraw of the UI
+        crossterm::queue!(
+            io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        )?;
+        io::stdout().flush()?;
+
+        result
+    }
+
+    //// ------- tmux based popup. working but requires tmux
+    // fn handle_neovim_edit(&mut self) -> anyhow::Result<Option<String>> {
+    //     if !self.is_inside_tmux() {
+    //         return Err(anyhow::anyhow!("Must be running inside tmux session"));
+    //     }
+
+    //     // Create a temporary file
+    //     let temp_path = format!("/tmp/pocket_tui_{}.txt", std::process::id());
+    //     File::create(&temp_path)?;
+
+    //     // Calculate dimensions for the popup (80% of terminal size)
+    //     let terminal_size = crossterm::terminal::size()?;
+    //     let width = (terminal_size.0 as f32 * 0.8) as u16;
+    //     let height = (terminal_size.1 as f32 * 0.8) as u16;
+    //     let x = (terminal_size.0 - width) / 2;
+    //     let y = (terminal_size.1 - height) / 2;
+
+    //     // Launch tmux popup with neovim without disturbing current terminal
+    //     let tmux_cmd = format!(
+    //         "tmux popup -E -d '{}' -w {} -h {} -x {} -y {} 'nvim {}'",
+    //         std::env::current_dir()?.display(),
+    //         width,
+    //         height,
+    //         x,
+    //         y,
+    //         temp_path
+    //     );
+
+    //     let output = std::process::Command::new("sh")
+    //         .arg("-c")
+    //         .arg(&tmux_cmd)
+    //         .output()
+    //         .context("Failed to start tmux popup with neovim")?;
+
+    //     let result = if output.status.success() {
+    //         // Read the content after editing
+    //         let content = fs::read_to_string(&temp_path)?;
+    //         fs::remove_file(&temp_path)?;
+    //         Ok(Some(content))
+    //     } else {
+    //         Ok(None)
+    //     };
+
+    //     // Clean up temp file if it still exists
+    //     if Path::new(&temp_path).exists() {
+    //         fs::remove_file(&temp_path)?;
+    //     }
+
+    //     result
+    // }
+
+    fn is_tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok()
+    }
+
+    fn is_inside_tmux(&self) -> bool {
+        std::env::var("TMUX").is_ok()
     }
 
     pub fn start_rss_feed_loading(&mut self) -> anyhow::Result<()> {
@@ -1071,7 +1193,7 @@ impl App {
             .into_iter()
             .collect();
         self.stats = stats;
-        self.items = FilteredItems::new(items);
+        self.items = FilteredItems::<PocketItem>::non_archived(items);
         self.apply_filter();
         Ok(())
     }
@@ -2200,6 +2322,28 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                     Char('n') => {
                         if app.rss_feed_popup_state.is_none() {
                             app.show_rss_feed_popup()?;
+                        }
+                    }
+                    Char('b') => {
+                        match app.handle_neovim_edit() {
+                            Ok(Some(content)) => {
+                                // Use the edited content here
+                                // For example, you could store it in the currently selected item
+                                if let Some(idx) = app.virtual_state.selected() {
+                                    if let Some(item) = app.items.get_mut(idx) {
+                                        // Do something with the content
+                                        // For example:
+                                        // item.notes = content;
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                // User cancelled or no changes
+                            }
+                            Err(e) => {
+                                // Show error in the footer or status area
+                                error!("Neovim edit failed: {}", e);
+                            }
                         }
                     }
                     Char('?') => app.show_help_popup()?,
