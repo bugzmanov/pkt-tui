@@ -1,6 +1,7 @@
 /target
 temp
 pdfs/
+articles/
 log.txt
 snapshot_updates.db
 snapshot.db

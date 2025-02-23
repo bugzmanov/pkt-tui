@@ -22,8 +22,8 @@ Features
  [ ] "Bump to top" - old article that i think needs to be read sooner than later
  [.] Figure out design for archived, deleted and favourite
      [x] PDF downloads
+        [x] PDFs title parser
         [ ] Better file naming ?
-     [x] PDFs title parser
      [ ] Show/hide favourites/archived
        [ ] Status line
      [ ] index for fuzzy searching
@@ -33,8 +33,6 @@ Features
         [ ] Text to audio
  [ ] Fuzzy search
  [ ] Figure out viewport parameters automatically (instead of current hardcode)
- [ ] Command mode ":" like in vim
-     [ ] display modes: don't show favs & reads, show top only, etc
  [ ] Save marks
  [ ] sneaky jumps
  [ ] White papers domains (https://arxiv.org/ https://dl.acm.org/doi/) should mark item type as pdf
@@ -47,6 +45,8 @@ Tech Dept:
  [ ] Logging of http requests/responses
  [ ] Integration tests (oof)
  [ ] Simplify App modes (some of popups represented both as a mode and status in App{})
+ [ ] Command mode ":" like in vim
+     [ ] display modes: don't show favs & reads, show top only, etc
 
 Low priority:
  [ ] Enable mouse for jumps and copy-pasting

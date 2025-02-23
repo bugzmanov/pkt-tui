@@ -3,6 +3,7 @@
 mod auth;
 mod errors;
 mod logo;
+mod markdown;
 mod pocket;
 mod prss;
 mod readingstats;
@@ -20,6 +21,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use dom_smoothie::{Article, Config, Readability};
 use itertools::Itertools;
 use log::{error, LevelFilter};
 use pocket::{GetPocketSync, SendResponse};
@@ -1133,6 +1135,210 @@ impl App {
         Ok(())
     }
 
+    fn download_and_convert_article(&mut self) -> anyhow::Result<()> {
+        if let Some(idx) = self.virtual_state.selected() {
+            if let Some(item) = self.items.get(idx) {
+                if item.item_type() == "article" {
+                    // Create articles directory if it doesn't exist
+                    fs::create_dir_all("articles")?;
+
+                    // Create sanitized filename from title
+                    // let title = item.title();
+                    // let filename = sanitize_filename::sanitize(title); //sanitazie_filename might be redundant dependency
+                    let filename = item.item_id.clone();
+                    let filename = if filename.is_empty() {
+                        "untitled".to_string()
+                    } else {
+                        filename
+                    };
+                    let path = Path::new("articles").join(format!("{}.md", filename));
+
+                    // Download the article content
+                    let response = self.download_client
+                                        .get(item.url())
+                                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+                                        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+                                        .header("Accept-Language", "en-US,en;q=0.5")
+                                        .header("Connection", "keep-alive")
+                                        .header("Upgrade-Insecure-Requests", "1")
+                                        .header("Sec-Fetch-Dest", "document")
+                                        .header("Sec-Fetch-Mode", "navigate")
+                                        .header("Sec-Fetch-Site", "none")
+                                        .header("Sec-Fetch-User", "?1")
+                                        .send()?;
+                    let status = response.status();
+                    let html_content = response
+                        .text()
+                        .unwrap_or_else(|_| "No response body".to_string());
+                    if !status.is_success() {
+                        return Err(anyhow::anyhow!(
+                            "Failed to download article: HTTP {} - {}",
+                            status,
+                            html_content
+                        ));
+                    }
+                    let md = html2md::rewrite_html(&html_content, true);
+
+                    // Configure and parse with dom_smoothie
+                    let cfg = Config {
+                        max_elements_to_parse: 9000,
+                        text_mode: dom_smoothie::TextMode::Formatted,
+                        ..Default::default()
+                    };
+
+                    let mut readability =
+                        Readability::new(html_content.as_str(), Some(item.url()), Some(cfg))?;
+                    // Readability::new(md.as_str(), Some(item.url()), Some(cfg))?;
+                    let article: Article = readability.parse()?;
+
+                    // Create markdown content with metadata and article details
+                    let mut content = String::new();
+
+                    // Add YAML frontmatter
+                    // content.push_str("---\n");
+                    // content.push_str(&format!("title: {}\n", article.title));
+                    // content.push_str(&format!("url: {}\n", item.url()));
+                    // content.push_str(&format!("date_added: {}\n", item.date()));
+
+                    // // Add optional metadata if available
+                    // if let Some(byline) = article.byline {
+                    //     content.push_str(&format!("author: {}\n", byline));
+                    // }
+                    // if let Some(site_name) = article.site_name {
+                    //     content.push_str(&format!("site_name: {}\n", site_name));
+                    // }
+                    // if let Some(published_time) = article.published_time {
+                    //     content.push_str(&format!("published_time: {}\n", published_time));
+                    // }
+                    // if let Some(modified_time) = article.modified_time {
+                    //     content.push_str(&format!("modified_time: {}\n", modified_time));
+                    // }
+                    // if let Some(excerpt) = article.excerpt {
+                    //     content.push_str(&format!("excerpt: {}\n", excerpt));
+                    // }
+                    // content.push_str("---\n\n");
+
+                    // Add article content
+                    let result = markdown::normalize_markdown(&md, &article.text_content);
+                    content.push_str(&article.text_content);
+                    content.push_str("--------\n\n");
+                    content.push_str(&md);
+                    content.push_str("--------\n\n");
+                    content.push_str(&result);
+
+                    // Save to file
+                    fs::write(&path, content)?;
+
+                    // Mark as downloaded in Pocket
+                    self.pocket_client
+                        .mark_as_downloaded(item.id().parse::<usize>()?)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // /// Checks if a line is a markdown header
+    // fn is_header(line: &str) -> bool {
+    //     line.trim_start().starts_with('#')
+    // }
+
+    // /// Checks if a line should stay attached to the previous line
+    // fn should_stay_attached(line: &str) -> bool {
+    //     // Headers should be followed by their content
+    //     Self::is_header(line) ||
+    //     // List items should stay together
+    //     line.trim_start().starts_with('*') ||
+    //     line.trim_start().starts_with('-') ||
+    //     line.trim_start().starts_with(|c: char| c.is_ascii_digit() && line.contains(". ")) ||
+    //     // Code blocks should stay together
+    //     line.trim_start().starts_with('`') ||
+    //     // Continuation of a sentence (no capital letter at start)
+    //     (!line.trim_start().is_empty() &&
+    //      !Self::is_header(line) &&
+    //      line.trim_start().chars().next()
+    //          .map(|c| !c.is_uppercase())
+    //          .unwrap_or(false))
+    // }
+
+    // /// Normalizes markdown content by:
+    // /// 1. Removing preamble/postamble content not present in plain text
+    // /// 2. Restoring proper paragraph separation while preserving markdown formatting
+    // pub fn normalize_markdown(markdown: &str, plain: &str) -> String {
+    //     // First, find the start of actual content
+    //     let first_plain_para = plain.split("\n\n").next().unwrap_or("").trim();
+
+    //     let markdown_lines: Vec<&str> = markdown.lines().collect();
+    //     let mut start_idx = 0;
+
+    //     // Find content start
+    //     for (i, window) in markdown_lines.windows(3).enumerate() {
+    //         let combined = window.join(" ");
+    //         if combined.contains(first_plain_para) {
+    //             start_idx = i;
+    //             break;
+    //         }
+    //     }
+
+    //     // Find content end
+    //     let mut end_idx = markdown_lines.len();
+    //     for (i, line) in markdown_lines.iter().enumerate().rev() {
+    //         if line.contains("## Related posts")
+    //             || line.contains("Blog Comments")
+    //             || line.contains("Contents")
+    //         {
+    //             end_idx = i;
+    //             break;
+    //         }
+    //     }
+
+    //     // Process content while preserving markdown formatting
+    //     let mut result = Vec::new();
+    //     let mut current_group = Vec::new();
+
+    //     for (i, line) in markdown_lines[start_idx..end_idx].iter().enumerate() {
+    //         let trimmed = line.trim();
+    //         if trimmed.is_empty() {
+    //             if !current_group.is_empty() {
+    //                 result.push(current_group.join("\n"));
+    //                 current_group.clear();
+    //             }
+    //             continue;
+    //         }
+
+    //         // Check if this line should be kept with the previous content
+    //         if i > 0 && Self::should_stay_attached(trimmed) {
+    //             current_group.push(trimmed);
+    //         } else {
+    //             if !current_group.is_empty() {
+    //                 result.push(current_group.join("\n"));
+    //                 current_group.clear();
+    //             }
+    //             current_group.push(trimmed);
+    //         }
+    //     }
+
+    //     // Add final group if any
+    //     if !current_group.is_empty() {
+    //         result.push(current_group.join("\n"));
+    //     }
+
+    //     // Join paragraphs with double newlines
+    //     let content = result
+    //         .into_iter()
+    //         .filter(|p| !p.is_empty())
+    //         .collect::<Vec<_>>()
+    //         .join("\n\n");
+
+    //     // Clean up the final string while preserving markdown structure
+    //     content
+    //         .split("\n\n")
+    //         .map(|para| para.trim())
+    //         .filter(|para| !para.is_empty())
+    //         .collect::<Vec<_>>()
+    //         .join("\n\n")
+    // }
+
     pub fn show_rss_feed_popup(&mut self) -> anyhow::Result<()> {
         if let Ok(is_loading) = self.rss_feed_state.is_loading.lock() {
             if (*is_loading) {
@@ -1931,7 +2137,21 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                 if pop.was_redered {
                     let refresh_result = match pop.refresh_type {
                         LoadingType::Refresh => app.refresh_data(),
-                        LoadingType::Download => app.download_current_pdf(),
+                        LoadingType::Download => {
+                            if let Some(idx) = app.virtual_state.selected() {
+                                if let Some(item) = app.items.get(idx) {
+                                    match item.item_type() {
+                                        "pdf" => app.download_current_pdf(),
+                                        "article" => app.download_and_convert_article(),
+                                        _ => Ok(()),
+                                    }
+                                } else {
+                                    Ok(())
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        }
                     };
 
                     match refresh_result {
@@ -1945,6 +2165,24 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                 } else {
                     pop.was_redered = true;
                 }
+
+                // if pop.was_redered {
+                //     let refresh_result = match pop.refresh_type {
+                //         LoadingType::Refresh => app.refresh_data(),
+                //         LoadingType::Download => app.download_current_pdf(),
+                //     };
+
+                //     match refresh_result {
+                //         Ok(_) => {
+                //             app.switch_to_normal_mode();
+                //         }
+                //         Err(err) => {
+                //             app.app_mode = AppMode::Error(err.to_string());
+                //         }
+                //     }
+                // } else {
+                //     pop.was_redered = true;
+                // }
             }
             AppMode::Error(err) => {
                 if let Event::Key(key) = event::read()? {
@@ -2297,11 +2535,19 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                     Char('w') => {
                         if let Some(idx) = app.virtual_state.selected() {
                             if let Some(item) = app.items.get(idx) {
-                                if item.item_type() == "pdf" {
-                                    app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
-                                        "Downloading pdf ⏳".to_string(),
-                                        LoadingType::Download,
-                                    ));
+                                match item.item_type() {
+                                    "pdf" | "article" => {
+                                        let message = match item.item_type() {
+                                            "pdf" => "Downloading pdf ⏳",
+                                            "article" => "Downloading article ⏳",
+                                            _ => unreachable!(),
+                                        };
+                                        app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
+                                            message.to_string(),
+                                            LoadingType::Download,
+                                        ));
+                                    }
+                                    _ => {} // Do nothing for other types
                                 }
                             }
                         }

@@ -31,6 +31,9 @@ cli-clipboard = "0.4"
 rss = "2.0"
 atom_syndication = "0.12"
 rayon = "1.8"
+dom_smoothie = "0.6.1"
+sanitize-filename = "0.6.0"
+fast_html2md = "0.0.47"
 
 [dev-dependencies]
 tempfile = "3.10.1"
