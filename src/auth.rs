@@ -20,7 +20,7 @@ struct RequestTokenResponse {
 #[derive(Deserialize, Debug)]
 struct AccessTokenResponse {
     access_token: String,
-    _username: String, //todo: use username to store user dedicated snapshots
+    username: String, //todo: use username to store user dedicated snapshots
 }
 
 #[derive(Serialize)]
