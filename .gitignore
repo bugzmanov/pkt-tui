@@ -3,8 +3,6 @@ temp
 pdfs/
 articles/
 log.txt
-snapshot_updates.db
-snapshot.db
 user.key
 hidden_rss_items.txt
 .DS_Store
