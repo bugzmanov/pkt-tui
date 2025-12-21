@@ -266,6 +266,21 @@ pub struct RssFeedPopupState {
 }
 
 impl RssFeedPopupState {
+    pub fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            selected_index: 0,
+            scroll_offset: 0,
+            visible_items: 20,
+            hidden_items: prss::hidden_items::HiddenItems::new(),
+            status_message: None,
+            pending_pocket_item: None,
+            show_description: false,
+            changes_made: false,
+            pending_key: None,
+        }
+    }
+
     pub fn new(mut items: Vec<RssFeedItem>, visible_items: usize) -> anyhow::Result<Self> {
         let hidden_items = prss::hidden_items::HiddenItems::load()?;
         items.retain(|item| !hidden_items.is_hidden(&item.item_id));
@@ -728,6 +743,12 @@ enum AppMode {
     Error(String),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum CurrentTab {
+    Raindrops,
+    RssFeed,
+}
+
 struct FilteredItems<T> {
     pub items: Vec<T>,
     is_filter_on: bool,
@@ -884,6 +905,8 @@ struct App {
     download_client: Client,
     cached_tags: Vec<String>,
     rss_feed_state: RssFeedState,
+    current_tab: CurrentTab,
+    rss_tab_state: RssFeedPopupState,
 }
 
 impl App {
@@ -928,6 +951,8 @@ impl App {
             rss_feed_popup_state: None,
             cached_tags,
             rss_feed_state: RssFeedState::new(),
+            current_tab: CurrentTab::Raindrops,
+            rss_tab_state: RssFeedPopupState::empty(),
         }
     }
 
@@ -1155,9 +1180,15 @@ impl App {
     }
 
     fn update_tags(&mut self, tags: String) -> anyhow::Result<()> {
-        // Handle RSS item tags
+        // Handle RSS popup item tags
         if let Some(popup_state) = &mut self.rss_feed_popup_state {
             popup_state.add_current_to_raindrop(&self.raindrop_client, &tags)?;
+            return Ok(());
+        }
+
+        // Handle RSS tab item tags
+        if self.current_tab == CurrentTab::RssFeed && self.rss_tab_state.pending_pocket_item.is_some() {
+            self.rss_tab_state.add_current_to_raindrop(&self.raindrop_client, &tags)?;
             return Ok(());
         }
 
@@ -1474,6 +1505,43 @@ impl App {
             }
         }
         // self.rss_feed_popup_state = None;
+        Ok(())
+    }
+
+    pub fn handle_rss_tab_selection(&mut self) -> anyhow::Result<()> {
+        if let Some(selected_item) = self.rss_tab_state.items.get(self.rss_tab_state.selected_index) {
+            if !selected_item.link.is_empty() {
+                webbrowser::open(&selected_item.link)
+                    .context("Failed to open link in browser")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn process_add_to_pocket_with_tags_rss_tab(&mut self) -> anyhow::Result<()> {
+        if let Some(_item) = self.rss_tab_state.prepare_add_to_pocket() {
+            self.switch_to_tags_mode(None);
+        }
+        Ok(())
+    }
+
+    fn sync_rss_tab_items(&mut self) -> anyhow::Result<()> {
+        if let Ok(items_guard) = self.rss_feed_state.items.lock() {
+            if !items_guard.is_empty() {
+                let hidden_items = prss::hidden_items::HiddenItems::load()?;
+                let filtered_items: Vec<RssFeedItem> = items_guard
+                    .iter()
+                    .filter(|item| !hidden_items.is_hidden(&item.item_id))
+                    .cloned()
+                    .collect();
+                self.rss_tab_state.items = filtered_items;
+                // Reset scroll position if needed
+                if self.rss_tab_state.selected_index >= self.rss_tab_state.items.len() {
+                    self.rss_tab_state.selected_index = 0;
+                    self.rss_tab_state.scroll_offset = 0;
+                }
+            }
+        }
         Ok(())
     }
     fn show_help_popup(&mut self) -> anyhow::Result<()> {
@@ -2680,9 +2748,72 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                         _ => {}
                     }
                 }
+            } else if app.current_tab == CurrentTab::RssFeed {
+                // RSS Tab input handling
+                let popup_state = &mut app.rss_tab_state;
+                // Handle multi-char commands first
+                if let Some(pending) = popup_state.pending_key.take() {
+                    match (pending, key.code) {
+                        ('d', Char('d')) => {
+                            popup_state.hide_current_item()?;
+                            return Ok(());
+                        }
+                        ('g', Char('g')) => {
+                            popup_state.scroll_to_beginning();
+                        }
+                        _ => {
+                            // Invalid sequence, ignore
+                        }
+                    }
+                } else {
+                    match key.code {
+                        Tab => {
+                            app.current_tab = CurrentTab::Raindrops;
+                        }
+                        Char('j') | Down => popup_state.move_selection(1),
+                        Char('k') | Up => popup_state.move_selection(-1),
+                        Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            popup_state.page_down();
+                        }
+                        Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            popup_state.page_up();
+                        }
+                        Char('d') => {
+                            popup_state.pending_key = Some('d');
+                        }
+                        Char('g') => {
+                            popup_state.pending_key = Some('g');
+                        }
+                        Char('G') => {
+                            popup_state.scroll_to_end();
+                        }
+                        Char('p') => app.rss_tab_state.show_description = !app.rss_tab_state.show_description,
+                        Char('a') => {
+                            app.process_add_to_pocket_with_tags_rss_tab()?;
+                            return Ok(());
+                        }
+                        Enter => app.handle_rss_tab_selection()?,
+                        Esc => {
+                            if app.rss_tab_state.show_description {
+                                app.rss_tab_state.show_description = false;
+                            }
+                        }
+                        Char('Q') => {
+                            app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
+                                "Refreshing ⏳".to_string(),
+                                LoadingType::Refresh,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
             } else {
-                //normal mode
+                //normal mode (Raindrops tab)
                 match key.code {
+                    Tab => {
+                        app.sync_rss_tab_items()?;
+                        app.current_tab = CurrentTab::RssFeed;
+                    }
                     Enter => {
                         if app.tag_popup_state.is_some() {
                             app.select_tag();
@@ -2819,7 +2950,12 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
-    let rects = Layout::vertical([Constraint::Min(5), Constraint::Length(3)]).split(f.area());
+    let rects = Layout::vertical([
+        Constraint::Length(1),  // Tab bar
+        Constraint::Min(5),     // Content area
+        Constraint::Length(3),  // Footer (border + text + border)
+    ])
+    .split(f.area());
     app.set_colors();
 
     if let AppMode::Initialize = app.app_mode {
@@ -2828,21 +2964,32 @@ fn ui(f: &mut Frame, app: &mut App) {
             Block::default().style(Style::default().bg(OCEANIC_NEXT.base_00)), //app.colors.buffer_bg)),
             f.area(),
         );
-        logo::render(f, rects[0]);
+        logo::render(f, rects[1]);
         return;
     }
 
-    render_table(f, app, rects[0]);
+    // Render tab bar
+    render_tab_bar(f, app, rects[0]);
 
-    render_scrollbar(f, app, rects[0]);
+    // Render content based on current tab
+    match app.current_tab {
+        CurrentTab::Raindrops => {
+            render_table(f, app, rects[1]);
+            render_scrollbar(f, app, rects[1]);
+        }
+        CurrentTab::RssFeed => {
+            render_rss_tab(f, app, rects[1]);
+        }
+    }
 
-    render_footer(f, app, rects[1]);
+    render_footer(f, app, rects[2]);
 
-    render_domain_stats_popup(f, app, rects[0]);
-
-    render_help_popup(f, app, rects[0]);
-
-    render_rss_feed_popup(f, app, rects[0]); //todo: move if out of render
+    // Overlays (only for Raindrops tab)
+    if app.current_tab == CurrentTab::Raindrops {
+        render_domain_stats_popup(f, app, rects[1]);
+        render_help_popup(f, app, rects[1]);
+        render_rss_feed_popup(f, app, rects[1]); //todo: move if out of render
+    }
 
     if let AppMode::Error(message) = &app.app_mode {
         render_error_popup(f, message, f.size(), &app.colors);
@@ -3058,7 +3205,8 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                     );
                     let stats_table: Vec<&str> =
                         tmp.split("\n").skip(actual_index * 3).take(3).collect();
-                    Cell::from(Text::from(stats_table.join("\n").to_string())).style(selected_style)
+                    Cell::from(Text::from(stats_table.join("\n").to_string()))
+                        .style(Style::default().fg(OCEANIC_NEXT.base_03))
                 } else {
                     if multiple_entries_for_date {
                         let stats = collect_stats(&app.items.items, actual_index); //todo! accessing items of items
@@ -3070,6 +3218,7 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                             stats.videos_total
                         );
                         Cell::from(Text::from(format!("{}", stats_str)))
+                            .style(Style::default().fg(OCEANIC_NEXT.base_03))
                     } else {
                         Cell::from(Text::from("".to_string()))
                     }
@@ -3089,7 +3238,13 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
     .row_highlight_style(selected_style)
     .highlight_symbol(Text::from(vec![" > ".into(), "".into(), "".into()]))
     .bg(app.colors.buffer_bg)
-    .highlight_spacing(HighlightSpacing::Always);
+    .highlight_spacing(HighlightSpacing::Always)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(OCEANIC_NEXT.base_02))
+            .border_type(BorderType::Rounded),
+    );
     f.render_stateful_widget(t, area, &mut app.state);
 }
 
@@ -3112,6 +3267,256 @@ fn constraint_len_calculator<T: TableRow>(items: &[T]) -> (u16, u16, u16) {
 
     #[allow(clippy::cast_possible_truncation)]
     (name_len as u16, title_len as u16, email_len as u16)
+}
+
+fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+    let rss_count = app.rss_tab_state.items.len();
+    let has_updates = app.rss_feed_state.has_updates;
+
+    let raindrops_style = if app.current_tab == CurrentTab::Raindrops {
+        Style::default()
+            .fg(OCEANIC_NEXT.base_00)
+            .bg(OCEANIC_NEXT.base_0d)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(OCEANIC_NEXT.base_04)
+    };
+
+    let rss_style = if app.current_tab == CurrentTab::RssFeed {
+        Style::default()
+            .fg(OCEANIC_NEXT.base_00)
+            .bg(OCEANIC_NEXT.base_0d)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(OCEANIC_NEXT.base_04)
+    };
+
+    let rss_label = if rss_count > 0 || has_updates {
+        format!(" RSS ({}) ", rss_count)
+    } else {
+        " RSS ".to_string()
+    };
+
+    let mut spans = vec![
+        Span::styled(" Raindrops ", raindrops_style),
+        Span::raw(" "),
+        Span::styled(rss_label, rss_style),
+    ];
+
+    // Add update indicator if there are new RSS items
+    if has_updates && app.current_tab != CurrentTab::RssFeed {
+        spans.push(Span::styled(
+            " ● ",
+            Style::default().fg(OCEANIC_NEXT.base_0e),
+        ));
+    }
+
+    spans.push(Span::styled(
+        "  [Tab] switch",
+        Style::default().fg(OCEANIC_NEXT.base_03),
+    ));
+
+    let tab_bar = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(app.colors.buffer_bg));
+
+    f.render_widget(tab_bar, area);
+}
+
+fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
+    let popup_state = &app.rss_tab_state;
+
+    if popup_state.items.is_empty() {
+        let empty_text = Paragraph::new("No RSS items. Press 'Q' to refresh feeds.")
+            .style(Style::default().fg(OCEANIC_NEXT.base_03))
+            .alignment(Alignment::Center);
+        f.render_widget(empty_text, area);
+        return;
+    }
+
+    // Calculate visible items based on area height
+    let visible_items = (area.height as usize).saturating_sub(2);
+
+    // Group items by source and count them
+    let mut source_counts = std::collections::HashMap::new();
+    for item in &popup_state.items {
+        *source_counts.entry(&item.source).or_insert(0) += 1;
+    }
+
+    // Keep track of which sources we've seen while rendering
+    let mut seen_sources = std::collections::HashSet::new();
+
+    let items: Vec<ListItem> = popup_state
+        .items
+        .iter()
+        .skip(popup_state.scroll_offset)
+        .take(visible_items)
+        .enumerate()
+        .map(|(i, item)| {
+            // Show source info only if we haven't seen this source yet
+            let source_column = if !seen_sources.contains(&item.source) {
+                seen_sources.insert(&item.source);
+                let count = source_counts.get(&item.source).unwrap_or(&0);
+                format!(" {} ({})", item.source, count)
+            } else {
+                String::new()
+            };
+
+            let date_and_title = if let Some(pub_date) = &item.pub_date {
+                let date_str = if pub_date.len() >= 10 {
+                    &pub_date[0..10]
+                } else {
+                    pub_date
+                };
+                vec![
+                    Span::styled(
+                        format!("{:<10}", date_str),
+                        Style::default().fg(OCEANIC_NEXT.base_03),
+                    ),
+                    Span::raw(": "),
+                    Span::styled(&item.title, Style::default().fg(OCEANIC_NEXT.base_05)),
+                ]
+            } else {
+                vec![
+                    Span::styled(
+                        format!("{:<10}", "unknown"),
+                        Style::default().fg(OCEANIC_NEXT.base_03),
+                    ),
+                    Span::raw(": "),
+                    Span::styled(&item.title, Style::default().fg(OCEANIC_NEXT.base_05)),
+                ]
+            };
+
+            let source_span = Span::styled(
+                format!("{:<25}", source_column),
+                Style::default().fg(OCEANIC_NEXT.base_0d),
+            );
+
+            let content = Line::from(
+                [vec![source_span, Span::raw("│ ")], date_and_title].concat(),
+            );
+
+            let style = if i + popup_state.scroll_offset == popup_state.selected_index {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::default()
+            };
+
+            ListItem::new(vec![content]).style(style)
+        })
+        .collect();
+
+    let feed_list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(OCEANIC_NEXT.base_02))
+                .border_type(BorderType::Rounded),
+        )
+        .style(Style::new().bg(app.colors.buffer_bg));
+
+    f.render_widget(feed_list, area);
+
+    // Scrollbar
+    let scrollbar = Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"));
+
+    let mut scroll_state =
+        ScrollbarState::new(popup_state.items.len()).position(popup_state.scroll_offset);
+
+    f.render_stateful_widget(
+        scrollbar,
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut scroll_state,
+    );
+
+    // Description popup overlay
+    if popup_state.show_description {
+        if let Some(selected_item) = popup_state.items.get(popup_state.selected_index) {
+            let desc_popup_area = centered_rect(70, 40, f.area());
+            f.render_widget(Clear, desc_popup_area);
+
+            let description = selected_item
+                .description
+                .as_deref()
+                .unwrap_or("No description available");
+
+            let max_width = (desc_popup_area.width as usize).saturating_sub(4);
+            let wrapped_text = description
+                .split_whitespace()
+                .fold((String::new(), 0), |(mut text, len), word| {
+                    if len + word.len() + 1 > max_width {
+                        text.push('\n');
+                        (text + word, word.len())
+                    } else if text.is_empty() {
+                        (word.to_string(), word.len())
+                    } else {
+                        (text + " " + word, len + word.len() + 1)
+                    }
+                })
+                .0;
+
+            let text = Text::from(vec![
+                Line::from(vec![
+                    Span::styled("Title: ", Style::default().fg(OCEANIC_NEXT.base_0d)),
+                    Span::styled(&selected_item.title, Style::default().fg(OCEANIC_NEXT.base_05)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Source: ", Style::default().fg(OCEANIC_NEXT.base_0d)),
+                    Span::styled(&selected_item.source, Style::default().fg(OCEANIC_NEXT.base_05)),
+                ]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "Description:",
+                    Style::default().fg(OCEANIC_NEXT.base_0d),
+                )]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    wrapped_text,
+                    Style::default().fg(OCEANIC_NEXT.base_05),
+                )]),
+            ]);
+
+            let description_widget = Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Article Preview ")
+                        .border_style(Style::new().fg(app.colors.footer_border_color))
+                        .border_type(BorderType::Rounded),
+                )
+                .style(Style::new().bg(Color::Black))
+                .wrap(Wrap { trim: true })
+                .scroll((0, 0));
+
+            f.render_widget(description_widget, desc_popup_area);
+        }
+    }
+
+    // Status message
+    if let Some((message, timestamp)) = &popup_state.status_message {
+        if timestamp.elapsed() < Duration::from_secs(5) {
+            let status_area = Rect {
+                x: area.x,
+                y: area.y + area.height - 1,
+                width: area.width,
+                height: 1,
+            };
+            let status_text = Paragraph::new(Line::from(vec![Span::styled(
+                message,
+                Style::default().fg(OCEANIC_NEXT.base_0b),
+            )]))
+            .style(Style::default().bg(app.colors.buffer_bg))
+            .alignment(Alignment::Center);
+
+            f.render_widget(status_text, status_area);
+        }
+    }
 }
 
 fn render_scrollbar(f: &mut Frame, app: &mut App, area: Rect) {
@@ -3393,70 +3798,87 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         | AppMode::MulticharNormalModeEnter(_)
         | AppMode::Refreshing(_)
         | AppMode::Error(_) => {
-            let is_filtered = !app.selected_tag_filters.is_empty()
-                || app.item_type_filter != ItemTypeFilter::All
-                || app.domain_filter.is_some()
-                || app.active_search_filter.is_some();
-
-            let mut spans = if is_filtered {
-                vec![Span::raw("[Filter]")]
+            // Different footer content based on current tab
+            let spans = if app.current_tab == CurrentTab::RssFeed {
+                // RSS Tab footer
+                let item_count = app.rss_tab_state.items.len();
+                vec![
+                    Span::raw("j/k ↑↓ | "),
+                    Span::raw("Enter: open | "),
+                    Span::raw("dd: hide | "),
+                    Span::raw("p: preview | "),
+                    Span::raw("a: add to Raindrop | "),
+                    Span::raw("Q: refresh | "),
+                    Span::styled(
+                        format!("[{} items]", item_count),
+                        Style::default().fg(OCEANIC_NEXT.base_03),
+                    ),
+                ]
             } else {
-                vec![Span::raw(INFO_TEXT)]
+                // Raindrops Tab footer (original logic)
+                let is_filtered = !app.selected_tag_filters.is_empty()
+                    || app.item_type_filter != ItemTypeFilter::All
+                    || app.domain_filter.is_some()
+                    || app.active_search_filter.is_some();
+
+                let mut spans = if is_filtered {
+                    vec![Span::raw("[Filter]")]
+                } else {
+                    vec![Span::raw(INFO_TEXT)]
+                };
+
+                if let Some(search) = &app.active_search_filter {
+                    spans.extend_from_slice(&[Span::raw(" | /"), Span::raw(search)]);
+                }
+                if !app.selected_tag_filters.is_empty() {
+                    let tags: Vec<&str> = app.selected_tag_filters.iter().map(|s| s.as_str()).collect();
+                    spans.extend_from_slice(&[Span::raw(" | Tags: "), Span::raw(tags.join(", "))]);
+                }
+                if let Some(domain) = &app.domain_filter {
+                    spans.extend_from_slice(&[Span::raw(" | Site : "), Span::raw(domain)]);
+                }
+                if app.item_type_filter != ItemTypeFilter::All {
+                    let filter_text = match app.item_type_filter {
+                        ItemTypeFilter::All => unreachable!(),
+                        ItemTypeFilter::Article => "Articles",
+                        ItemTypeFilter::Video => "Videos",
+                        ItemTypeFilter::PDF => "PDFs",
+                    };
+                    spans.extend_from_slice(&[Span::raw(" | Doc type : "), Span::raw(filter_text)]);
+                }
+
+                if app.item_type_filter != ItemTypeFilter::All
+                    || !app.selected_tag_filters.is_empty()
+                    || app.active_search_filter.is_some()
+                {
+                    let text = format!("[Showing {} items]", app.items.len());
+                    spans.extend_from_slice(&[Span::raw(" ('ESC` to clear) | "), Span::raw(text)]);
+                }
+                if let Ok(items) = app.rss_feed_state.items.lock() {
+                    if !items.is_empty() {
+                        spans.extend_from_slice(&[
+                            Span::raw(" | "),
+                            Span::styled(
+                                " RSS updates ",
+                                Style::default()
+                                    .bg(OCEANIC_NEXT.base_0e) // Pink background
+                                    .fg(OCEANIC_NEXT.base_00) // Dark text for contrast
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]);
+                    }
+                }
+                spans
             };
 
-            if let Some(search) = &app.active_search_filter {
-                spans.extend_from_slice(&[Span::raw(" | /"), Span::raw(search)]);
-            }
-            if !app.selected_tag_filters.is_empty() {
-                let tags: Vec<&str> = app.selected_tag_filters.iter().map(|s| s.as_str()).collect();
-                spans.extend_from_slice(&[Span::raw(" | Tags: "), Span::raw(tags.join(", "))]);
-            }
-            if let Some(domain) = &app.domain_filter {
-                spans.extend_from_slice(&[Span::raw(" | Site : "), Span::raw(domain)]);
-            }
-            if app.item_type_filter != ItemTypeFilter::All {
-                let filter_text = match app.item_type_filter {
-                    ItemTypeFilter::All => unreachable!(),
-                    ItemTypeFilter::Article => "Articles",
-                    ItemTypeFilter::Video => "Videos",
-                    ItemTypeFilter::PDF => "PDFs",
-                };
-                spans.extend_from_slice(&[Span::raw(" | Doc type : "), Span::raw(filter_text)]);
-            }
-
-            if app.item_type_filter != ItemTypeFilter::All
-                || !app.selected_tag_filters.is_empty()
-                || app.active_search_filter.is_some()
-            {
-                let text = format!("[Showing {} items]", app.items.len());
-                spans.extend_from_slice(&[Span::raw(" ('ESC` to clear) | "), Span::raw(text)]);
-            }
-            if let Ok(items) = app.rss_feed_state.items.lock() {
-                if !items.is_empty() {
-                    spans.extend_from_slice(&[
-                        Span::raw(" | "),
-                        Span::styled(
-                            " RSS updates ",
-                            Style::default()
-                                .bg(OCEANIC_NEXT.base_0e) // Pink background
-                                .fg(OCEANIC_NEXT.base_00) // Dark text for contrast
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]);
-                }
-            }
             let info_footer = Paragraph::new(Line::from(spans))
-                .style(Style::new().fg(app.colors.row_fg).bg(app.colors.buffer_bg))
-                .alignment(if is_filtered {
-                    Alignment::Left
-                } else {
-                    Alignment::Center
-                })
+                .style(Style::new().fg(OCEANIC_NEXT.base_03).bg(app.colors.buffer_bg))
+                .alignment(Alignment::Center)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::new().fg(app.colors.footer_border_color))
-                        .border_type(BorderType::Double),
+                        .border_style(Style::new().fg(OCEANIC_NEXT.base_02))
+                        .border_type(BorderType::Rounded),
                 );
             f.render_widget(info_footer, area);
         }
