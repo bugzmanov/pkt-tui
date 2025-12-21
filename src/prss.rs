@@ -104,6 +104,9 @@ impl RssManager {
 
         let content = response.text()?;
 
+        // Extract base URL for resolving relative links
+        let base_url = Self::extract_base_url(url);
+
         // Try parsing as Atom first
         if let Ok(atom_feed) = atom_syndication::Feed::read_from(content.as_bytes()) {
             let source_name = atom_feed.title().to_string();
@@ -112,13 +115,14 @@ impl RssManager {
                 .iter()
                 .map(|entry| {
                     let item_id = format!("{}:{}", source_name, entry.id());
+                    let raw_link = entry
+                        .links()
+                        .first()
+                        .map(|l| l.href().to_string())
+                        .unwrap_or_default();
                     RssFeedItem {
                         title: entry.title().to_string(),
-                        link: entry
-                            .links()
-                            .first()
-                            .map(|l| l.href().to_string())
-                            .unwrap_or_default(),
+                        link: Self::resolve_url(&raw_link, &base_url),
                         description: entry.content().and_then(|c| c.value()).map(String::from),
                         pub_date: Some(
                             entry
@@ -169,6 +173,33 @@ impl RssManager {
             }
         }
     }
+
+    /// Extract base URL (scheme + host) from a feed URL
+    fn extract_base_url(url: &str) -> String {
+        // Parse URL to get scheme://host
+        if let Some(scheme_end) = url.find("://") {
+            let after_scheme = &url[scheme_end + 3..];
+            if let Some(path_start) = after_scheme.find('/') {
+                return url[..scheme_end + 3 + path_start].to_string();
+            }
+        }
+        url.to_string()
+    }
+
+    /// Resolve a potentially relative URL against a base URL
+    fn resolve_url(link: &str, base_url: &str) -> String {
+        if link.starts_with("http://") || link.starts_with("https://") {
+            // Already absolute
+            link.to_string()
+        } else if link.starts_with('/') {
+            // Absolute path - prepend base URL
+            format!("{}{}", base_url, link)
+        } else {
+            // Relative path - just return as-is (rare case)
+            link.to_string()
+        }
+    }
+
     fn format_pub_date(date_str: &str) -> Option<String> {
         // Try to parse the RFC 2822 date format used by RSS feeds
         if let Ok(datetime) = DateTime::parse_from_rfc2822(date_str) {

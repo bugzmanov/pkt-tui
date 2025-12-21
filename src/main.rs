@@ -1511,8 +1511,9 @@ impl App {
     pub fn handle_rss_tab_selection(&mut self) -> anyhow::Result<()> {
         if let Some(selected_item) = self.rss_tab_state.items.get(self.rss_tab_state.selected_index) {
             if !selected_item.link.is_empty() {
-                webbrowser::open(&selected_item.link)
-                    .context("Failed to open link in browser")?;
+                if let Err(e) = webbrowser::open(&selected_item.link) {
+                    self.app_mode = AppMode::Error(format!("Failed to open browser: {}", e));
+                }
             }
         }
         Ok(())
@@ -1957,7 +1958,9 @@ impl App {
                 // Mark as read by adding a tag
                 self.raindrop_client.add_tag(item, "read")?;
                 item.add_tag("read");
-                webbrowser::open(&item.url()).context("Failed to open link in a browser")?;
+                if let Err(e) = webbrowser::open(&item.url()) {
+                    self.app_mode = AppMode::Error(format!("Failed to open browser: {}", e));
+                }
             }
             self.save_to_cache()?;
         }
@@ -2804,6 +2807,9 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                                 LoadingType::Refresh,
                             ));
                         }
+                        Char('Z') => {
+                            app.app_mode = AppMode::MulticharNormalModeEnter("Z".to_string());
+                        }
                         _ => {}
                     }
                 }
@@ -3361,39 +3367,41 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 String::new()
             };
 
-            let date_and_title = if let Some(pub_date) = &item.pub_date {
-                let date_str = if pub_date.len() >= 10 {
+            let date_str = if let Some(pub_date) = &item.pub_date {
+                if pub_date.len() >= 10 {
                     &pub_date[0..10]
                 } else {
                     pub_date
-                };
-                vec![
-                    Span::styled(
-                        format!("{:<10}", date_str),
-                        Style::default().fg(OCEANIC_NEXT.base_03),
-                    ),
-                    Span::raw(": "),
-                    Span::styled(&item.title, Style::default().fg(OCEANIC_NEXT.base_05)),
-                ]
+                }
             } else {
-                vec![
-                    Span::styled(
-                        format!("{:<10}", "unknown"),
-                        Style::default().fg(OCEANIC_NEXT.base_03),
-                    ),
-                    Span::raw(": "),
-                    Span::styled(&item.title, Style::default().fg(OCEANIC_NEXT.base_05)),
-                ]
+                "unknown"
             };
 
+            // Source column (like date in Raindrop - neutral color)
             let source_span = Span::styled(
-                format!("{:<25}", source_column),
-                Style::default().fg(OCEANIC_NEXT.base_0d),
+                format!("{:<20}", source_column),
+                Style::default().fg(OCEANIC_NEXT.base_04),
             );
 
-            let content = Line::from(
-                [vec![source_span, Span::raw("│ ")], date_and_title].concat(),
+            // Date (dim)
+            let date_span = Span::styled(
+                format!("{:<10}", date_str),
+                Style::default().fg(OCEANIC_NEXT.base_03),
             );
+
+            // Title (bright like Raindrop)
+            let title_span = Span::styled(
+                &item.title,
+                Style::default().fg(OCEANIC_NEXT.base_07),
+            );
+
+            let content = Line::from(vec![
+                source_span,
+                Span::raw("│ "),
+                date_span,
+                Span::raw(": "),
+                title_span,
+            ]);
 
             let style = if i + popup_state.scroll_offset == popup_state.selected_index {
                 Style::default().fg(Color::Black).bg(Color::White)
