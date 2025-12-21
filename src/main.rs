@@ -1489,7 +1489,7 @@ impl App {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        self.stats = TotalStats::new();
+        self.stats = TotalStats::from_items(&items);
         self.items = FilteredItems::new(items);
         self.apply_filter();
         Ok(())
@@ -1514,7 +1514,7 @@ impl App {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        self.stats = TotalStats::new();
+        self.stats = TotalStats::from_items(&items);
         self.items = FilteredItems::new(items);
         self.apply_filter();
         Ok(())
@@ -2072,7 +2072,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let stats = TotalStats::new();
+    let stats = TotalStats::from_items(&items);
 
     let mut app: App = App::new(items, raindrop_client, stats);
     app.start_rss_feed_loading()?;

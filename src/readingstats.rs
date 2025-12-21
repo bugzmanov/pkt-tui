@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
-use log::error;
 
-use crate::{storage::PocketItem, TableRow};
+use crate::raindrop::Raindrop;
 //----
 pub struct Stats {
     articles_added: usize,
@@ -27,33 +26,39 @@ impl TotalStats {
         }
     }
 
-    pub fn track_as(
-        &mut self,
-        item: &PocketItem,
-        today: &chrono::DateTime<Utc>,
-        is_read: bool,
-        read_ts: i64,
-    ) {
-        let datetime_ts = DateTime::from_timestamp(read_ts, 0).expect("invalid timestamp");
-        let datetime: DateTime<Utc> = datetime_ts.to_utc();
-        let duration = *today - datetime;
+    pub fn from_items(items: &[Raindrop]) -> Self {
+        let mut stats = Self::new();
+        let today = Utc::now();
 
-        if today.date_naive() == datetime.date_naive() {
-            self.today_stats.increment(item.item_type(), is_read);
-            self.week_stats.increment(item.item_type(), is_read);
-            self.month_stats.increment(item.item_type(), is_read);
-        } else if duration.num_days() <= 7 {
-            self.week_stats.increment(item.item_type(), is_read);
-            self.month_stats.increment(item.item_type(), is_read);
-        } else if duration.num_days() <= 30 {
-            self.month_stats.increment(item.item_type(), is_read);
+        for item in items {
+            stats.track_raindrop(item, &today);
         }
+
+        stats
     }
 
-    pub fn track_item(&mut self, item: &PocketItem, today: &chrono::DateTime<Utc>) {
-        let is_read = item.tags().any(|x| x == "read"); // todo: encapsulate
-        let timestamp = item.time_added.parse::<i64>().unwrap();
-        self.track_as(item, today, is_read, timestamp);
+    pub fn track_raindrop(&mut self, item: &Raindrop, today: &DateTime<Utc>) {
+        let is_read = item.tags.iter().any(|t| t == "read");
+        let item_type = item.item_type.as_str();
+
+        // Parse created date
+        let created = match DateTime::parse_from_rfc3339(&item.created) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => return,
+        };
+
+        let duration = *today - created;
+
+        if today.date_naive() == created.date_naive() {
+            self.today_stats.increment(item_type, is_read);
+            self.week_stats.increment(item_type, is_read);
+            self.month_stats.increment(item_type, is_read);
+        } else if duration.num_days() <= 7 {
+            self.week_stats.increment(item_type, is_read);
+            self.month_stats.increment(item_type, is_read);
+        } else if duration.num_days() <= 30 {
+            self.month_stats.increment(item_type, is_read);
+        }
     }
 }
 
