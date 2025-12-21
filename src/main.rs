@@ -822,9 +822,10 @@ struct App {
     app_mode: AppMode,
     stats: TotalStats,
     raindrop_client: raindrop::RaindropAPISync,
+    archive_collection_id: Option<i64>,
     tag_popup_state: Option<TagPopupState>,
     doc_type_popup_state: Option<DocTypePopupState>,
-    selected_tag_filter: Option<String>,
+    selected_tag_filters: std::collections::HashSet<String>,
     active_search_filter: Option<String>,
     item_type_filter: ItemTypeFilter,
     domain_filter: Option<String>,
@@ -841,7 +842,12 @@ struct App {
 }
 
 impl App {
-    fn new(data_vec: Vec<raindrop::Raindrop>, raindrop_client: raindrop::RaindropAPISync, stats: TotalStats) -> App {
+    fn new(
+        data_vec: Vec<raindrop::Raindrop>,
+        raindrop_client: raindrop::RaindropAPISync,
+        stats: TotalStats,
+        archive_collection_id: Option<i64>,
+    ) -> App {
         let cached_tags = data_vec
             .iter()
             .flat_map(|item| item.tags().map(|tag| tag.to_string()))
@@ -859,10 +865,11 @@ impl App {
             items: FilteredItems::new(data_vec),
             app_mode: AppMode::Initialize,
             raindrop_client,
+            archive_collection_id,
             stats,
             tag_popup_state: None,
             doc_type_popup_state: None,
-            selected_tag_filter: None,
+            selected_tag_filters: std::collections::HashSet::new(),
             active_search_filter: None,
             item_type_filter: ItemTypeFilter::All,
             domain_filter: None,
@@ -1471,6 +1478,9 @@ impl App {
         // Sort by created date (newest first)
         items.sort_by(|a, b| b.created.cmp(&a.created));
 
+        // Inject "archived" tag for items in archive collection
+        self.inject_archived_tags(&mut items);
+
         // Update cache with new sync time
         let cache = raindrop::RaindropCache {
             raindrops: items.clone(),
@@ -1500,6 +1510,9 @@ impl App {
         let mut items = self.raindrop_client.get_all_raindrops(raindrop::COLLECTION_ALL)?;
         items.sort_by(|a, b| b.created.cmp(&a.created));
 
+        // Inject "archived" tag for items in archive collection
+        self.inject_archived_tags(&mut items);
+
         // Update cache
         let cache = raindrop::RaindropCache {
             raindrops: items.clone(),
@@ -1520,24 +1533,42 @@ impl App {
         Ok(())
     }
 
+    /// Inject "archived" tag for items in the archive collection
+    fn inject_archived_tags(&self, items: &mut [raindrop::Raindrop]) {
+        if let Some(archive_id) = self.archive_collection_id {
+            for item in items {
+                if item.collection.id == archive_id && !item.tags.contains(&"archived".to_string()) {
+                    item.tags.push("archived".to_string());
+                }
+            }
+        }
+    }
+
     fn show_tag_popup(&mut self) {
-        let tag_counts: Vec<(String, usize)> = self
+        // Count tags from ALL items (including archived) so "archived" tag appears
+        let mut tag_counts: std::collections::HashMap<String, usize> = self
             .items
+            .items  // Access all items, not just filtered
             .iter()
             .filter(|item| {
                 !item.tags().any(|tag| tag == "read") // Exclude read items
-                                                      // item.favorite != "1" // Exclude favorited items
             })
             .flat_map(|item| item.tags().map(|tag| tag.to_string()))
             .fold(std::collections::HashMap::new(), |mut acc, tag| {
                 *acc.entry(tag).or_insert(0) += 1;
                 acc
-            })
-            .into_iter()
-            .collect();
+            });
 
-        let mut sorted_tag_counts = tag_counts;
-        sorted_tag_counts.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1))); // sort by alfabet then by counts
+        // Ensure "archived" tag is included if there are any archived items
+        let archived_count = self.items.items.iter()
+            .filter(|item| item.tags().any(|t| t == "archived"))
+            .count();
+        if archived_count > 0 {
+            tag_counts.insert("archived".to_string(), archived_count);
+        }
+
+        let mut sorted_tag_counts: Vec<(String, usize)> = tag_counts.into_iter().collect();
+        sorted_tag_counts.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1))); // sort by alphabet then by counts
 
         let visible_items = 26; // Adjust this value based on your UI
         self.tag_popup_state = Some(TagPopupState::new(sorted_tag_counts, visible_items));
@@ -1578,9 +1609,18 @@ impl App {
                 None => true,
             };
 
-            let tag_matches = match &self.selected_tag_filter {
-                Some(tag) => item.tags().any(|t| t == tag),
-                None => true,
+            // Item must have ALL selected tags (AND logic)
+            let tag_matches = if self.selected_tag_filters.is_empty() {
+                true
+            } else {
+                self.selected_tag_filters.iter().all(|tag| item.tags().any(|t| t == tag))
+            };
+
+            // Hide archived items unless explicitly filtering for "archived" tag
+            let not_archived = if self.selected_tag_filters.contains("archived") {
+                true // Show archived when filtering for it
+            } else {
+                !item.tags().any(|t| t == "archived") // Otherwise hide archived
             };
 
             let type_matches = match self.item_type_filter {
@@ -1597,7 +1637,7 @@ impl App {
                 None => true,
             };
 
-            title_matches && tag_matches && type_matches && domain_matches
+            title_matches && tag_matches && type_matches && domain_matches && not_archived
         });
         self.virtual_state.select(Some(0));
         *self.virtual_state.offset_mut() = 0;
@@ -1626,15 +1666,20 @@ impl App {
                 .filtered_tags
                 .get(tag_popup_state.selected_index)
             {
-                self.selected_tag_filter = Some(selected_tag.clone());
-                self.tag_popup_state = None;
+                // Toggle tag: add if not present, remove if present
+                if self.selected_tag_filters.contains(selected_tag) {
+                    self.selected_tag_filters.remove(selected_tag);
+                } else {
+                    self.selected_tag_filters.insert(selected_tag.clone());
+                }
                 self.apply_filter();
+                // Don't close popup - allow selecting more tags
             }
         }
     }
 
     fn clear_tag_filter(&mut self) {
-        self.selected_tag_filter = None;
+        self.selected_tag_filters.clear();
         self.apply_filter();
     }
 
@@ -1650,7 +1695,7 @@ impl App {
 
     fn clear_all_filters(&mut self) {
         self.active_search_filter = None;
-        self.selected_tag_filter = None;
+        self.selected_tag_filters.clear();
         self.domain_filter = None;
         self.items.clear_filter();
     }
@@ -1785,9 +1830,14 @@ impl App {
 
     fn archive_article(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
-            if let Some(item) = self.items.get_mut(idx) {
-                // Archive by adding a tag (Raindrop doesn't have archive like Pocket)
-                self.raindrop_client.add_tag(item, "archived")?;
+            if let Some(item) = self.items.get(idx) {
+                if let Some(archive_id) = self.archive_collection_id {
+                    // Move to archive collection
+                    self.raindrop_client.move_raindrop(item.id, archive_id)?;
+                } else {
+                    // Fallback: add "archived" tag if no archive collection exists
+                    self.raindrop_client.add_tag(item, "archived")?;
+                }
             }
             self.items.remove(idx);
             self.save_to_cache()?;
@@ -2010,6 +2060,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Create Raindrop client
     let raindrop_client = raindrop::RaindropAPISync::new(&token)?;
 
+    // Find "archive" collection ID
+    let archive_collection_id = raindrop_client
+        .find_collection_by_name("archive")
+        .ok()
+        .flatten()
+        .map(|c| c.id);
+
+    if let Some(id) = archive_collection_id {
+        println!("Found archive collection (id: {})", id);
+    }
+
     // Load items from cache or fetch from API
     let mut items = if let Ok(Some(cache)) = raindrop::load_cache() {
         println!("Loaded {} items from cache (synced: {})", cache.raindrops.len(), cache.last_sync);
@@ -2039,6 +2100,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Fetched {} items from Raindrop.io", fetched.len());
         fetched
     };
+
+    // Inject "archived" tag for items in archive collection
+    if let Some(archive_id) = archive_collection_id {
+        for item in &mut items {
+            if item.collection.id == archive_id && !item.tags.contains(&"archived".to_string()) {
+                item.tags.push("archived".to_string());
+            }
+        }
+    }
 
     // Sort by date (newest first)
     items.sort_by(|a, b| b.created.cmp(&a.created));
@@ -2074,7 +2144,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let stats = TotalStats::from_items(&items);
 
-    let mut app: App = App::new(items, raindrop_client, stats);
+    let mut app: App = App::new(items, raindrop_client, stats, archive_collection_id);
     app.start_rss_feed_loading()?;
     let res = run_app(&mut terminal, app);
 
@@ -2462,7 +2532,7 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                     Esc => {
                         if app.active_search_filter.is_some() {
                             app.clear_search_filter();
-                        } else if app.selected_tag_filter.is_some() {
+                        } else if !app.selected_tag_filters.is_empty() {
                             app.clear_tag_filter();
                         } else if app.domain_filter.is_some() {
                             app.clear_domain_filter();
@@ -2659,9 +2729,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             .take(tag_popup_state.visible_items)
             .enumerate()
             .map(|(i, (tag, count))| {
-                let content = format!("{:<30} {}", tag, count);
+                let is_selected = app.selected_tag_filters.contains(tag);
+                let marker = if is_selected { "[x] " } else { "[ ] " };
+                let content = format!("{}{:<30} {}", marker, tag, count);
                 let style = if i + tag_popup_state.scroll_offset == tag_popup_state.selected_index {
                     Style::default().fg(Color::Black).bg(Color::White)
+                } else if is_selected {
+                    Style::default().fg(Color::Green)
                 } else {
                     Style::default().fg(app.colors.row_fg)
                 };
@@ -3155,7 +3229,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         | AppMode::MulticharNormalModeEnter(_)
         | AppMode::Refreshing(_)
         | AppMode::Error(_) => {
-            let is_filtered = app.selected_tag_filter.is_some()
+            let is_filtered = !app.selected_tag_filters.is_empty()
                 || app.item_type_filter != ItemTypeFilter::All
                 || app.domain_filter.is_some()
                 || app.active_search_filter.is_some();
@@ -3169,8 +3243,9 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             if let Some(search) = &app.active_search_filter {
                 spans.extend_from_slice(&[Span::raw(" | /"), Span::raw(search)]);
             }
-            if let Some(tag) = &app.selected_tag_filter {
-                spans.extend_from_slice(&[Span::raw(" | Tag: "), Span::raw(tag)]);
+            if !app.selected_tag_filters.is_empty() {
+                let tags: Vec<&str> = app.selected_tag_filters.iter().map(|s| s.as_str()).collect();
+                spans.extend_from_slice(&[Span::raw(" | Tags: "), Span::raw(tags.join(", "))]);
             }
             if let Some(domain) = &app.domain_filter {
                 spans.extend_from_slice(&[Span::raw(" | Site : "), Span::raw(domain)]);
@@ -3186,7 +3261,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             }
 
             if app.item_type_filter != ItemTypeFilter::All
-                || app.selected_tag_filter.is_some()
+                || !app.selected_tag_filters.is_empty()
                 || app.active_search_filter.is_some()
             {
                 let text = format!("[Showing {} items]", app.items.len());
