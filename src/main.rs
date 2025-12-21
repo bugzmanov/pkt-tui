@@ -1438,16 +1438,37 @@ impl App {
     }
 
     fn refresh_data(&mut self) -> anyhow::Result<()> {
-        // Load existing cache to get last_sync and current items
-        let (mut items, last_sync) = if let Ok(Some(cache)) = raindrop::load_cache() {
-            (cache.raindrops, cache.last_sync)
+        log::info!("=== refresh_data() called ===");
+
+        // Load base snapshot from cache
+        let base_items = if let Ok(Some(cache)) = raindrop::load_cache() {
+            log::info!("Loaded {} base items from cache", cache.raindrops.len());
+            cache.raindrops
         } else {
+            log::info!("No cache found, doing full refresh");
             // No cache, do full fetch
             return self.full_refresh();
         };
 
+        // Get last_sync from meta file (or fall back to cache)
+        let last_sync = match raindrop::get_last_sync() {
+            Some(ts) => {
+                log::info!("Got last_sync: {}", ts);
+                ts
+            }
+            None => {
+                log::info!("No last_sync found, doing full refresh");
+                return self.full_refresh();
+            }
+        };
+
+        // Apply delta to get current state
+        let delta_updates = raindrop::load_raindrop_delta();
+        log::info!("Loaded {} delta updates", delta_updates.len());
+        let mut items = raindrop::apply_delta_to_state(base_items, delta_updates);
+        log::info!("After applying delta: {} items", items.len());
+
         // Subtract 2 minutes from last_sync to handle race conditions
-        // (items created during previous sync might have earlier timestamps)
         let sync_with_buffer = {
             use chrono::{DateTime, Duration};
             DateTime::parse_from_rfc3339(&last_sync)
@@ -1456,21 +1477,66 @@ impl App {
         };
 
         // 1. Delta sync: fetch only items updated since last_sync (with buffer)
+        log::info!("Fetching items since: {}", sync_with_buffer);
         let updated = self.raindrop_client.get_raindrops_since(
             raindrop::COLLECTION_ALL,
             &sync_with_buffer,
         )?;
+        log::info!("Fetched {} updated items", updated.len());
+        for item in &updated {
+            log::info!("  - {} (created: {}, updated: {})", item.id, item.created, item.last_update);
+        }
 
-        // 2. Fetch trash to detect deletions (including external ones)
+        // 2. Fetch trash to detect deletions
         let trash_items = self.raindrop_client.get_all_raindrops(raindrop::COLLECTION_TRASH)?;
         let trashed_ids: std::collections::HashSet<i64> = trash_items.iter().map(|r| r.id).collect();
 
-        // 3. Remove trashed items from local cache
+        // 3. Find items to delete (that we have locally)
+        let items_to_delete: Vec<i64> = items
+            .iter()
+            .filter(|item| trashed_ids.contains(&item.id))
+            .map(|item| item.id)
+            .collect();
+
+        // 4. Filter out trashed items from updates (they shouldn't be upserted!)
+        //    Also filter out items we already have with same or newer lastUpdate
+        let existing_timestamps: std::collections::HashMap<i64, String> = items
+            .iter()
+            .map(|item| (item.id, item.last_update.clone()))
+            .collect();
+
+        let updated: Vec<_> = updated
+            .into_iter()
+            .filter(|item| !trashed_ids.contains(&item.id))
+            .filter(|item| {
+                // Only include if item is new or has newer lastUpdate
+                match existing_timestamps.get(&item.id) {
+                    None => true, // New item
+                    Some(existing_ts) => item.last_update.as_str() > existing_ts.as_str(),
+                }
+            })
+            .collect();
+
+        // 5. Append updates to delta file FIRST (before updating last_sync)
+        if !updated.is_empty() {
+            log::info!("Appending {} upserts to delta file", updated.len());
+            raindrop::append_raindrop_upserts(&updated)?;
+        }
+        for id in &items_to_delete {
+            log::info!("Appending delete for {} to delta file", id);
+            raindrop::append_raindrop_delete(*id)?;
+        }
+
+        // 6. Update last_sync in meta file (small, cheap write)
+        let new_last_sync = raindrop::now_iso8601();
+        log::info!("Updating last_sync to: {}", new_last_sync);
+        raindrop::update_last_sync(&new_last_sync)?;
+
+        // 7. Update in-memory state
         let before_count = items.len();
         items.retain(|item| !trashed_ids.contains(&item.id));
         let removed_count = before_count - items.len();
 
-        // 4. Merge updated items into existing items
         let updated_ids: std::collections::HashSet<i64> = updated.iter().map(|r| r.id).collect();
         items.retain(|item| !updated_ids.contains(&item.id));
         items.extend(updated.clone());
@@ -1480,14 +1546,6 @@ impl App {
 
         // Inject "archived" tag for items in archive collection
         self.inject_archived_tags(&mut items);
-
-        // Update cache with new sync time
-        let cache = raindrop::RaindropCache {
-            raindrops: items.clone(),
-            collections: vec![],
-            last_sync: raindrop::now_iso8601(),
-        };
-        raindrop::save_cache(&cache)?;
 
         if removed_count > 0 || !updated.is_empty() {
             log::info!("Sync: {} updated, {} removed (via trash)", updated.len(), removed_count);
@@ -1513,13 +1571,19 @@ impl App {
         // Inject "archived" tag for items in archive collection
         self.inject_archived_tags(&mut items);
 
-        // Update cache
+        // Clear delta file since cache becomes the new base snapshot
+        raindrop::delete_delta()?;
+
+        // Save base snapshot (without last_sync - that goes in meta file)
         let cache = raindrop::RaindropCache {
             raindrops: items.clone(),
             collections: vec![],
-            last_sync: raindrop::now_iso8601(),
+            last_sync: String::new(), // Not used anymore, meta file has last_sync
         };
         raindrop::save_cache(&cache)?;
+
+        // Update last_sync in meta file
+        raindrop::update_last_sync(&raindrop::now_iso8601())?;
 
         self.cached_tags = items
             .iter()
@@ -2071,10 +2135,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Found archive collection (id: {})", id);
     }
 
-    // Load items from cache or fetch from API
+    // Load items from cache + delta, or fetch from API
     let mut items = if let Ok(Some(cache)) = raindrop::load_cache() {
-        println!("Loaded {} items from cache (synced: {})", cache.raindrops.len(), cache.last_sync);
-        cache.raindrops
+        let base_count = cache.raindrops.len();
+        let delta_updates = raindrop::load_raindrop_delta();
+        let delta_count = delta_updates.len();
+        let merged = raindrop::apply_delta_to_state(cache.raindrops, delta_updates);
+
+        let last_sync = raindrop::get_last_sync().unwrap_or_default();
+        if delta_count > 0 {
+            println!("Loaded {} items (base: {}, delta: {} updates, synced: {})",
+                merged.len(), base_count, delta_count, last_sync);
+        } else {
+            println!("Loaded {} items from cache (synced: {})", merged.len(), last_sync);
+        }
+        merged
     } else {
         print!("Fetching raindrops from Raindrop.io... ");
         io::stdout().flush()?;
@@ -2087,14 +2162,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
         println!();
 
-        // Save to cache
+        // Save base snapshot to cache
         let cache = raindrop::RaindropCache {
             raindrops: fetched.clone(),
             collections: vec![],
-            last_sync: raindrop::now_iso8601(),
+            last_sync: String::new(), // last_sync is in meta file now
         };
         if let Err(e) = raindrop::save_cache(&cache) {
             eprintln!("Warning: Failed to save cache: {}", e);
+        }
+
+        // Set initial last_sync in meta file
+        if let Err(e) = raindrop::update_last_sync(&raindrop::now_iso8601()) {
+            eprintln!("Warning: Failed to save sync metadata: {}", e);
         }
 
         println!("Fetched {} items from Raindrop.io", fetched.len());

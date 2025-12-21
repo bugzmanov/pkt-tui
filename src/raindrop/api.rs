@@ -193,8 +193,14 @@ impl RaindropAPI {
             // Filter by exact timestamp (search only supports date granularity)
             // Use >= to include items created at or after since_timestamp
             for item in items {
-                if item.created.as_str() >= since_timestamp ||
-                   item.last_update.as_str() >= since_timestamp {
+                let created_match = item.created.as_str() >= since_timestamp;
+                let updated_match = item.last_update.as_str() >= since_timestamp;
+                log::debug!(
+                    "Comparing item {}: created='{}' >= '{}' = {}, lastUpdate='{}' >= '{}' = {}",
+                    item.id, item.created, since_timestamp, created_match,
+                    item.last_update, since_timestamp, updated_match
+                );
+                if created_match || updated_match {
                     updated_items.push(item);
                 }
             }
