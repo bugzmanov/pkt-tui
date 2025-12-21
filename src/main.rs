@@ -6,6 +6,7 @@ mod logo;
 mod markdown;
 mod pocket;
 mod prss;
+pub mod raindrop;
 mod readingstats;
 pub mod storage;
 mod tokenstorage;
