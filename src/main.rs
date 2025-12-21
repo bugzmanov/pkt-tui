@@ -3520,16 +3520,23 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_scrollbar(f: &mut Frame, app: &mut App, area: Rect) {
+    let total_items = app.items.len();
+    let current_position = app.virtual_state.selected().unwrap_or(0);
+
+    let scrollbar = Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"));
+
+    let mut scroll_state = ScrollbarState::new(total_items).position(current_position);
+
     f.render_stateful_widget(
-        Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None),
+        scrollbar,
         area.inner(Margin {
             vertical: 1,
-            horizontal: 1,
+            horizontal: 0,
         }),
-        &mut app.scroll_state,
+        &mut scroll_state,
     );
 }
 
