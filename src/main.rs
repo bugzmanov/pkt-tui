@@ -262,6 +262,7 @@ pub struct RssFeedPopupState {
     pending_pocket_item: Option<RssFeedItem>,  // Store item waiting for tags
     show_description: bool,
     pub changes_made: bool,
+    pending_key: Option<char>, // For multi-char commands like dd, gg
 }
 
 impl RssFeedPopupState {
@@ -279,6 +280,7 @@ impl RssFeedPopupState {
             pending_pocket_item: None,
             show_description: false,
             changes_made: false,
+            pending_key: None,
         })
     }
 
@@ -309,6 +311,31 @@ impl RssFeedPopupState {
         }
         Ok(())
     }
+
+    pub fn page_down(&mut self) {
+        let half_page = self.visible_items / 2;
+        self.move_selection(half_page as isize);
+    }
+
+    pub fn page_up(&mut self) {
+        let half_page = self.visible_items / 2;
+        self.move_selection(-(half_page as isize));
+    }
+
+    pub fn scroll_to_beginning(&mut self) {
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+    }
+
+    pub fn scroll_to_end(&mut self) {
+        if !self.items.is_empty() {
+            self.selected_index = self.items.len() - 1;
+            if self.selected_index >= self.visible_items {
+                self.scroll_offset = self.selected_index - self.visible_items + 1;
+            }
+        }
+    }
+
     pub fn set_status(&mut self, message: String) {
         self.status_message = Some((message, Instant::now()));
     }
@@ -413,14 +440,32 @@ impl TagPopupState {
     }
 
     fn move_selection(&mut self, delta: isize) {
+        let list = if self.filter.is_empty() {
+            &self.tags
+        } else {
+            &self.filtered_tags
+        };
+        if list.is_empty() {
+            return;
+        }
         let new_index = self.selected_index as isize + delta;
-        self.selected_index = new_index.clamp(0, self.tags.len() as isize - 1) as usize;
+        self.selected_index = new_index.clamp(0, list.len() as isize - 1) as usize;
 
         if self.selected_index < self.scroll_offset {
             self.scroll_offset = self.selected_index;
         } else if self.selected_index >= self.scroll_offset + self.visible_items {
             self.scroll_offset = self.selected_index - self.visible_items + 1;
         }
+    }
+
+    fn page_down(&mut self) {
+        let half_page = self.visible_items / 2;
+        self.move_selection(half_page as isize);
+    }
+
+    fn page_up(&mut self) {
+        let half_page = self.visible_items / 2;
+        self.move_selection(-(half_page as isize));
     }
 
     fn _selected_tag(&self) -> Option<String> {
@@ -2525,17 +2570,30 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
             } else if let Some(tag_popup_state) = &mut app.tag_popup_state {
                 match app.tag_selection_mode {
                     TagSelectionMode::Normal => match key.code {
-                        Down => tag_popup_state.move_selection(1),
-                        Up => tag_popup_state.move_selection(-1),
+                        Char('j') | Down => tag_popup_state.move_selection(1),
+                        Char('k') | Up => tag_popup_state.move_selection(-1),
+                        Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            tag_popup_state.page_down()
+                        }
+                        Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            tag_popup_state.page_up()
+                        }
                         Enter => app.select_tag(),
                         Esc => app.tag_popup_state = None,
-                        Char(ch) => {
+                        Char('/') => {
                             app.tag_selection_mode = TagSelectionMode::Filtering;
-                            tag_popup_state.add_to_filter(ch)
                         }
                         _ => {}
                     },
                     TagSelectionMode::Filtering => match key.code {
+                        Down => tag_popup_state.move_selection(1),
+                        Up => tag_popup_state.move_selection(-1),
+                        Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            tag_popup_state.page_down()
+                        }
+                        Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            tag_popup_state.page_up()
+                        }
                         Char(ch) => tag_popup_state.add_to_filter(ch),
                         Backspace => tag_popup_state.remove_from_filter(),
                         Esc => {
@@ -2573,28 +2631,54 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                     _ => { /*do nothing */ }
                 }
             } else if let Some(ref mut popup_state) = app.rss_feed_popup_state {
-                match key.code {
-                    Char('j') | Down => popup_state.move_selection(1),
-                    Char('k') | Up => popup_state.move_selection(-1),
-                    Char('p') => popup_state.show_description = !popup_state.show_description,
-                    KeyCode::Char('d') => {
-                        popup_state.hide_current_item()?;
-                        return Ok(());
-                    }
-                    Char('a') => {
-                        app.process_add_to_pocket_with_tags()?;
-                        return Ok(());
-                    }
-                    Enter => app.handle_rss_feed_selection()?,
-                    Esc => {
-                        if (popup_state.show_description) {
-                            popup_state.show_description = false;
-                        } else {
-                            app.close_rss_feed_popup()?;
+                // Handle multi-char commands first
+                if let Some(pending) = popup_state.pending_key.take() {
+                    match (pending, key.code) {
+                        ('d', Char('d')) => {
+                            popup_state.hide_current_item()?;
+                            return Ok(());
                         }
-                        // app.rss_feed_popup_state = None;
+                        ('g', Char('g')) => {
+                            popup_state.scroll_to_beginning();
+                        }
+                        _ => {
+                            // Invalid sequence, ignore
+                        }
                     }
-                    _ => {}
+                } else {
+                    match key.code {
+                        Char('j') | Down => popup_state.move_selection(1),
+                        Char('k') | Up => popup_state.move_selection(-1),
+                        Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            popup_state.page_down();
+                        }
+                        Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            popup_state.page_up();
+                        }
+                        Char('d') => {
+                            popup_state.pending_key = Some('d');
+                        }
+                        Char('g') => {
+                            popup_state.pending_key = Some('g');
+                        }
+                        Char('G') => {
+                            popup_state.scroll_to_end();
+                        }
+                        Char('p') => popup_state.show_description = !popup_state.show_description,
+                        Char('a') => {
+                            app.process_add_to_pocket_with_tags()?;
+                            return Ok(());
+                        }
+                        Enter => app.handle_rss_feed_selection()?,
+                        Esc => {
+                            if popup_state.show_description {
+                                popup_state.show_description = false;
+                            } else {
+                                app.close_rss_feed_popup()?;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             } else {
                 //normal mode
