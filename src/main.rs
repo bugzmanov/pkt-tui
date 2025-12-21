@@ -172,6 +172,48 @@ impl TableRow for PocketItem {
     }
 }
 
+impl TableRow for raindrop::Raindrop {
+    fn id(&self) -> String {
+        self.id.to_string()
+    }
+
+    fn date(&self) -> String {
+        raindrop::Raindrop::date(self)
+    }
+
+    fn title(&self) -> &str {
+        self.display_title()
+    }
+
+    fn item_type(&self) -> &str {
+        self.type_str()
+    }
+
+    fn tags(&self) -> impl Iterator<Item = &String> {
+        self.tags.iter()
+    }
+
+    fn url(&self) -> &str {
+        &self.link
+    }
+
+    fn add_tag(&mut self, tag: &str) {
+        raindrop::Raindrop::add_tag(self, tag);
+    }
+
+    fn remove_tag(&mut self, tag: &str) {
+        raindrop::Raindrop::remove_tag(self, tag);
+    }
+
+    fn rename_title_to(&mut self, new_title: String) {
+        self.rename_title(new_title);
+    }
+
+    fn time_added(&self) -> u64 {
+        raindrop::Raindrop::time_added(self)
+    }
+}
+
 //todo: remove
 trait TableRow {
     fn id(&self) -> String;
@@ -271,9 +313,9 @@ impl RssFeedPopupState {
         self.status_message = Some((message, Instant::now()));
     }
 
-    pub fn add_current_to_pocket(
+    pub fn add_current_to_raindrop(
         &mut self,
-        pocket_client: &GetPocketSync,
+        raindrop_client: &raindrop::RaindropAPISync,
         tags_input: &str,
     ) -> anyhow::Result<()> {
         if let Some(item) = self.pending_pocket_item.take() {
@@ -284,10 +326,14 @@ impl RssFeedPopupState {
                 .filter(|t| !t.is_empty())
                 .collect();
 
-            // Add to Pocket with parsed tags
-            pocket_client.add(&item.link, &tags)?;
+            // Add to Raindrop with parsed tags
+            let tag_count = tags.len();
+            let new_raindrop = raindrop::NewRaindrop::new(&item.link)
+                .with_title(&item.title)
+                .with_tags(tags);
+            raindrop_client.add_raindrop(&new_raindrop)?;
 
-            // Hide the item
+            // Hide the item from RSS feed
             self.hidden_items.hide_item(item.item_id.clone())?;
 
             // Remove from current list
@@ -297,7 +343,7 @@ impl RssFeedPopupState {
             }
 
             // Set success message
-            self.set_status(format!("✓ Added to Pocket with {} tags", tags.len()));
+            self.set_status(format!("✓ Added to Raindrop with {} tags", tag_count));
             self.changes_made = true;
             Ok(())
         } else {
@@ -768,14 +814,14 @@ const SCROLL_STEP: usize = 1; // Number of items to scroll at once
 struct App {
     virtual_state: TableState,
     state: TableState,
-    items: FilteredItems<PocketItem>,
+    items: FilteredItems<raindrop::Raindrop>,
     longest_item_lens: (u16, u16, u16), // order is (name, address, email)
     scroll_state: ScrollbarState,
     colors: TableColors,
     color_index: usize,
     app_mode: AppMode,
     stats: TotalStats,
-    pocket_client: GetPocketSync,
+    raindrop_client: raindrop::RaindropAPISync,
     tag_popup_state: Option<TagPopupState>,
     doc_type_popup_state: Option<DocTypePopupState>,
     selected_tag_filter: Option<String>,
@@ -795,7 +841,7 @@ struct App {
 }
 
 impl App {
-    fn new(data_vec: Vec<PocketItem>, pocket_client: GetPocketSync, stats: TotalStats) -> App {
+    fn new(data_vec: Vec<raindrop::Raindrop>, raindrop_client: raindrop::RaindropAPISync, stats: TotalStats) -> App {
         let cached_tags = data_vec
             .iter()
             .flat_map(|item| item.tags().map(|tag| tag.to_string()))
@@ -810,9 +856,9 @@ impl App {
             scroll_state: ScrollbarState::new(1), //todo: fix this
             colors: TableColors::new(&PALETTES[0]),
             color_index: 0,
-            items: FilteredItems::<PocketItem>::non_archived(data_vec),
+            items: FilteredItems::new(data_vec),
             app_mode: AppMode::Initialize,
-            pocket_client,
+            raindrop_client,
             stats,
             tag_popup_state: None,
             doc_type_popup_state: None,
@@ -1047,9 +1093,9 @@ impl App {
         }
     }
 
-    fn complete_add_to_pocket(&mut self, tags: String) -> anyhow::Result<()> {
+    fn complete_add_to_raindrop(&mut self, tags: String) -> anyhow::Result<()> {
         if let Some(popup_state) = &mut self.rss_feed_popup_state {
-            if let Err(e) = popup_state.add_current_to_pocket(&self.pocket_client, &tags) {
+            if let Err(e) = popup_state.add_current_to_raindrop(&self.raindrop_client, &tags) {
                 popup_state.set_status(format!("Error: {}", e));
             }
         }
@@ -1059,14 +1105,14 @@ impl App {
     fn update_tags(&mut self, tags: String) -> anyhow::Result<()> {
         // Handle RSS item tags
         if let Some(popup_state) = &mut self.rss_feed_popup_state {
-            popup_state.add_current_to_pocket(&self.pocket_client, &tags)?;
+            popup_state.add_current_to_raindrop(&self.raindrop_client, &tags)?;
             return Ok(());
         }
 
-        // Handle pocket item tags
+        // Handle raindrop item tags
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get_mut(idx) {
-                let item_id = item.id().parse::<usize>()?;
+                let item_id = item.id;
 
                 // Parse the new tags
                 let new_tag_set: Vec<String> = tags
@@ -1075,8 +1121,8 @@ impl App {
                     .filter(|t| !t.is_empty())
                     .collect();
 
-                // Update tags in Pocket
-                self.pocket_client.update_tags(item_id, &new_tag_set)?;
+                // Update tags in Raindrop
+                self.raindrop_client.update_tags(item_id, new_tag_set.clone())?;
 
                 // Update local item
                 // First, remove all existing tags
@@ -1090,6 +1136,7 @@ impl App {
                     item.add_tag(&tag);
                 }
             }
+            self.save_to_cache()?;
         }
         Ok(())
     }
@@ -1122,9 +1169,9 @@ impl App {
                     let response = client.get(&download_url).send()?;
                     let content = response.bytes()?;
                     std::fs::write(path_clone, content)?;
-                    //
-                    self.pocket_client
-                        .mark_as_downloaded(item.id().parse::<usize>()?)?;
+
+                    // Mark as downloaded by adding a tag
+                    self.raindrop_client.add_tag(item, "downloaded")?;
 
                     let pdf_info = utils::extract_pdf_title(path.as_path())?;
                     if let Some(title) = pdf_info.and_then(|info| info.title) {
@@ -1146,12 +1193,7 @@ impl App {
                     // Create sanitized filename from title
                     // let title = item.title();
                     // let filename = sanitize_filename::sanitize(title); //sanitazie_filename might be redundant dependency
-                    let filename = item.item_id.clone();
-                    let filename = if filename.is_empty() {
-                        "untitled".to_string()
-                    } else {
-                        filename
-                    };
+                    let filename = item.id.to_string();
                     let path = Path::new("articles").join(format!("{}.md", filename));
 
                     // Download the article content
@@ -1230,9 +1272,8 @@ impl App {
                     // Save to file
                     fs::write(&path, content)?;
 
-                    // Mark as downloaded in Pocket
-                    self.pocket_client
-                        .mark_as_downloaded(item.id().parse::<usize>()?)?;
+                    // Mark as downloaded by adding a tag
+                    self.raindrop_client.add_tag(item, "downloaded")?;
                 }
             }
         }
@@ -1390,17 +1431,91 @@ impl App {
     }
 
     fn refresh_data(&mut self) -> anyhow::Result<()> {
-        let delta_file = Path::new("snapshot_updates.db");
-        let mut stats = TotalStats::new();
-        let items = reload_data(delta_file, &self.pocket_client, &mut stats)?;
+        // Load existing cache to get last_sync and current items
+        let (mut items, last_sync) = if let Ok(Some(cache)) = raindrop::load_cache() {
+            (cache.raindrops, cache.last_sync)
+        } else {
+            // No cache, do full fetch
+            return self.full_refresh();
+        };
+
+        // Subtract 2 minutes from last_sync to handle race conditions
+        // (items created during previous sync might have earlier timestamps)
+        let sync_with_buffer = {
+            use chrono::{DateTime, Duration};
+            DateTime::parse_from_rfc3339(&last_sync)
+                .map(|dt| (dt - Duration::minutes(2)).to_rfc3339())
+                .unwrap_or(last_sync.clone())
+        };
+
+        // 1. Delta sync: fetch only items updated since last_sync (with buffer)
+        let updated = self.raindrop_client.get_raindrops_since(
+            raindrop::COLLECTION_ALL,
+            &sync_with_buffer,
+        )?;
+
+        // 2. Fetch trash to detect deletions (including external ones)
+        let trash_items = self.raindrop_client.get_all_raindrops(raindrop::COLLECTION_TRASH)?;
+        let trashed_ids: std::collections::HashSet<i64> = trash_items.iter().map(|r| r.id).collect();
+
+        // 3. Remove trashed items from local cache
+        let before_count = items.len();
+        items.retain(|item| !trashed_ids.contains(&item.id));
+        let removed_count = before_count - items.len();
+
+        // 4. Merge updated items into existing items
+        let updated_ids: std::collections::HashSet<i64> = updated.iter().map(|r| r.id).collect();
+        items.retain(|item| !updated_ids.contains(&item.id));
+        items.extend(updated.clone());
+
+        // Sort by created date (newest first)
+        items.sort_by(|a, b| b.created.cmp(&a.created));
+
+        // Update cache with new sync time
+        let cache = raindrop::RaindropCache {
+            raindrops: items.clone(),
+            collections: vec![],
+            last_sync: raindrop::now_iso8601(),
+        };
+        raindrop::save_cache(&cache)?;
+
+        if removed_count > 0 || !updated.is_empty() {
+            log::info!("Sync: {} updated, {} removed (via trash)", updated.len(), removed_count);
+        }
+
         self.cached_tags = items
             .iter()
             .flat_map(|item| item.tags().map(|tag| tag.to_string()))
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        self.stats = stats;
-        self.items = FilteredItems::<PocketItem>::non_archived(items);
+        self.stats = TotalStats::new();
+        self.items = FilteredItems::new(items);
+        self.apply_filter();
+        Ok(())
+    }
+
+    fn full_refresh(&mut self) -> anyhow::Result<()> {
+        // Full re-fetch from Raindrop API
+        let mut items = self.raindrop_client.get_all_raindrops(raindrop::COLLECTION_ALL)?;
+        items.sort_by(|a, b| b.created.cmp(&a.created));
+
+        // Update cache
+        let cache = raindrop::RaindropCache {
+            raindrops: items.clone(),
+            collections: vec![],
+            last_sync: raindrop::now_iso8601(),
+        };
+        raindrop::save_cache(&cache)?;
+
+        self.cached_tags = items
+            .iter()
+            .flat_map(|item| item.tags().map(|tag| tag.to_string()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        self.stats = TotalStats::new();
+        self.items = FilteredItems::new(items);
         self.apply_filter();
         Ok(())
     }
@@ -1430,21 +1545,12 @@ impl App {
     }
 
     fn show_domain_stats(&mut self) {
-        // Create a hashmap to store domain/author counts
+        // Create a hashmap to store domain counts
         let mut counts = std::collections::HashMap::new();
 
-        // Count domains/authors for each item
+        // Count domains for each item
         for item in self.items.iter() {
-            let key = if item.item_type() == "video" || item.url().contains("medium") {
-                // For videos, use author IDs if available
-                match &item.authors {
-                    Some(authors) if !authors.is_empty() => authors.join(", "),
-                    _ => "IGNORE".to_string(),
-                }
-            } else {
-                // For non-videos, use domain
-                Self::extract_domain(item.url()).unwrap_or_else(|| "IGNORE".to_string())
-            };
+            let key = Self::extract_domain(item.url()).unwrap_or_else(|| "IGNORE".to_string());
             if key != "IGNORE" {
                 *counts.entry(key).or_insert(0) += 1;
             }
@@ -1558,66 +1664,25 @@ impl App {
         url.split('/').next().map(|s| s.to_string())
     }
 
-    fn filter_by_video_authors(&mut self, target_authors: &[String]) {
-        self.items.apply_filter(|item| {
-            if item.item_type() == "video" {
-                // For videos, check if any authors match
-                if let Some(item_authors) = &item.authors {
-                    item_authors
-                        .iter()
-                        .any(|author| target_authors.iter().any(|target| author.contains(target)))
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        });
-        self.virtual_state.select(Some(0));
-        *self.virtual_state.offset_mut() = 0;
-    }
     fn filter_by_current_domain(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx).cloned() {
-                if item.item_type() == "video" {
-                    // For videos, use authors as the filter criteria
-                    match &item.authors {
-                        Some(authors) if !authors.is_empty() => {
-                            // Use authors as filter
-                            self.domain_filter = Some(authors.join(", "));
-                            self.filter_by_video_authors(authors);
-                        }
-                        _ => {
-                            // No authors available
-                            self.domain_filter = Some("N/A".to_string());
-                            self.apply_filter();
-                        }
-                    }
-                } else {
-                    // Regular domain filtering for non-video content
-                    if let Some(domain) = Self::extract_domain(item.url()) {
-                        self.domain_filter = Some(domain);
-                        self.apply_filter();
-                    }
+                // Domain filtering for all content
+                if let Some(domain) = Self::extract_domain(item.url()) {
+                    self.domain_filter = Some(domain);
+                    self.apply_filter();
                 }
             }
         }
         Ok(())
     }
 
-    fn _apply_video_author_filter(&mut self, target_authors: &[String]) {
+    #[allow(dead_code)]
+    fn _apply_domain_filter(&mut self, target_domain: &str) {
         self.items.apply_filter(|item| {
-            if item.item_type() == "video" {
-                // For videos, check if any authors match
-                if let Some(item_authors) = &item.authors {
-                    item_authors
-                        .iter()
-                        .any(|author| target_authors.contains(author))
-                } else {
-                    false
-                }
+            if let Some(domain) = Self::extract_domain(item.url()) {
+                domain.contains(target_domain)
             } else {
-                // Non-video items don't match when filtering by video author
                 false
             }
         });
@@ -1667,32 +1732,38 @@ impl App {
     fn open_current_url(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get_mut(idx) {
-                self.pocket_client
-                    .mark_as_read(item.id().parse::<usize>()?)?;
+                // Mark as read by adding a tag
+                self.raindrop_client.add_tag(item, "read")?;
                 item.add_tag("read");
                 webbrowser::open(&item.url()).context("Failed to open link in a browser")?;
             }
+            self.save_to_cache()?;
         }
         Ok(())
     }
 
-    //todo: usize conversion is dumb
     fn delete_article(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
-                self.pocket_client.delete(item.id().parse::<usize>()?)?;
-
-                // Log the deletion in the storage.delta
-                let delta_record = storage::PocketItemUpdate::Delete {
-                    item_id: item.id(),
-                    timestamp: Some(Utc::now().timestamp().try_into().unwrap()),
-                };
-                let delta_file = Path::new("snapshot_updates.db");
-                // this is needed to enrich delete event with timestamp. looks like pocket api erases this info
-                storage::append_delete_to_delta(delta_file, &delta_record)?;
+                self.raindrop_client.delete_raindrop(item.id)?;
             }
             self.items.remove(idx);
+            // Save to cache: item might be permanently gone (not in Trash)
+            // so Trash-based detection wouldn't catch it
+            self.save_to_cache()?;
         }
+        Ok(())
+    }
+
+    /// Save current items to cache
+    fn save_to_cache(&self) -> anyhow::Result<()> {
+        let all_items: Vec<raindrop::Raindrop> = self.items.items.clone();
+        let cache = raindrop::RaindropCache {
+            raindrops: all_items,
+            collections: vec![],
+            last_sync: raindrop::now_iso8601(),
+        };
+        raindrop::save_cache(&cache)?;
         Ok(())
     }
 
@@ -1700,26 +1771,26 @@ impl App {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get_mut(idx) {
                 if !item.tags().any(|x| x == "top") {
-                    self.pocket_client
-                        .mark_as_top(item.id().parse::<usize>()?)?;
+                    self.raindrop_client.add_tag(item, "top")?;
                     item.add_tag("top");
                 } else {
-                    self.pocket_client
-                        .unmark_as_top(item.id().parse::<usize>()?)?;
+                    self.raindrop_client.remove_tag(item, "top")?;
                     item.remove_tag("top");
                 }
             }
+            self.save_to_cache()?;
         }
         Ok(())
     }
 
-    fn fav_and_archive_article(&mut self) -> anyhow::Result<()> {
+    fn archive_article(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
-            if let Some(item) = self.items.get(idx) {
-                self.pocket_client
-                    .fav_and_archive(item.id().parse::<usize>()?)?;
+            if let Some(item) = self.items.get_mut(idx) {
+                // Archive by adding a tag (Raindrop doesn't have archive like Pocket)
+                self.raindrop_client.add_tag(item, "archived")?;
             }
             self.items.remove(idx);
+            self.save_to_cache()?;
         }
         Ok(())
     }
@@ -1826,14 +1897,11 @@ impl App {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get_mut(idx) {
                 let normalized_title = current_enter.replace('\n', " ").trim().to_string();
-                self.pocket_client.rename(
-                    item.id().parse::<usize>()?,
-                    item.url(),
-                    &normalized_title,
-                    item.time_added(),
-                )?;
+                let update = raindrop::UpdateRaindrop::new().title(&normalized_title);
+                self.raindrop_client.update_raindrop(item.id, &update)?;
                 item.rename_title_to(current_enter);
             }
+            self.save_to_cache()?;
         }
         Ok(())
     }
@@ -1926,133 +1994,54 @@ impl App {
     }
 }
 
-fn reload_data(
-    delta_file: &Path,
-    pocket_client: &GetPocketSync,
-    stats: &mut TotalStats,
-) -> anyhow::Result<Vec<PocketItem>> {
-    pocket_client
-        .refresh_delta_block(&delta_file)
-        .context("failed to refresh delta during refresh")?;
-
-    // Load and process delta updates
-    let delta_items = storage::load_delta_pocket_items(&delta_file);
-    let mut seen_item_ids = std::collections::HashSet::new();
-    let today = Utc::now();
-
-    let pocket_snapshot = storage::load_snapshot_file();
-    let mut current_items = pocket_snapshot.pocket_items();
-
-    // Process each delta update
-    for update in delta_items {
-        match update {
-            PocketItemUpdate::Delete {
-                item_id,
-                timestamp: ts_opt,
-            } => {
-                if let Some(ts) = ts_opt {
-                    if let Some(item) = current_items.get(&item_id) {
-                        if !seen_item_ids.contains(&item_id) {
-                            stats.track_as(item, &today, true, ts as i64);
-                            seen_item_ids.insert(item_id.clone());
-                        }
-                    }
-                }
-                current_items.remove(&item_id);
-            }
-            PocketItemUpdate::Add {
-                item_id: id,
-                data: mut new_item,
-            } => {
-                if let Some(existing) = current_items.get(&id) {
-                    // Update existing item
-                    new_item.time_added = existing.time_added().to_string();
-                    let ts: i64 = new_item.time_updated.parse::<i64>().unwrap_or(0);
-                    if new_item.favorite == "1" && !seen_item_ids.contains(&id) {
-                        stats.track_as(existing, &today, true, ts);
-                        seen_item_ids.insert(id.clone());
-                    }
-                    current_items.insert(id, new_item.into()); // Assuming T can be created from PocketItem
-                } else {
-                    // Add new item
-                    stats.track_item(&new_item, &today);
-                    current_items.insert(id, new_item.into());
-                }
-            }
-        }
-    }
-
-    // Convert back to a sorted vector
-    let items: Vec<PocketItem> = current_items
-        .into_values()
-        .filter(|a| a.tags().all(|tag| tag != "favorite")) // Skip favorited items
-        .sorted_by(|a, b| b.time_added.partial_cmp(&a.time_added).unwrap())
-        .collect();
-
-    return Ok(items);
-}
+// Legacy Pocket reload function - not used with Raindrop backend
+// fn reload_data(
+//     delta_file: &Path,
+//     pocket_client: &GetPocketSync,
+//     stats: &mut TotalStats,
+// ) -> anyhow::Result<Vec<PocketItem>> { ... }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let target = Box::new(File::create("log.txt").expect("Can't create file"));
 
-    let token_opt = tokenstorage::UserTokenStorage::get_token()?;
-    let token = if let Some(t) = token_opt {
-        t
+    // Get Raindrop token
+    let token = raindrop::token::get_or_prompt_token()?;
+
+    // Create Raindrop client
+    let raindrop_client = raindrop::RaindropAPISync::new(&token)?;
+
+    // Load items from cache or fetch from API
+    let mut items = if let Ok(Some(cache)) = raindrop::load_cache() {
+        println!("Loaded {} items from cache (synced: {})", cache.raindrops.len(), cache.last_sync);
+        cache.raindrops
     } else {
-        println!("Auth information is not found. Starting authentication procedure...");
-        thread::sleep(Duration::from_secs(4));
-        let pocket_auth = auth::PocketAuth::new()?;
-        let auth_token = pocket_auth.authenticate()?;
-        tokenstorage::UserTokenStorage::store_token(&auth_token)?;
-        auth_token
+        print!("Fetching raindrops from Raindrop.io... ");
+        io::stdout().flush()?;
+        let fetched = raindrop_client.get_all_raindrops_with_progress(
+            raindrop::COLLECTION_ALL,
+            |downloaded, total| {
+                print!("\rFetching raindrops from Raindrop.io... {}/{}", downloaded, total);
+                let _ = io::stdout().flush();
+            },
+        )?;
+        println!();
+
+        // Save to cache
+        let cache = raindrop::RaindropCache {
+            raindrops: fetched.clone(),
+            collections: vec![],
+            last_sync: raindrop::now_iso8601(),
+        };
+        if let Err(e) = raindrop::save_cache(&cache) {
+            eprintln!("Warning: Failed to save cache: {}", e);
+        }
+
+        println!("Fetched {} items from Raindrop.io", fetched.len());
+        fetched
     };
 
-    let pocket_client = GetPocketSync::new(&token)?;
-
-    if !storage::snapshot_exists() {
-        // let animation = vec!["|", "/", "-", "\\"];
-        // let mut animation_index = 0;
-        // let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        // let running_clone = running.clone();
-        // let animation_handle = thread::spawn(move || {
-        //     while running_clone.load(std::sync::atomic::Ordering::SeqCst) {
-        //         print!(
-        //             "\rRetrieving snapshot data from pocket. This might take time... {}",
-        //             animation[animation_index]
-        //         );
-        //         io::stdout().flush().unwrap();
-        //         thread::sleep(Duration::from_millis(100));
-        //         animation_index = (animation_index + 1) % animation.len();
-        //     }
-        // });
-
-        println!("\rRetrieving snapshot data from pocket. This might take time... ");
-        let snapshot: storage::Pocket = pocket_client.retrieve_all()?;
-        storage::save_to_snapshot(&snapshot)?;
-        if let Some((item_id, value)) = snapshot.list.iter().max_by_key(|(_id, item)| {
-            item.get("time_added")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0)
-        }) {
-            let delta_file = Path::new(DELTA_FILE);
-            let mut map: serde_json::Map<String, serde_json::Value> =
-                serde_json::Map::with_capacity(1);
-            map.insert(item_id.clone(), value.clone());
-            storage::append_to_delta(
-                delta_file,
-                &storage::Pocket {
-                    status: 1,
-                    complete: 1,
-                    list: map,
-                },
-            )?;
-        } else {
-            todo!("Oh no1");
-        }
-        // running.store(false, std::sync::atomic::Ordering::SeqCst);
-        // let _ = animation_handle.join();
-    }
+    // Sort by date (newest first)
+    items.sort_by(|a, b| b.created.cmp(&a.created));
 
     env_logger::Builder::new()
         .target(env_logger::Target::Pipe(target))
@@ -2084,9 +2073,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let stats = TotalStats::new();
-    let list = Vec::new(); //reload_data(&delta_file, &pocket_client, &mut stats)?;
 
-    let mut app: App = App::new(list, pocket_client, stats);
+    let mut app: App = App::new(items, raindrop_client, stats);
     app.start_rss_feed_loading()?;
     let res = run_app(&mut terminal, app);
 
@@ -2113,7 +2101,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
             .context("Failed to draw UI")?;
         match &mut app.app_mode {
             AppMode::Initialize => {
-                app.refresh_data()?;
+                // Refresh data on startup to catch any changes since last run
+                if let Err(e) = app.refresh_data() {
+                    log::error!("Failed to refresh on startup: {}", e);
+                }
                 app.app_mode = AppMode::Normal;
             }
             AppMode::Normal => process_input_normal_mode(&mut app)?,
@@ -2414,17 +2405,9 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                         if let Some((domain, _)) =
                             domain_state.stats.get(domain_state.selected_index)
                         {
-                            let authors: Vec<String> =
-                                domain.split(", ").map(String::from).collect();
-                            if domain.contains("YT:") {
-                                // This is a video author
-                                app.domain_filter = Some(domain.clone());
-                                app.filter_by_video_authors(&authors);
-                            } else {
-                                // Regular domain
-                                app.domain_filter = Some(domain.clone());
-                                app.apply_filter();
-                            }
+                            // Filter by domain
+                            app.domain_filter = Some(domain.clone());
+                            app.apply_filter();
                             app.domain_stats_popup_state = None;
                         }
                     }
@@ -2507,7 +2490,7 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                     Char('/') => app.switch_to_search_mode(),
                     Char('t') => app.toggle_top_tag()?,
                     Char('T') => app.switch_to_edit_tags_mode(),
-                    Char('f') | Char('F') => app.fav_and_archive_article()?,
+                    Char('f') | Char('F') => app.archive_article()?,
                     Char('d') => {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
                             app.scroll_down();

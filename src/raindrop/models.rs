@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 // Special collection IDs
@@ -29,6 +30,9 @@ pub enum RaindropType {
     Video,
     Document,
     Audio,
+    Book,
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for RaindropType {
@@ -40,6 +44,8 @@ impl std::fmt::Display for RaindropType {
             RaindropType::Video => write!(f, "video"),
             RaindropType::Document => write!(f, "document"),
             RaindropType::Audio => write!(f, "audio"),
+            RaindropType::Book => write!(f, "book"),
+            RaindropType::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -119,6 +125,75 @@ impl Raindrop {
         } else {
             &self.title
         }
+    }
+
+    // TableRow-compatible methods for UI compatibility
+
+    /// Get formatted date string
+    pub fn date(&self) -> String {
+        if self.created.is_empty() {
+            return "unknown".to_string();
+        }
+        // Parse ISO 8601 date
+        let parsed = DateTime::parse_from_rfc3339(&self.created)
+            .or_else(|_| DateTime::parse_from_rfc3339(&self.created.replace("Z", "+00:00")));
+
+        match parsed {
+            Ok(dt) => dt.format("%Y-%m-%d").to_string(),
+            Err(_) => self.created.chars().take(10).collect(),
+        }
+    }
+
+    /// Get time added as Unix timestamp
+    pub fn time_added(&self) -> u64 {
+        if self.created.is_empty() {
+            return 0;
+        }
+        DateTime::parse_from_rfc3339(&self.created)
+            .or_else(|_| DateTime::parse_from_rfc3339(&self.created.replace("Z", "+00:00")))
+            .map(|dt| dt.timestamp() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Get item type as string
+    pub fn type_str(&self) -> &str {
+        match self.item_type {
+            RaindropType::Video => "video",
+            RaindropType::Article => "article",
+            RaindropType::Document => "pdf",
+            RaindropType::Image => "image",
+            RaindropType::Audio => "audio",
+            RaindropType::Book => "book",
+            RaindropType::Unknown => "unknown",
+            RaindropType::Link => {
+                // Check URL for hints
+                if self.link.contains("youtube.com") || self.link.contains("youtu.be") {
+                    "video"
+                } else if self.link.contains(".pdf") {
+                    "pdf"
+                } else {
+                    "article"
+                }
+            }
+        }
+    }
+
+    /// Add a tag (mutably)
+    pub fn add_tag(&mut self, tag: &str) {
+        if !self.has_tag(tag) {
+            self.tags.push(tag.to_string());
+        }
+    }
+
+    /// Remove a tag (mutably)
+    pub fn remove_tag(&mut self, tag: &str) {
+        let tag_lower = tag.to_lowercase();
+        self.tags.retain(|t| t.to_lowercase() != tag_lower);
+    }
+
+    /// Rename title
+    pub fn rename_title(&mut self, new_title: String) {
+        self.title = new_title;
     }
 }
 
@@ -312,6 +387,8 @@ pub struct RaindropsResponse {
     pub result: bool,
     #[serde(default)]
     pub items: Vec<Raindrop>,
+    #[serde(default)]
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

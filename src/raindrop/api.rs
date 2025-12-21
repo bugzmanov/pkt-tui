@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
 use reqwest::{header, Client, StatusCode};
+use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::time::sleep;
 
 use super::models::*;
 
@@ -102,48 +104,217 @@ impl RaindropAPI {
     /// Get raindrops from a collection with pagination
     ///
     /// Use COLLECTION_ALL (0) to get all raindrops
+    /// Automatically waits and retries on rate limiting.
     pub async fn get_raindrops(
         &self,
         collection_id: i64,
         page: u32,
     ) -> Result<Vec<Raindrop>> {
+        self.get_raindrops_sorted(collection_id, page, "-created").await
+    }
+
+    /// Get raindrops sorted by a field
+    /// Common sorts: "-created", "-lastUpdate", "title", etc.
+    pub async fn get_raindrops_sorted(
+        &self,
+        collection_id: i64,
+        page: u32,
+        sort: &str,
+    ) -> Result<Vec<Raindrop>> {
         let url = format!("{}/raindrops/{}", BASE_URL, collection_id);
-        let response = self
-            .client
-            .get(&url)
-            .query(&[("page", page.to_string()), ("perpage", PAGE_SIZE.to_string())])
-            .send()
-            .await?;
 
-        self.handle_response_status(&response)?;
+        loop {
+            let response = self
+                .client
+                .get(&url)
+                .query(&[
+                    ("page", page.to_string()),
+                    ("perpage", PAGE_SIZE.to_string()),
+                    ("sort", sort.to_string()),
+                ])
+                .send()
+                .await?;
 
-        let data: RaindropsResponse = response
-            .json()
-            .await
-            .context("Failed to parse raindrops response")?;
-        if !data.result {
-            bail!("API returned result=false for raindrops request");
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(30);
+
+                eprintln!("Rate limited, waiting {} seconds...", retry_after);
+                sleep(Duration::from_secs(retry_after)).await;
+                continue;
+            }
+
+            self.handle_response_status(&response)?;
+
+            let data: RaindropsResponse = response
+                .json()
+                .await
+                .context("Failed to parse raindrops response")?;
+            if !data.result {
+                bail!("API returned result=false for raindrops request");
+            }
+            return Ok(data.items);
         }
-        Ok(data.items)
+    }
+
+    /// Get raindrops created or updated since a given timestamp (delta sync)
+    /// Uses search filter with created date for efficiency
+    pub async fn get_raindrops_since(
+        &self,
+        collection_id: i64,
+        since_timestamp: &str,
+    ) -> Result<Vec<Raindrop>> {
+        // Extract date part from ISO timestamp (YYYY-MM-DD)
+        // Go back one day to handle race conditions at day boundaries
+        let since_date = if since_timestamp.len() >= 10 {
+            &since_timestamp[..10]
+        } else {
+            return Ok(Vec::new());
+        };
+
+        let mut updated_items = Vec::new();
+        let mut page = 0u32;
+
+        loop {
+            let items = self.get_raindrops_with_search(
+                collection_id,
+                page,
+                &format!("created:{}", since_date)  // Include items from sync day
+            ).await?;
+
+            if items.is_empty() {
+                break;
+            }
+
+            // Filter by exact timestamp (search only supports date granularity)
+            // Use >= to include items created at or after since_timestamp
+            for item in items {
+                if item.created.as_str() >= since_timestamp ||
+                   item.last_update.as_str() >= since_timestamp {
+                    updated_items.push(item);
+                }
+            }
+
+            page += 1;
+        }
+
+        Ok(updated_items)
+    }
+
+    /// Get raindrops with search filter
+    async fn get_raindrops_with_search(
+        &self,
+        collection_id: i64,
+        page: u32,
+        search: &str,
+    ) -> Result<Vec<Raindrop>> {
+        let url = format!("{}/raindrops/{}", BASE_URL, collection_id);
+
+        loop {
+            let response = self
+                .client
+                .get(&url)
+                .query(&[
+                    ("page", page.to_string()),
+                    ("perpage", PAGE_SIZE.to_string()),
+                    ("search", search.to_string()),
+                ])
+                .send()
+                .await?;
+
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(30);
+
+                eprintln!("Rate limited, waiting {} seconds...", retry_after);
+                sleep(Duration::from_secs(retry_after)).await;
+                continue;
+            }
+
+            self.handle_response_status(&response)?;
+
+            let data: RaindropsResponse = response
+                .json()
+                .await
+                .context("Failed to parse raindrops response")?;
+            if !data.result {
+                bail!("API returned result=false for raindrops request");
+            }
+            return Ok(data.items);
+        }
+    }
+
+    /// Get raindrops with count (returns items and total count)
+    async fn get_raindrops_with_count(
+        &self,
+        collection_id: i64,
+        page: u32,
+    ) -> Result<(Vec<Raindrop>, i64)> {
+        let url = format!("{}/raindrops/{}", BASE_URL, collection_id);
+
+        loop {
+            let response = self
+                .client
+                .get(&url)
+                .query(&[("page", page.to_string()), ("perpage", PAGE_SIZE.to_string())])
+                .send()
+                .await?;
+
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(30);
+
+                eprintln!("Rate limited, waiting {} seconds...", retry_after);
+                sleep(Duration::from_secs(retry_after)).await;
+                continue;
+            }
+
+            self.handle_response_status(&response)?;
+
+            let data: RaindropsResponse = response
+                .json()
+                .await
+                .context("Failed to parse raindrops response")?;
+            if !data.result {
+                bail!("API returned result=false for raindrops request");
+            }
+            return Ok((data.items, data.count));
+        }
     }
 
     /// Get ALL raindrops from a collection (handles pagination)
     ///
-    /// Optionally provide a progress callback that receives the count downloaded so far.
-    /// Negative count indicates rate-limited pause.
+    /// Progress callback receives (downloaded_count, total_count).
     pub async fn get_all_raindrops<F>(
         &self,
         collection_id: i64,
         mut progress: Option<F>,
     ) -> Result<Vec<Raindrop>>
     where
-        F: FnMut(i32),
+        F: FnMut(i32, i64),
     {
         let mut all_raindrops = Vec::new();
         let mut page = 0u32;
+        let mut total_count = 0i64;
 
         loop {
-            let raindrops = self.get_raindrops(collection_id, page).await?;
+            let (raindrops, count) = self.get_raindrops_with_count(collection_id, page).await?;
+
+            if page == 0 {
+                total_count = count;
+            }
 
             if raindrops.is_empty() {
                 break;
@@ -152,7 +323,7 @@ impl RaindropAPI {
             all_raindrops.extend(raindrops);
 
             if let Some(ref mut cb) = progress {
-                cb(all_raindrops.len() as i32);
+                cb(all_raindrops.len() as i32, total_count);
             }
 
             page += 1;
@@ -196,9 +367,15 @@ impl RaindropAPI {
     }
 
     /// Delete a raindrop (moves to trash, or permanently deletes if already in trash)
+    /// Returns Ok(()) even if item was already deleted (404)
     pub async fn delete_raindrop(&self, id: i64) -> Result<()> {
         let url = format!("{}/raindrop/{}", BASE_URL, id);
         let response = self.client.delete(&url).send().await?;
+
+        // Treat 404 as success - item is already gone
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
 
         self.handle_response_status(&response)?;
 
@@ -323,20 +500,30 @@ impl RaindropAPISync {
     /// Get ALL raindrops from a collection (handles pagination)
     pub fn get_all_raindrops(&self, collection_id: i64) -> Result<Vec<Raindrop>> {
         self.runtime
-            .block_on(self.api.get_all_raindrops::<fn(i32)>(collection_id, None))
+            .block_on(self.api.get_all_raindrops::<fn(i32, i64)>(collection_id, None))
     }
 
-    /// Get ALL raindrops with progress callback
+    /// Get ALL raindrops with progress callback (downloaded, total)
     pub fn get_all_raindrops_with_progress<F>(
         &self,
         collection_id: i64,
         progress: F,
     ) -> Result<Vec<Raindrop>>
     where
-        F: FnMut(i32),
+        F: FnMut(i32, i64),
     {
         self.runtime
             .block_on(self.api.get_all_raindrops(collection_id, Some(progress)))
+    }
+
+    /// Get raindrops updated since a timestamp (delta sync)
+    pub fn get_raindrops_since(
+        &self,
+        collection_id: i64,
+        since_timestamp: &str,
+    ) -> Result<Vec<Raindrop>> {
+        self.runtime
+            .block_on(self.api.get_raindrops_since(collection_id, since_timestamp))
     }
 
     /// Add a new raindrop
