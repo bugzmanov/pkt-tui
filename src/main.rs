@@ -416,19 +416,19 @@ impl ReadingStats {
     }
 }
 
-fn collect_stats(items: &Vec<impl TableRow>, start_idx: usize) -> ReadingStats {
+fn collect_stats<T: TableRow>(items: &FilteredItems<T>, start_idx: usize) -> ReadingStats {
     let mut stats = ReadingStats::new();
-    let mut idx = start_idx;
     let current_date = items.get(start_idx).unwrap().date();
-    while idx < items.len() && items.get(idx).unwrap().date() == current_date {
-        let item = items.get(idx).unwrap();
+    for item in items.iter_from(start_idx) {
+        if item.date() != current_date {
+            break;
+        }
         match item.item_type() {
             "article" => stats.articles_total += 1,
             "video" => stats.videos_total += 1,
             "pdf" => stats.pdfs_total += 1,
             _ => {} // do nothing
         }
-        idx += 1;
     }
     stats
 }
@@ -858,6 +858,15 @@ impl<T> FilteredItems<T> {
                     .map(|i| &self.items[*i])
                     .collect()
             }
+        }
+    }
+
+    /// Returns an iterator over items starting at idx (respects filter)
+    fn iter_from(&self, idx: usize) -> Box<dyn Iterator<Item = &T> + '_> {
+        if !self.is_filter_on {
+            Box::new(self.items.iter().skip(idx))
+        } else {
+            Box::new(self.filtered.iter().skip(idx).map(|i| &self.items[*i]))
         }
     }
 }
@@ -2054,42 +2063,31 @@ impl App {
 
     fn scroll_down(&mut self) {
         let page_size = 13;
-        let i = match self.virtual_state.selected() {
-            Some(i) => {
-                if (i + page_size) > self.items.len() - 1 {
-                    (i + page_size) % self.items.len()
-                } else {
-                    i + page_size
-                }
-            }
-            None => 0,
-        };
-        if self.virtual_state.offset() < self.virtual_state.selected().unwrap_or(0) {
-            *self.virtual_state.offset_mut() = self.virtual_state.selected().unwrap_or(0);
-        } else {
-            self.virtual_state.select(Some(i));
-            *self.virtual_state.offset_mut() = i;
+        let current = self.virtual_state.selected().unwrap_or(0);
+        let max_index = self.items.len().saturating_sub(1);
+
+        // If already at end, do nothing
+        if current >= max_index {
+            return;
         }
+
+        let new_index = (current + page_size).min(max_index);
+        self.virtual_state.select(Some(new_index));
+        self.scroll_state = self.scroll_state.position(new_index * ITEM_HEIGHT);
     }
 
     fn scroll_up(&mut self) {
         let page_size = 13;
-        let i = match self.virtual_state.selected() {
-            Some(i) => {
-                if i > page_size {
-                    i - page_size
-                } else {
-                    0
-                }
-            }
-            None => 0,
-        };
-        if self.virtual_state.offset() < self.virtual_state.selected().unwrap_or(0) {
-            self.virtual_state.select(Some(self.virtual_state.offset()));
-        } else {
-            self.virtual_state.select(Some(i));
-            *self.virtual_state.offset_mut() = i;
+        let current = self.virtual_state.selected().unwrap_or(0);
+
+        // If already at beginning, do nothing
+        if current == 0 {
+            return;
         }
+
+        let new_index = current.saturating_sub(page_size);
+        self.virtual_state.select(Some(new_index));
+        self.scroll_state = self.scroll_state.position(new_index * ITEM_HEIGHT);
     }
 
     fn scroll_to_end(&mut self) {
@@ -3138,8 +3136,15 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
     let length = 14; //todo calc the value
 
-    if app.virtual_state.selected().unwrap() >= app.virtual_state.offset() + length {
-        *app.virtual_state.offset_mut() = app.virtual_state.selected().unwrap() + 1 - length;
+    let selected = app.virtual_state.selected().unwrap_or(0);
+
+    // Adjust offset if selection is below visible area
+    if selected >= app.virtual_state.offset() + length {
+        *app.virtual_state.offset_mut() = selected + 1 - length;
+    }
+    // Adjust offset if selection is above visible area
+    if selected < app.virtual_state.offset() {
+        *app.virtual_state.offset_mut() = selected;
     }
 
     let offset = app.virtual_state.offset();
@@ -3215,7 +3220,7 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                         .style(Style::default().fg(OCEANIC_NEXT.base_03))
                 } else {
                     if multiple_entries_for_date {
-                        let stats = collect_stats(&app.items.items, actual_index); //todo! accessing items of items
+                        let stats = collect_stats(&app.items, actual_index);
                         let stats_str = format!(
                             "░▒▓ Text: {} | PDFs: {} | Vids: {} ▓▒░",
                             // "Day [  Text: {} | PDFs: {} |  Vids: {}  ]",
