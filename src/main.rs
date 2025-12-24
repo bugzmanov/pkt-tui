@@ -26,19 +26,26 @@ use dom_smoothie::{Article, Config, Readability};
 use itertools::Itertools;
 use log::{error, LevelFilter};
 use pocket::{GetPocketSync, SendResponse};
-use prss::{RssFeedItem, RssManager};
+use prss::{
+    metadata::{load_shared_store, SharedMetadataStore},
+    RssFeedItem, RssManager,
+};
 use ratatui::{prelude::*, widgets::*};
 use rayon::prelude::*;
 use readingstats::{render_stats, TotalStats};
 use reqwest::blocking::Client;
 use serde_json::json;
 use std::{
+    collections::HashMap,
     error::Error,
     fs::{self, File},
     io::{self, Write},
     ops::Range,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread::{self},
     time::{Duration, Instant},
 };
@@ -231,9 +238,10 @@ trait TableRow {
 pub struct RssFeedState {
     pub items: Arc<Mutex<Vec<RssFeedItem>>>,
     pub is_loading: Arc<Mutex<bool>>,
-    pub has_updates: bool,
+    pub has_updates: Arc<AtomicBool>,
     pub error: Option<String>,
     pub items_processed: bool,
+    pub per_feed_cache: Arc<Mutex<HashMap<String, Vec<RssFeedItem>>>>,
 }
 
 impl RssFeedState {
@@ -241,14 +249,15 @@ impl RssFeedState {
         Self {
             items: Arc::new(Mutex::new(Vec::new())),
             is_loading: Arc::new(Mutex::new(false)),
-            has_updates: false,
+            has_updates: Arc::new(AtomicBool::new(false)),
             error: None,
             items_processed: false,
+            per_feed_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     pub fn mark_items_processed(&mut self) {
         self.items_processed = true;
-        self.has_updates = false; // Clear the updates flag
+        self.has_updates.store(false, Ordering::Relaxed); // Clear the updates flag
     }
 }
 
@@ -266,13 +275,13 @@ pub struct RssFeedPopupState {
 }
 
 impl RssFeedPopupState {
-    pub fn empty() -> Self {
+    pub fn empty(metadata: SharedMetadataStore) -> Self {
         Self {
             items: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
             visible_items: 20,
-            hidden_items: prss::hidden_items::HiddenItems::new(),
+            hidden_items: prss::hidden_items::HiddenItems::new(metadata),
             status_message: None,
             pending_pocket_item: None,
             show_description: false,
@@ -281,8 +290,12 @@ impl RssFeedPopupState {
         }
     }
 
-    pub fn new(mut items: Vec<RssFeedItem>, visible_items: usize) -> anyhow::Result<Self> {
-        let hidden_items = prss::hidden_items::HiddenItems::load()?;
+    pub fn new(
+        mut items: Vec<RssFeedItem>,
+        visible_items: usize,
+        metadata: SharedMetadataStore,
+    ) -> anyhow::Result<Self> {
+        let hidden_items = prss::hidden_items::HiddenItems::load(metadata)?;
         items.retain(|item| !hidden_items.is_hidden(&item.item_id));
 
         Ok(Self {
@@ -916,6 +929,8 @@ struct App {
     rss_feed_state: RssFeedState,
     current_tab: CurrentTab,
     rss_tab_state: RssFeedPopupState,
+    rss_metadata: SharedMetadataStore,
+    raindrop_url_index: Arc<HashMap<String, Vec<String>>>,
 }
 
 impl App {
@@ -924,14 +939,16 @@ impl App {
         raindrop_client: raindrop::RaindropAPISync,
         stats: TotalStats,
         archive_collection_id: Option<i64>,
-    ) -> App {
+    ) -> anyhow::Result<App> {
         let cached_tags = data_vec
             .iter()
             .flat_map(|item| item.tags().map(|tag| tag.to_string()))
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        App {
+        let metadata_store = load_shared_store()?;
+        let raindrop_url_index = Arc::new(Self::build_raindrop_url_index(&data_vec));
+        Ok(App {
             virtual_state: TableState::default().with_selected(0),
             state: TableState::default().with_selected(0),
             longest_item_lens: constraint_len_calculator(&data_vec),
@@ -961,7 +978,42 @@ impl App {
             cached_tags,
             rss_feed_state: RssFeedState::new(),
             current_tab: CurrentTab::Raindrops,
-            rss_tab_state: RssFeedPopupState::empty(),
+            rss_tab_state: RssFeedPopupState::empty(metadata_store.clone()),
+            rss_metadata: metadata_store,
+            raindrop_url_index,
+        })
+    }
+
+    fn build_raindrop_url_index(items: &[raindrop::Raindrop]) -> HashMap<String, Vec<String>> {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for item in items {
+            let normalized = Self::normalize_url(item.url());
+            if normalized.is_empty() {
+                continue;
+            }
+            let entry = map.entry(normalized).or_insert_with(Vec::new);
+            for tag in item.tags() {
+                if !entry.contains(tag) {
+                    entry.push(tag.clone());
+                }
+            }
+        }
+        map
+    }
+
+    fn normalize_url(url: &str) -> String {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let without_trailing = trimmed.trim_end_matches('/');
+        let lowered = without_trailing.to_ascii_lowercase();
+        if let Some(rest) = lowered.strip_prefix("https://") {
+            rest.to_string()
+        } else if let Some(rest) = lowered.strip_prefix("http://") {
+            rest.to_string()
+        } else {
+            lowered
         }
     }
 
@@ -1088,22 +1140,64 @@ impl App {
                 *is_loading = true;
             }
         }
+        self.rss_feed_state.items_processed = false;
 
         let client = reqwest::blocking::ClientBuilder::new()
             .timeout(Duration::from_secs(10))
             .build()?;
 
         let items_arc = self.rss_feed_state.items.clone();
-        let hidden_items = prss::hidden_items::HiddenItems::load()?;
         let is_loading_arc = self.rss_feed_state.is_loading.clone();
+        let per_feed_cache = self.rss_feed_state.per_feed_cache.clone();
+        let metadata_store = self.rss_metadata.clone();
+        let raindrop_index = self.raindrop_url_index.clone();
+        let has_updates_flag = self.rss_feed_state.has_updates.clone();
+        let feed_order = feeds.clone();
+
         thread::spawn(move || {
-            let results = Arc::new(Mutex::new(Vec::new()));
+            let combined_items = Arc::new(Mutex::new(HashMap::new()));
 
             feeds.par_iter().for_each(|url| {
-                match RssManager::fetch_and_parse_feed(&client, url) {
-                    Ok(items) => {
-                        if let Ok(mut results_guard) = results.lock() {
-                            results_guard.extend(items);
+                let has_cached_items = {
+                    if let Ok(cache) = per_feed_cache.lock() {
+                        cache.contains_key(url)
+                    } else {
+                        false
+                    }
+                };
+
+                let conditional_headers = if has_cached_items {
+                    metadata_store
+                        .lock()
+                        .ok()
+                        .and_then(|meta| meta.feed_headers(url))
+                } else {
+                    None
+                };
+
+                match RssManager::fetch_and_parse_feed(&client, url, conditional_headers.as_ref()) {
+                    Ok(result) => {
+                        let items_for_feed = if result.not_modified {
+                            per_feed_cache
+                                .lock()
+                                .ok()
+                                .and_then(|cache| cache.get(url).cloned())
+                                .unwrap_or_default()
+                        } else {
+                            result.items.clone()
+                        };
+
+                        if !result.not_modified {
+                            if let Ok(mut cache) = per_feed_cache.lock() {
+                                cache.insert(url.to_string(), result.items.clone());
+                            }
+                            if let Ok(mut meta) = metadata_store.lock() {
+                                meta.update_feed_headers(url, result.headers.clone());
+                            }
+                        }
+
+                        if let Ok(mut combined_guard) = combined_items.lock() {
+                            combined_guard.insert(url.to_string(), items_for_feed);
                         }
                     }
                     Err(e) => error!("Error fetching {}: {}", url, e),
@@ -1112,21 +1206,50 @@ impl App {
             });
 
             if let Ok(mut items_guard) = items_arc.lock() {
-                if let Ok(results_guard) = results.lock() {
-                    // Filter out hidden items
-                    let new_items: Vec<RssFeedItem> = results_guard
-                        .iter()
-                        .filter(|item| !hidden_items.is_hidden(&item.item_id))
-                        .cloned()
-                        .collect();
-                    *items_guard = new_items;
-
-                    if let Ok(mut is_loading) = is_loading_arc.lock() {
-                        *is_loading = false;
-                    } else {
-                        panic!("is_loading lock error"); //todo
+                if let Ok(combined_guard) = combined_items.lock() {
+                    let mut ordered_items = Vec::new();
+                    for url in &feed_order {
+                        if let Some(items) = combined_guard.get(url) {
+                            ordered_items.extend(items.clone());
+                        }
                     }
+                    // include any feeds not present in the original list
+                    for (url, items) in combined_guard.iter() {
+                        if !feed_order.contains(url) {
+                            ordered_items.extend(items.clone());
+                        }
+                    }
+                    let hidden_ids = metadata_store
+                        .lock()
+                        .map(|meta| meta.hidden_items())
+                        .unwrap_or_default();
+                    let mut filtered: Vec<RssFeedItem> = ordered_items
+                        .into_iter()
+                        .filter(|item| !hidden_ids.contains(&item.item_id))
+                        .collect();
+
+                    for item in &mut filtered {
+                        let normalized = App::normalize_url(&item.link);
+                        if let Some(tags) = raindrop_index.get(&normalized) {
+                            item.matched_tags = Some(tags.clone());
+                        } else {
+                            item.matched_tags = None;
+                        }
+                    }
+
+                    *items_guard = filtered;
+                    has_updates_flag.store(!items_guard.is_empty(), Ordering::Relaxed);
                 }
+            }
+
+            if let Ok(mut meta) = metadata_store.lock() {
+                if let Err(e) = meta.save() {
+                    error!("Failed to save RSS metadata: {}", e);
+                }
+            }
+
+            if let Ok(mut is_loading) = is_loading_arc.lock() {
+                *is_loading = false;
             }
         });
 
@@ -1479,7 +1602,7 @@ impl App {
 
     pub fn show_rss_feed_popup(&mut self) -> anyhow::Result<()> {
         if let Ok(is_loading) = self.rss_feed_state.is_loading.lock() {
-            if (*is_loading) {
+            if *is_loading {
                 self.app_mode = AppMode::Error("RSS feed is being updated.".to_string());
                 return Ok(());
             }
@@ -1498,7 +1621,11 @@ impl App {
         };
 
         // Create popup state with current items
-        self.rss_feed_popup_state = Some(RssFeedPopupState::new(items, visible_items)?);
+        self.rss_feed_popup_state = Some(RssFeedPopupState::new(
+            items,
+            visible_items,
+            self.rss_metadata.clone(),
+        )?);
 
         // If we need to refresh the items, do it in the background
         if !self.rss_feed_state.items_processed {
@@ -1546,7 +1673,7 @@ impl App {
     fn sync_rss_tab_items(&mut self) -> anyhow::Result<()> {
         if let Ok(items_guard) = self.rss_feed_state.items.lock() {
             if !items_guard.is_empty() {
-                let hidden_items = prss::hidden_items::HiddenItems::load()?;
+                let hidden_items = prss::hidden_items::HiddenItems::new(self.rss_metadata.clone());
                 let filtered_items: Vec<RssFeedItem> = items_guard
                     .iter()
                     .filter(|item| !hidden_items.is_hidden(&item.item_id))
@@ -2395,7 +2522,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let stats = TotalStats::from_items(&items);
 
-    let mut app: App = App::new(items, raindrop_client, stats, archive_collection_id);
+    let mut app = App::new(items, raindrop_client, stats, archive_collection_id)?;
     app.start_rss_feed_loading()?;
     let res = run_app(&mut terminal, app);
 
@@ -3341,7 +3468,7 @@ fn constraint_len_calculator<T: TableRow>(items: &[T]) -> (u16, u16, u16) {
 
 fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
     let rss_count = app.rss_tab_state.items.len();
-    let has_updates = app.rss_feed_state.has_updates;
+    let has_updates = app.rss_feed_state.has_updates.load(Ordering::Relaxed);
 
     let raindrops_style = if app.current_tab == CurrentTab::Raindrops {
         Style::default()
@@ -3411,6 +3538,11 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
     for item in &popup_state.items {
         *source_counts.entry(&item.source).or_insert(0) += 1;
     }
+    let source_column_width = source_counts
+        .iter()
+        .map(|(source, count)| format!(" {} ({})", source, count).width())
+        .max()
+        .unwrap_or(0);
 
     // Keep track of which sources we've seen while rendering
     let mut seen_sources = std::collections::HashSet::new();
@@ -3442,8 +3574,22 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
             };
 
             // Source column (like date in Raindrop - neutral color)
+            let padded_source = if source_column_width == 0 {
+                String::new()
+            } else {
+                let width = source_column_width;
+                let current_width = UnicodeWidthStr::width(source_column.as_str());
+                if current_width >= width {
+                    source_column.clone()
+                } else {
+                    let mut s = source_column.clone();
+                    s.push_str(&" ".repeat(width - current_width));
+                    s
+                }
+            };
+
             let source_span = Span::styled(
-                format!("{:<20}", source_column),
+                padded_source,
                 Style::default().fg(OCEANIC_NEXT.base_04),
             );
 
@@ -3453,8 +3599,28 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(OCEANIC_NEXT.base_03),
             );
 
-            // Title (bright like Raindrop)
-            let title_span = Span::styled(&item.title, Style::default().fg(OCEANIC_NEXT.base_07));
+            let mut display_title = item.title.clone();
+            if let Some(tags) = &item.matched_tags {
+                if !tags.is_empty() {
+                    let suffix = tags.iter().map(|t| format!("[{}]", t)).collect::<String>();
+                    display_title.push(' ');
+                    display_title.push_str(&suffix);
+                }
+            }
+            let is_existing = item
+                .matched_tags
+                .as_ref()
+                .map(|tags| !tags.is_empty())
+                .unwrap_or(false);
+            // Title (bright like Raindrop, dim if already saved)
+            let title_style = if is_existing {
+                Style::default()
+                    .fg(OCEANIC_NEXT.base_04)
+                    .add_modifier(Modifier::DIM)
+            } else {
+                Style::default().fg(OCEANIC_NEXT.base_07)
+            };
+            let title_span = Span::styled(display_title, title_style);
 
             let content = Line::from(vec![
                 source_span,
@@ -3694,6 +3860,11 @@ fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
         for item in &popup_state.items {
             *source_counts.entry(&item.source).or_insert(0) += 1;
         }
+        let source_column_width = source_counts
+            .iter()
+            .map(|(source, count)| format!(" {} ({})", source, count).width())
+            .max()
+            .unwrap_or(0);
 
         // Keep track of which sources we've seen while rendering
         let mut seen_sources = std::collections::HashSet::new();
@@ -3714,6 +3885,27 @@ fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
                     String::new()
                 };
 
+                let is_existing = item
+                    .matched_tags
+                    .as_ref()
+                    .map(|tags| !tags.is_empty())
+                    .unwrap_or(false);
+                let mut display_title = item.title.clone();
+                if let Some(tags) = &item.matched_tags {
+                    if !tags.is_empty() {
+                        let suffix = tags.iter().map(|t| format!("[{}]", t)).collect::<String>();
+                        display_title.push(' ');
+                        display_title.push_str(&suffix);
+                    }
+                }
+                let title_style = if is_existing {
+                    Style::default()
+                        .fg(OCEANIC_NEXT.base_04)
+                        .add_modifier(Modifier::DIM)
+                } else {
+                    Style::default().fg(OCEANIC_NEXT.base_05)
+                };
+
                 let date_and_title = if let Some(pub_date) = &item.pub_date {
                     vec![
                         Span::styled(
@@ -3721,10 +3913,7 @@ fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
                             Style::default().fg(OCEANIC_NEXT.base_03), // Gray for date
                         ),
                         Span::raw(": "),
-                        Span::styled(
-                            &item.title,
-                            Style::default().fg(OCEANIC_NEXT.base_05), // Default text color
-                        ),
+                        Span::styled(display_title, title_style),
                     ]
                 } else {
                     vec![
@@ -3733,12 +3922,26 @@ fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
                             Style::default().fg(OCEANIC_NEXT.base_03),
                         ),
                         Span::raw(": "),
-                        Span::styled(&item.title, Style::default().fg(OCEANIC_NEXT.base_05)),
+                        Span::styled(display_title, title_style),
                     ]
                 };
 
+                let padded_source = if source_column_width == 0 {
+                    String::new()
+                } else {
+                    let width = source_column_width;
+                    let current_width = UnicodeWidthStr::width(source_column.as_str());
+                    if current_width >= width {
+                        source_column.clone()
+                    } else {
+                        let mut s = source_column.clone();
+                        s.push_str(&" ".repeat(width - current_width));
+                        s
+                    }
+                };
+
                 let source_span = Span::styled(
-                    format!("{:<25}", source_column),
+                    padded_source,
                     Style::default().fg(OCEANIC_NEXT.base_0d), // Distinct color for source
                 );
 
@@ -3753,13 +3956,14 @@ fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
                     .concat(),
                 );
 
+                let mut lines = vec![content];
                 let style = if i + popup_state.scroll_offset == popup_state.selected_index {
                     Style::default().fg(Color::Black).bg(Color::White)
                 } else {
                     Style::default()
                 };
 
-                ListItem::new(vec![content]).style(style)
+                ListItem::new(lines).style(style)
             })
             .collect();
 

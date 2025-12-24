@@ -238,6 +238,18 @@ pub fn load_raindrop_delta() -> Vec<RaindropUpdate> {
 
 /// Apply delta updates to build the current state
 /// Returns a HashMap of id -> Raindrop (deleted items are removed)
+fn preview_title(title: &str, max_chars: usize) -> String {
+    let mut result = String::new();
+    for (i, ch) in title.chars().enumerate() {
+        if i >= max_chars {
+            result.push_str("...");
+            return result;
+        }
+        result.push(ch);
+    }
+    result
+}
+
 pub fn apply_delta_to_state(
     base_items: Vec<Raindrop>,
     updates: Vec<RaindropUpdate>,
@@ -260,7 +272,7 @@ pub fn apply_delta_to_state(
                 info!(
                     "Delta: upserting item {} '{}'",
                     item.id,
-                    &item.title[..item.title.len().min(30)]
+                    preview_title(&item.title, 30)
                 );
                 items_map.insert(item.id, item.clone());
             }

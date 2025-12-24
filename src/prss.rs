@@ -1,11 +1,14 @@
 use anyhow::Context;
 use chrono::{DateTime, Local, Utc};
 use log::{error, LevelFilter};
+use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RssFeedItem {
     pub title: String,
     pub link: String,
@@ -13,6 +16,7 @@ pub struct RssFeedItem {
     pub description: Option<String>,
     pub pub_date: Option<String>,
     pub item_id: String,
+    pub matched_tags: Option<Vec<String>>,
 }
 
 pub struct RssManager {
@@ -84,25 +88,65 @@ impl RssManager {
 
         Ok(())
     }
+}
 
+pub struct FeedFetchResult {
+    pub items: Vec<RssFeedItem>,
+    pub headers: metadata::FeedHeaders,
+    pub not_modified: bool,
+}
+
+impl RssManager {
     pub fn fetch_and_parse_feed(
         client: &reqwest::blocking::Client,
         url: &str,
-    ) -> anyhow::Result<Vec<RssFeedItem>> {
-        let response = client
-                    .get(url)
-                    .header(
-                        "User-Agent",
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                    )
-                    .send()?;
+        conditional: Option<&metadata::FeedHeaders>,
+    ) -> anyhow::Result<FeedFetchResult> {
+        let mut request = client
+            .get(url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            );
+
+        if let Some(headers) = conditional {
+            if let Some(etag) = &headers.etag {
+                request = request.header(IF_NONE_MATCH, etag);
+            }
+            if let Some(last_modified) = &headers.last_modified {
+                request = request.header(IF_MODIFIED_SINCE, last_modified);
+            }
+        }
+
+        let response = request.send()?;
+
+        if response.status() == StatusCode::NOT_MODIFIED {
+            let headers = conditional.cloned().unwrap_or_default();
+            return Ok(FeedFetchResult {
+                items: Vec::new(),
+                headers,
+                not_modified: true,
+            });
+        }
 
         if !response.status().is_success() {
             error!("Failed to fetch {}: Status {}", url, response.status());
             return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
         }
 
+        let header_map = response.headers().clone();
         let content = response.text()?;
+
+        let response_headers = metadata::FeedHeaders {
+            etag: header_map
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(|s| s.to_string()),
+            last_modified: header_map
+                .get(LAST_MODIFIED)
+                .and_then(|value| value.to_str().ok())
+                .map(|s| s.to_string()),
+        };
 
         // Extract base URL for resolving relative links
         let base_url = Self::extract_base_url(url);
@@ -110,7 +154,7 @@ impl RssManager {
         // Try parsing as Atom first
         if let Ok(atom_feed) = atom_syndication::Feed::read_from(content.as_bytes()) {
             let source_name = atom_feed.title().to_string();
-            return Ok(atom_feed
+            let items = atom_feed
                 .entries()
                 .iter()
                 .map(|entry| {
@@ -130,16 +174,22 @@ impl RssManager {
                         ),
                         source: source_name.clone(),
                         item_id,
+                        matched_tags: None,
                     }
                 })
-                .collect());
+                .collect();
+            return Ok(FeedFetchResult {
+                items,
+                headers: response_headers,
+                not_modified: false,
+            });
         }
 
         // Try parsing as RSS
         match rss::Channel::read_from(content.as_bytes()) {
             Ok(rss_feed) => {
                 let source_name = rss_feed.title().to_string();
-                Ok(rss_feed
+                let items = rss_feed
                     .items()
                     .iter()
                     .map(|item| {
@@ -161,9 +211,15 @@ impl RssManager {
                                 .or(item.pub_date().map(String::from)),
                             source: source_name.clone(),
                             item_id,
+                            matched_tags: None,
                         }
                     })
-                    .collect())
+                    .collect();
+                Ok(FeedFetchResult {
+                    items,
+                    headers: response_headers,
+                    not_modified: false,
+                })
             }
             Err(e) => {
                 error!("Failed to parse feed from {}: {}", url, e);
@@ -226,64 +282,125 @@ impl RssManager {
     }
 }
 
-//this needs to be encapsulated and hidden
+pub mod metadata {
+    use anyhow::Context;
+    use serde::{Deserialize, Serialize};
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    const METADATA_FILE: &str = "rss/feed_meta.json";
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    pub struct FeedHeaders {
+        pub etag: Option<String>,
+        pub last_modified: Option<String>,
+    }
+
+    #[derive(Default, Serialize, Deserialize)]
+    struct MetadataData {
+        feeds: HashMap<String, FeedHeaders>,
+        hidden_items: HashSet<String>,
+    }
+
+    pub struct RssMetadataStore {
+        path: PathBuf,
+        data: MetadataData,
+    }
+
+    impl RssMetadataStore {
+        pub fn load() -> anyhow::Result<Self> {
+            let metadata_path = PathBuf::from(METADATA_FILE);
+            if let Some(parent) = metadata_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let data = if metadata_path.exists() {
+                let content =
+                    fs::read_to_string(&metadata_path).context("Failed to read metadata file")?;
+                serde_json::from_str::<MetadataData>(&content)
+                    .context("Failed to parse metadata file")?
+            } else {
+                MetadataData::default()
+            };
+
+            Ok(Self {
+                path: metadata_path,
+                data,
+            })
+        }
+
+        pub fn save(&self) -> anyhow::Result<()> {
+            let serialized = serde_json::to_string_pretty(&self.data)?;
+            fs::write(&self.path, serialized)?;
+            Ok(())
+        }
+
+        pub fn feed_headers(&self, url: &str) -> Option<FeedHeaders> {
+            self.data.feeds.get(url).cloned()
+        }
+
+        pub fn update_feed_headers(&mut self, url: &str, headers: FeedHeaders) {
+            self.data.feeds.insert(url.to_string(), headers);
+        }
+
+        pub fn is_hidden(&self, item_id: &str) -> bool {
+            self.data.hidden_items.contains(item_id)
+        }
+
+        pub fn hide_item(&mut self, item_id: String) {
+            self.data.hidden_items.insert(item_id);
+        }
+
+        pub fn hidden_items(&self) -> HashSet<String> {
+            self.data.hidden_items.clone()
+        }
+    }
+
+    pub type SharedMetadataStore = Arc<Mutex<RssMetadataStore>>;
+
+    pub fn load_shared_store() -> anyhow::Result<SharedMetadataStore> {
+        Ok(Arc::new(Mutex::new(RssMetadataStore::load()?)))
+    }
+}
+
 pub mod hidden_items {
-    use std::collections::HashSet;
-    use std::fs::{File, OpenOptions};
-    use std::io::{self, BufRead, BufReader, Write};
-    use std::path::Path;
+    use super::metadata::SharedMetadataStore;
+    use anyhow::anyhow;
 
-    const HIDDEN_ITEMS_FILE: &str = "rss/hidden_rss_items.txt";
-
+    #[derive(Clone)]
     pub struct HiddenItems {
-        items: HashSet<String>,
+        metadata: SharedMetadataStore,
     }
 
     impl HiddenItems {
-        pub fn new() -> Self {
-            Self {
-                items: HashSet::new(),
-            }
+        pub fn new(metadata: SharedMetadataStore) -> Self {
+            Self { metadata }
         }
 
-        pub fn load() -> anyhow::Result<Self> {
-            let mut items = HashSet::new();
-
-            if Path::new(HIDDEN_ITEMS_FILE).exists() {
-                let file = File::open(HIDDEN_ITEMS_FILE)?;
-                let reader = BufReader::new(file);
-
-                for line in reader.lines() {
-                    let line = line?;
-                    if !line.trim().is_empty() {
-                        items.insert(line);
-                    }
-                }
-            }
-
-            Ok(Self { items })
+        pub fn load(metadata: SharedMetadataStore) -> anyhow::Result<Self> {
+            Ok(Self { metadata })
         }
 
-        // No need for full save, we'll just append new items
-        pub fn hide_item(&mut self, item_id: String) -> anyhow::Result<()> {
-            if !self.items.contains(&item_id) {
-                // Open file in append mode, create if doesn't exist
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(HIDDEN_ITEMS_FILE)?;
-
-                // Write the new item with a newline
-                writeln!(file, "{}", item_id)?;
-
-                // Add to our in-memory set
-                self.items.insert(item_id);
+        pub fn hide_item(&self, item_id: String) -> anyhow::Result<()> {
+            let mut guard = self
+                .metadata
+                .lock()
+                .map_err(|_| anyhow!("Failed to lock RSS metadata store"))?;
+            if !guard.is_hidden(&item_id) {
+                guard.hide_item(item_id);
+                guard.save()?;
             }
             Ok(())
         }
 
         pub fn is_hidden(&self, item_id: &str) -> bool {
-            self.items.contains(item_id)
+            if let Ok(guard) = self.metadata.lock() {
+                guard.is_hidden(item_id)
+            } else {
+                false
+            }
         }
     }
 }
