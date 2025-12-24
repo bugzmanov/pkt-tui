@@ -115,9 +115,7 @@ impl RssManager {
                 .iter()
                 .map(|entry| {
                     let item_id = format!("{}:{}", source_name, entry.id());
-                    let raw_link = entry
-                        .links()
-                        .first()
+                    let raw_link = Self::select_atom_entry_link(entry)
                         .map(|l| l.href().to_string())
                         .unwrap_or_default();
                     RssFeedItem {
@@ -198,6 +196,22 @@ impl RssManager {
             // Relative path - just return as-is (rare case)
             link.to_string()
         }
+    }
+
+    /// Blogger feeds often list comment links first; prefer article/permalink links.
+    fn select_atom_entry_link(entry: &atom_syndication::Entry) -> Option<&atom_syndication::Link> {
+        entry
+            .links()
+            .iter()
+            .find(|link| link.rel().eq_ignore_ascii_case("alternate"))
+            .or_else(|| {
+                entry.links().iter().find(|link| {
+                    link.mime_type()
+                        .map(|mime| mime.contains("html"))
+                        .unwrap_or(false)
+                })
+            })
+            .or_else(|| entry.links().first())
     }
 
     fn format_pub_date(date_str: &str) -> Option<String> {

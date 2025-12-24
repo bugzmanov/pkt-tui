@@ -1196,8 +1196,11 @@ impl App {
         }
 
         // Handle RSS tab item tags
-        if self.current_tab == CurrentTab::RssFeed && self.rss_tab_state.pending_pocket_item.is_some() {
-            self.rss_tab_state.add_current_to_raindrop(&self.raindrop_client, &tags)?;
+        if self.current_tab == CurrentTab::RssFeed
+            && self.rss_tab_state.pending_pocket_item.is_some()
+        {
+            self.rss_tab_state
+                .add_current_to_raindrop(&self.raindrop_client, &tags)?;
             return Ok(());
         }
 
@@ -1214,7 +1217,8 @@ impl App {
                     .collect();
 
                 // Update tags in Raindrop
-                self.raindrop_client.update_tags(item_id, new_tag_set.clone())?;
+                self.raindrop_client
+                    .update_tags(item_id, new_tag_set.clone())?;
 
                 // Update local item
                 // First, remove all existing tags
@@ -1518,7 +1522,11 @@ impl App {
     }
 
     pub fn handle_rss_tab_selection(&mut self) -> anyhow::Result<()> {
-        if let Some(selected_item) = self.rss_tab_state.items.get(self.rss_tab_state.selected_index) {
+        if let Some(selected_item) = self
+            .rss_tab_state
+            .items
+            .get(self.rss_tab_state.selected_index)
+        {
             if !selected_item.link.is_empty() {
                 if let Err(e) = webbrowser::open(&selected_item.link) {
                     self.app_mode = AppMode::Error(format!("Failed to open browser: {}", e));
@@ -1591,28 +1599,53 @@ impl App {
         let mut items = raindrop::apply_delta_to_state(base_items, delta_updates);
         log::info!("After applying delta: {} items", items.len());
 
-        // Subtract 2 minutes from last_sync to handle race conditions
+        // Subtract 2 minutes from last_sync to handle race conditions.
+        // Clamp future timestamps back to "now" so an incorrect clock doesn't prevent delta syncs.
         let sync_with_buffer = {
-            use chrono::{DateTime, Duration};
-            DateTime::parse_from_rfc3339(&last_sync)
-                .map(|dt| (dt - Duration::minutes(2)).to_rfc3339())
-                .unwrap_or(last_sync.clone())
+            use chrono::{DateTime, Duration, Utc};
+            match DateTime::parse_from_rfc3339(&last_sync) {
+                Ok(dt) => {
+                    let mut utc_dt = dt.with_timezone(&Utc);
+                    let now = Utc::now();
+                    if utc_dt > now {
+                        log::warn!(
+                            "last_sync ({}) is in the future relative to now ({}), clamping",
+                            utc_dt.to_rfc3339(),
+                            now.to_rfc3339()
+                        );
+                        utc_dt = now;
+                    }
+                    let buffer = Duration::try_minutes(2).expect("2 minute buffer");
+                    (utc_dt - buffer).to_rfc3339()
+                }
+                Err(err) => {
+                    log::error!("Failed to parse last_sync '{}': {}", last_sync, err);
+                    return self.full_refresh();
+                }
+            }
         };
 
         // 1. Delta sync: fetch only items updated since last_sync (with buffer)
         log::info!("Fetching items since: {}", sync_with_buffer);
-        let updated = self.raindrop_client.get_raindrops_since(
-            raindrop::COLLECTION_ALL,
-            &sync_with_buffer,
-        )?;
+        let updated = self
+            .raindrop_client
+            .get_raindrops_since(raindrop::COLLECTION_ALL, &sync_with_buffer)?;
         log::info!("Fetched {} updated items", updated.len());
         for item in &updated {
-            log::info!("  - {} (created: {}, updated: {})", item.id, item.created, item.last_update);
+            log::info!(
+                "  - {} (created: {}, updated: {})",
+                item.id,
+                item.created,
+                item.last_update
+            );
         }
 
         // 2. Fetch trash to detect deletions
-        let trash_items = self.raindrop_client.get_all_raindrops(raindrop::COLLECTION_TRASH)?;
-        let trashed_ids: std::collections::HashSet<i64> = trash_items.iter().map(|r| r.id).collect();
+        let trash_items = self
+            .raindrop_client
+            .get_all_raindrops(raindrop::COLLECTION_TRASH)?;
+        let trashed_ids: std::collections::HashSet<i64> =
+            trash_items.iter().map(|r| r.id).collect();
 
         // 3. Find items to delete (that we have locally)
         let items_to_delete: Vec<i64> = items
@@ -1671,7 +1704,11 @@ impl App {
         self.inject_archived_tags(&mut items);
 
         if removed_count > 0 || !updated.is_empty() {
-            log::info!("Sync: {} updated, {} removed (via trash)", updated.len(), removed_count);
+            log::info!(
+                "Sync: {} updated, {} removed (via trash)",
+                updated.len(),
+                removed_count
+            );
         }
 
         self.cached_tags = items
@@ -1688,7 +1725,9 @@ impl App {
 
     fn full_refresh(&mut self) -> anyhow::Result<()> {
         // Full re-fetch from Raindrop API
-        let mut items = self.raindrop_client.get_all_raindrops(raindrop::COLLECTION_ALL)?;
+        let mut items = self
+            .raindrop_client
+            .get_all_raindrops(raindrop::COLLECTION_ALL)?;
         items.sort_by(|a, b| b.created.cmp(&a.created));
 
         // Inject "archived" tag for items in archive collection
@@ -1724,7 +1763,8 @@ impl App {
     fn inject_archived_tags(&self, items: &mut [raindrop::Raindrop]) {
         if let Some(archive_id) = self.archive_collection_id {
             for item in items {
-                if item.collection.id == archive_id && !item.tags.contains(&"archived".to_string()) {
+                if item.collection.id == archive_id && !item.tags.contains(&"archived".to_string())
+                {
                     item.tags.push("archived".to_string());
                 }
             }
@@ -1735,7 +1775,7 @@ impl App {
         // Count tags from ALL items (including archived) so "archived" tag appears
         let mut tag_counts: std::collections::HashMap<String, usize> = self
             .items
-            .items  // Access all items, not just filtered
+            .items // Access all items, not just filtered
             .iter()
             .filter(|item| {
                 !item.tags().any(|tag| tag == "read") // Exclude read items
@@ -1747,7 +1787,10 @@ impl App {
             });
 
         // Ensure "archived" tag is included if there are any archived items
-        let archived_count = self.items.items.iter()
+        let archived_count = self
+            .items
+            .items
+            .iter()
             .filter(|item| item.tags().any(|t| t == "archived"))
             .count();
         if archived_count > 0 {
@@ -1800,7 +1843,9 @@ impl App {
             let tag_matches = if self.selected_tag_filters.is_empty() {
                 true
             } else {
-                self.selected_tag_filters.iter().all(|tag| item.tags().any(|t| t == tag))
+                self.selected_tag_filters
+                    .iter()
+                    .all(|tag| item.tags().any(|t| t == tag))
             };
 
             // Hide archived items unless explicitly filtering for "archived" tag
@@ -2258,10 +2303,19 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let last_sync = raindrop::get_last_sync().unwrap_or_default();
         if delta_count > 0 {
-            println!("Loaded {} items (base: {}, delta: {} updates, synced: {})",
-                merged.len(), base_count, delta_count, last_sync);
+            println!(
+                "Loaded {} items (base: {}, delta: {} updates, synced: {})",
+                merged.len(),
+                base_count,
+                delta_count,
+                last_sync
+            );
         } else {
-            println!("Loaded {} items from cache (synced: {})", merged.len(), last_sync);
+            println!(
+                "Loaded {} items from cache (synced: {})",
+                merged.len(),
+                last_sync
+            );
         }
         merged
     } else {
@@ -2270,7 +2324,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let fetched = raindrop_client.get_all_raindrops_with_progress(
             raindrop::COLLECTION_ALL,
             |downloaded, total| {
-                print!("\rFetching raindrops from Raindrop.io... {}/{}", downloaded, total);
+                print!(
+                    "\rFetching raindrops from Raindrop.io... {}/{}",
+                    downloaded, total
+                );
                 let _ = io::stdout().flush();
             },
         )?;
@@ -2788,7 +2845,9 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                         Char('G') => {
                             popup_state.scroll_to_end();
                         }
-                        Char('p') => app.rss_tab_state.show_description = !app.rss_tab_state.show_description,
+                        Char('p') => {
+                            app.rss_tab_state.show_description = !app.rss_tab_state.show_description
+                        }
                         Char('a') => {
                             app.process_add_to_pocket_with_tags_rss_tab()?;
                             return Ok(());
@@ -2955,9 +3014,9 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
 
 fn ui(f: &mut Frame, app: &mut App) {
     let rects = Layout::vertical([
-        Constraint::Length(1),  // Tab bar
-        Constraint::Min(5),     // Content area
-        Constraint::Length(3),  // Footer (border + text + border)
+        Constraint::Length(1), // Tab bar
+        Constraint::Min(5),    // Content area
+        Constraint::Length(3), // Footer (border + text + border)
     ])
     .split(f.area());
     app.set_colors();
@@ -3327,8 +3386,8 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(OCEANIC_NEXT.base_03),
     ));
 
-    let tab_bar = Paragraph::new(Line::from(spans))
-        .style(Style::default().bg(app.colors.buffer_bg));
+    let tab_bar =
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(app.colors.buffer_bg));
 
     f.render_widget(tab_bar, area);
 }
@@ -3395,10 +3454,7 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
             );
 
             // Title (bright like Raindrop)
-            let title_span = Span::styled(
-                &item.title,
-                Style::default().fg(OCEANIC_NEXT.base_07),
-            );
+            let title_span = Span::styled(&item.title, Style::default().fg(OCEANIC_NEXT.base_07));
 
             let content = Line::from(vec![
                 source_span,
@@ -3476,12 +3532,18 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
             let text = Text::from(vec![
                 Line::from(vec![
                     Span::styled("Title: ", Style::default().fg(OCEANIC_NEXT.base_0d)),
-                    Span::styled(&selected_item.title, Style::default().fg(OCEANIC_NEXT.base_05)),
+                    Span::styled(
+                        &selected_item.title,
+                        Style::default().fg(OCEANIC_NEXT.base_05),
+                    ),
                 ]),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("Source: ", Style::default().fg(OCEANIC_NEXT.base_0d)),
-                    Span::styled(&selected_item.source, Style::default().fg(OCEANIC_NEXT.base_05)),
+                    Span::styled(
+                        &selected_item.source,
+                        Style::default().fg(OCEANIC_NEXT.base_05),
+                    ),
                 ]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
@@ -3851,7 +3913,11 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                     spans.extend_from_slice(&[Span::raw(" | /"), Span::raw(search)]);
                 }
                 if !app.selected_tag_filters.is_empty() {
-                    let tags: Vec<&str> = app.selected_tag_filters.iter().map(|s| s.as_str()).collect();
+                    let tags: Vec<&str> = app
+                        .selected_tag_filters
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect();
                     spans.extend_from_slice(&[Span::raw(" | Tags: "), Span::raw(tags.join(", "))]);
                 }
                 if let Some(domain) = &app.domain_filter {
@@ -3892,7 +3958,11 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             };
 
             let info_footer = Paragraph::new(Line::from(spans))
-                .style(Style::new().fg(OCEANIC_NEXT.base_03).bg(app.colors.buffer_bg))
+                .style(
+                    Style::new()
+                        .fg(OCEANIC_NEXT.base_03)
+                        .bg(app.colors.buffer_bg),
+                )
                 .alignment(Alignment::Center)
                 .block(
                     Block::default()

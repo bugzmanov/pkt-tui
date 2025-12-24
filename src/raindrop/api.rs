@@ -52,7 +52,10 @@ impl RaindropAPI {
 
         self.handle_response_status(&response)?;
 
-        let data: UserResponse = response.json().await.context("Failed to parse user response")?;
+        let data: UserResponse = response
+            .json()
+            .await
+            .context("Failed to parse user response")?;
         if !data.result {
             bail!("API returned result=false for user request");
         }
@@ -105,12 +108,9 @@ impl RaindropAPI {
     ///
     /// Use COLLECTION_ALL (0) to get all raindrops
     /// Automatically waits and retries on rate limiting.
-    pub async fn get_raindrops(
-        &self,
-        collection_id: i64,
-        page: u32,
-    ) -> Result<Vec<Raindrop>> {
-        self.get_raindrops_sorted(collection_id, page, "-created").await
+    pub async fn get_raindrops(&self, collection_id: i64, page: u32) -> Result<Vec<Raindrop>> {
+        self.get_raindrops_sorted(collection_id, page, "-created")
+            .await
     }
 
     /// Get raindrops sorted by a field
@@ -168,40 +168,40 @@ impl RaindropAPI {
         collection_id: i64,
         since_timestamp: &str,
     ) -> Result<Vec<Raindrop>> {
-        // Extract date part from ISO timestamp (YYYY-MM-DD)
-        // Go back one day to handle race conditions at day boundaries
-        let since_date = if since_timestamp.len() >= 10 {
-            &since_timestamp[..10]
-        } else {
-            return Ok(Vec::new());
-        };
-
         let mut updated_items = Vec::new();
         let mut page = 0u32;
 
-        loop {
-            let items = self.get_raindrops_with_search(
-                collection_id,
-                page,
-                &format!("created:{}", since_date)  // Include items from sync day
-            ).await?;
+        'pages: loop {
+            let items = self
+                .get_raindrops_sorted(collection_id, page, "-lastUpdate")
+                .await?;
 
             if items.is_empty() {
                 break;
             }
 
-            // Filter by exact timestamp (search only supports date granularity)
-            // Use >= to include items created at or after since_timestamp
             for item in items {
-                let created_match = item.created.as_str() >= since_timestamp;
-                let updated_match = item.last_update.as_str() >= since_timestamp;
+                let created_match =
+                    !item.created.is_empty() && item.created.as_str() >= since_timestamp;
+                let updated_match =
+                    !item.last_update.is_empty() && item.last_update.as_str() >= since_timestamp;
                 log::debug!(
-                    "Comparing item {}: created='{}' >= '{}' = {}, lastUpdate='{}' >= '{}' = {}",
-                    item.id, item.created, since_timestamp, created_match,
-                    item.last_update, since_timestamp, updated_match
+                    "Comparing item {}: created >= {} => {}, lastUpdate >= {} => {}",
+                    item.id,
+                    since_timestamp,
+                    created_match,
+                    since_timestamp,
+                    updated_match
                 );
+
                 if created_match || updated_match {
                     updated_items.push(item);
+                } else if !item.last_update.is_empty()
+                    && item.last_update.as_str() < since_timestamp
+                {
+                    // Items are sorted by descending lastUpdate, so once we hit one older
+                    // than our cutoff we can stop fetching further pages.
+                    break 'pages;
                 }
             }
 
@@ -209,53 +209,6 @@ impl RaindropAPI {
         }
 
         Ok(updated_items)
-    }
-
-    /// Get raindrops with search filter
-    async fn get_raindrops_with_search(
-        &self,
-        collection_id: i64,
-        page: u32,
-        search: &str,
-    ) -> Result<Vec<Raindrop>> {
-        let url = format!("{}/raindrops/{}", BASE_URL, collection_id);
-
-        loop {
-            let response = self
-                .client
-                .get(&url)
-                .query(&[
-                    ("page", page.to_string()),
-                    ("perpage", PAGE_SIZE.to_string()),
-                    ("search", search.to_string()),
-                ])
-                .send()
-                .await?;
-
-            if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                let retry_after = response
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(30);
-
-                eprintln!("Rate limited, waiting {} seconds...", retry_after);
-                sleep(Duration::from_secs(retry_after)).await;
-                continue;
-            }
-
-            self.handle_response_status(&response)?;
-
-            let data: RaindropsResponse = response
-                .json()
-                .await
-                .context("Failed to parse raindrops response")?;
-            if !data.result {
-                bail!("API returned result=false for raindrops request");
-            }
-            return Ok(data.items);
-        }
     }
 
     /// Get raindrops with count (returns items and total count)
@@ -270,7 +223,10 @@ impl RaindropAPI {
             let response = self
                 .client
                 .get(&url)
-                .query(&[("page", page.to_string()), ("perpage", PAGE_SIZE.to_string())])
+                .query(&[
+                    ("page", page.to_string()),
+                    ("perpage", PAGE_SIZE.to_string()),
+                ])
                 .send()
                 .await?;
 
@@ -503,10 +459,23 @@ impl RaindropAPISync {
             .block_on(self.api.get_raindrops(collection_id, page))
     }
 
+    /// Get raindrops from a collection using a specific sort order
+    pub fn get_raindrops_sorted(
+        &self,
+        collection_id: i64,
+        page: u32,
+        sort: &str,
+    ) -> Result<Vec<Raindrop>> {
+        self.runtime
+            .block_on(self.api.get_raindrops_sorted(collection_id, page, sort))
+    }
+
     /// Get ALL raindrops from a collection (handles pagination)
     pub fn get_all_raindrops(&self, collection_id: i64) -> Result<Vec<Raindrop>> {
-        self.runtime
-            .block_on(self.api.get_all_raindrops::<fn(i32, i64)>(collection_id, None))
+        self.runtime.block_on(
+            self.api
+                .get_all_raindrops::<fn(i32, i64)>(collection_id, None),
+        )
     }
 
     /// Get ALL raindrops with progress callback (downloaded, total)

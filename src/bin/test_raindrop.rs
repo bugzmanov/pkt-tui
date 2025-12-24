@@ -5,9 +5,7 @@
 //! Set RAINDROP_API_TOKEN env var or it will prompt for token.
 
 use anyhow::Result;
-use pkt_tui::raindrop::{
-    token, NewRaindrop, RaindropAPISync, UpdateRaindrop, COLLECTION_ALL,
-};
+use pkt_tui::raindrop::{token, NewRaindrop, RaindropAPISync, UpdateRaindrop, COLLECTION_ALL};
 
 fn main() -> Result<()> {
     println!("=== Raindrop.io API Integration Test ===\n");
@@ -15,7 +13,10 @@ fn main() -> Result<()> {
     // Step 1: Get token
     println!("1. Getting API token...");
     let token = token::get_or_prompt_token()?;
-    println!("   ✓ Token obtained ({}...)\n", &token[..8.min(token.len())]);
+    println!(
+        "   ✓ Token obtained ({}...)\n",
+        &token[..8.min(token.len())]
+    );
 
     // Step 2: Create API client
     println!("2. Creating API client...");
@@ -36,17 +37,28 @@ fn main() -> Result<()> {
         let parent_info = if col.is_root() {
             String::new()
         } else {
-            format!(" (child of {})", col.parent.as_ref().map(|p| p.id).unwrap_or(0))
+            format!(
+                " (child of {})",
+                col.parent.as_ref().map(|p| p.id).unwrap_or(0)
+            )
         };
-        println!("     - [{}] {} ({} items){}", col.id, col.title, col.count, parent_info);
+        println!(
+            "     - [{}] {} ({} items){}",
+            col.id, col.title, col.count, parent_info
+        );
     }
     println!();
 
     // Step 5: Check for Archive collection
     println!("5. Looking for 'Archive' collection...");
-    let archive = collections.iter().find(|c| c.title.to_lowercase() == "archive");
+    let archive = collections
+        .iter()
+        .find(|c| c.title.to_lowercase() == "archive");
     match archive {
-        Some(col) => println!("   ✓ Found Archive collection: id={}, {} items\n", col.id, col.count),
+        Some(col) => println!(
+            "   ✓ Found Archive collection: id={}, {} items\n",
+            col.id, col.count
+        ),
         None => println!("   ⚠ No 'Archive' collection found (will need to create one)\n"),
     }
 
@@ -62,7 +74,12 @@ fn main() -> Result<()> {
             } else {
                 rd.tags.join(", ")
             };
-            println!("     - [{}] {} ({})", rd.id, truncate(&rd.title, 40), tags_str);
+            println!(
+                "     - [{}] {} ({})",
+                rd.id,
+                truncate(&rd.title, 40),
+                tags_str
+            );
         }
     }
     println!();
@@ -103,7 +120,10 @@ fn test_write_operations(client: &RaindropAPISync) -> Result<()> {
         .tags(vec!["test".into(), "pkt-tui".into(), "updated".into()]);
 
     let updated = client.update_raindrop(created.id, &update)?;
-    println!("       ✓ Updated: title='{}', tags={:?}", updated.title, updated.tags);
+    println!(
+        "       ✓ Updated: title='{}', tags={:?}",
+        updated.title, updated.tags
+    );
 
     // Delete it
     println!("   7c. Deleting test raindrop...");

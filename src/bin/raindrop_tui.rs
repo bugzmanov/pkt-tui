@@ -43,7 +43,10 @@ impl App {
 
     fn visible_items(&self) -> Vec<&Raindrop> {
         if self.filter.is_some() {
-            self.filtered_indices.iter().map(|&i| &self.items[i]).collect()
+            self.filtered_indices
+                .iter()
+                .map(|&i| &self.items[i])
+                .collect()
         } else {
             self.items.iter().collect()
         }
@@ -134,7 +137,11 @@ impl App {
         }
         self.filter = Some(tag.to_string());
         self.state.select(Some(0));
-        self.status = format!("Filtered by tag '{}': {} items", tag, self.filtered_indices.len());
+        self.status = format!(
+            "Filtered by tag '{}': {} items",
+            tag,
+            self.filtered_indices.len()
+        );
     }
 
     fn clear_filter(&mut self) {
@@ -180,16 +187,24 @@ fn main() -> Result<()> {
 
     // Try to load from cache first
     let mut items = if let Ok(Some(cache)) = load_cache() {
-        println!("Loaded {} items from cache (synced: {})", cache.raindrops.len(), cache.last_sync);
+        println!(
+            "Loaded {} items from cache (synced: {})",
+            cache.raindrops.len(),
+            cache.last_sync
+        );
         cache.raindrops
     } else {
         // Fetch all raindrops with progress
         print!("Fetching raindrops from Raindrop.io... ");
         let _ = io::Write::flush(&mut io::stdout());
-        let fetched = client.get_all_raindrops_with_progress(COLLECTION_ALL, |downloaded, total| {
-            print!("\rFetching raindrops from Raindrop.io... {}/{}", downloaded, total);
-            let _ = io::Write::flush(&mut io::stdout());
-        })?;
+        let fetched =
+            client.get_all_raindrops_with_progress(COLLECTION_ALL, |downloaded, total| {
+                print!(
+                    "\rFetching raindrops from Raindrop.io... {}/{}",
+                    downloaded, total
+                );
+                let _ = io::Write::flush(&mut io::stdout());
+            })?;
         println!();
 
         // Save to cache
@@ -293,7 +308,11 @@ fn ui(f: &mut Frame, app: &mut App) {
         app.filter.as_deref().unwrap_or("none")
     ))
     .style(Style::default().fg(Color::Cyan))
-    .block(Block::default().borders(Borders::ALL).title(" Raindrop.io "));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Raindrop.io "),
+    );
     f.render_widget(header, chunks[0]);
 
     // Table header
@@ -355,7 +374,11 @@ fn ui(f: &mut Frame, app: &mut App) {
     )
     .header(table_header)
     .block(Block::default().borders(Borders::ALL))
-    .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
     .highlight_symbol("> ");
 
     f.render_stateful_widget(table, chunks[1], &mut app.state);

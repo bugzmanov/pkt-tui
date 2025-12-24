@@ -38,12 +38,12 @@ pub enum RaindropType {
 impl RaindropType {
     pub fn as_str(&self) -> &'static str {
         match self {
-            RaindropType::Link => "article",      // treat links as articles for stats
+            RaindropType::Link => "article", // treat links as articles for stats
             RaindropType::Article => "article",
             RaindropType::Image => "article",
             RaindropType::Video => "video",
-            RaindropType::Document => "pdf",      // treat documents as PDFs for stats
-            RaindropType::Audio => "video",       // treat audio as video for stats
+            RaindropType::Document => "pdf", // treat documents as PDFs for stats
+            RaindropType::Audio => "video",  // treat audio as video for stats
             RaindropType::Book => "pdf",
             RaindropType::Unknown => "article",
         }
