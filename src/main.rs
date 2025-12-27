@@ -61,7 +61,7 @@ const PALETTES: [tailwind::Palette; 4] = [
     tailwind::RED,
 ];
 const INFO_TEXT: &str = "(ZZ) quit | gg/G/j/k  - start,end,↓,↑ | ? - Help";
-const ITEM_HEIGHT: usize = 4;
+const ITEM_HEIGHT: usize = 3;
 const DELTA_FILE: &str = "snapshot_updates.db";
 
 pub struct Base16Palette {
@@ -899,6 +899,55 @@ enum TagSelectionMode {
 }
 const SCROLL_STEP: usize = 1; // Number of items to scroll at once
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClickType {
+    Single,
+    Double,
+}
+
+struct MouseTracker {
+    last_click_time: Option<Instant>,
+    last_click_position: Option<(u16, u16)>,
+}
+
+impl MouseTracker {
+    fn new() -> Self {
+        Self {
+            last_click_time: None,
+            last_click_position: None,
+        }
+    }
+
+    fn register_click(&mut self, column: u16, row: u16) -> ClickType {
+        const DOUBLE_CLICK_THRESHOLD: u128 = 500; // ms
+        const DISTANCE_THRESHOLD: u16 = 3;
+
+        let now = Instant::now();
+        let position = (column, row);
+
+        let is_double = self
+            .last_click_time
+            .map(|last| now.duration_since(last).as_millis() <= DOUBLE_CLICK_THRESHOLD)
+            .unwrap_or(false)
+            && self
+                .last_click_position
+                .map(|last_pos| {
+                    column.abs_diff(last_pos.0) <= DISTANCE_THRESHOLD
+                        && row.abs_diff(last_pos.1) <= DISTANCE_THRESHOLD
+                })
+                .unwrap_or(false);
+
+        self.last_click_time = Some(now);
+        self.last_click_position = Some(position);
+
+        if is_double {
+            ClickType::Double
+        } else {
+            ClickType::Single
+        }
+    }
+}
+
 struct App {
     virtual_state: TableState,
     state: TableState,
@@ -919,8 +968,7 @@ struct App {
     domain_filter: Option<String>,
     tag_selection_mode: TagSelectionMode,
     scroll_accumulator: f32,
-    last_click_time: Option<std::time::Instant>,
-    last_click_position: Option<(u16, u16)>,
+    mouse_tracker: MouseTracker,
     domain_stats_popup_state: Option<DomainStatsPopupState>,
     help_popup_state: Option<HelpPopupState>,
     rss_feed_popup_state: Option<RssFeedPopupState>,
@@ -931,6 +979,11 @@ struct App {
     rss_tab_state: RssFeedPopupState,
     rss_metadata: SharedMetadataStore,
     raindrop_url_index: Arc<HashMap<String, Vec<String>>>,
+    tab_bar_area: Option<Rect>,
+    tab_bar_hitboxes: Vec<(std::ops::Range<u16>, CurrentTab)>,
+    raindrop_area: Option<Rect>,
+    rss_tab_area: Option<Rect>,
+    rss_popup_area: Option<Rect>,
 }
 
 impl App {
@@ -969,8 +1022,7 @@ impl App {
             domain_filter: None,
             tag_selection_mode: TagSelectionMode::Normal,
             scroll_accumulator: 0.0,
-            last_click_time: None,
-            last_click_position: None,
+            mouse_tracker: MouseTracker::new(),
             domain_stats_popup_state: None,
             help_popup_state: None,
             download_client: Client::new(),
@@ -981,6 +1033,11 @@ impl App {
             rss_tab_state: RssFeedPopupState::empty(metadata_store.clone()),
             rss_metadata: metadata_store,
             raindrop_url_index,
+            tab_bar_area: None,
+            tab_bar_hitboxes: Vec::new(),
+            raindrop_area: None,
+            rss_tab_area: None,
+            rss_popup_area: None,
         })
     }
 
@@ -1379,22 +1436,18 @@ impl App {
                     let mut path = std::path::PathBuf::from("pdfs");
                     path.push(&filename);
 
-                    // Download the file in a separate thread
-                    let download_url = url.to_string();
-                    let path_clone = path.clone();
-                    let client = self.download_client.clone();
-
-                    // thread::spawn(move || -> anyhow::Result<()> {
-                    let response = client.get(&download_url).send()?;
+                    // Download the file
+                    let response = self.download_client.get(url).send()?;
                     let content = response.bytes()?;
-                    std::fs::write(path_clone, content)?;
+                    std::fs::write(path.clone(), content)?;
 
                     // Mark as downloaded by adding a tag
                     self.raindrop_client.add_tag(item, "downloaded")?;
 
-                    let pdf_info = utils::extract_pdf_title(path.as_path())?;
-                    if let Some(title) = pdf_info.and_then(|info| info.title) {
-                        self.rename_current_item(title)?;
+                    if let Some(pdf_info) = utils::extract_pdf_title(path.as_path())? {
+                        if let Some(title) = pdf_info.title {
+                            self.rename_current_item(title)?;
+                        }
                     }
                 }
             }
@@ -2323,32 +2376,167 @@ impl App {
         Ok(())
     }
 
-    fn handle_mouse_event(&mut self, mouse_event: MouseEvent) -> anyhow::Result<()> {
-        match mouse_event.kind {
-            MouseEventKind::Down(event::MouseButton::Left) => {
-                let current_time = std::time::Instant::now();
-                let current_position = (mouse_event.column, mouse_event.row);
+    fn handle_mouse_event_batched(
+        &mut self,
+        mouse_event: MouseEvent,
+    ) -> anyhow::Result<Option<Event>> {
+        if matches!(
+            mouse_event.kind,
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+        ) {
+            let mut net_scroll: i32 = if mouse_event.kind == MouseEventKind::ScrollDown {
+                1
+            } else {
+                -1
+            };
 
-                if let (Some(last_time), Some(last_position)) =
-                    (self.last_click_time, self.last_click_position)
-                {
-                    if current_time.duration_since(last_time) < Duration::from_millis(500)
-                        && current_position == last_position
-                    {
-                        // Double click detected
-                        self.open_current_url()?;
+            while event::poll(Duration::from_millis(0))? {
+                match event::read()? {
+                    Event::Mouse(more_mouse) => match more_mouse.kind {
+                        MouseEventKind::ScrollDown => net_scroll += 1,
+                        MouseEventKind::ScrollUp => net_scroll -= 1,
+                        _ => {
+                            self.handle_mouse_event(more_mouse)?;
+                            break;
+                        }
+                    },
+                    other => {
+                        self.apply_mouse_scroll(
+                            net_scroll,
+                            mouse_event.column,
+                            mouse_event.row,
+                        );
+                        return Ok(Some(other));
                     }
                 }
+            }
 
-                self.last_click_time = Some(current_time);
-                self.last_click_position = Some(current_position);
+            self.apply_mouse_scroll(net_scroll, mouse_event.column, mouse_event.row);
+            Ok(None)
+        } else {
+            self.handle_mouse_event(mouse_event)?;
+            Ok(None)
+        }
+    }
 
-                // Calculate the clicked row index
-                let clicked_row = (mouse_event.row as usize).saturating_sub(1) / ITEM_HEIGHT
-                    + self.virtual_state.offset();
+    fn apply_mouse_scroll(&mut self, delta: i32, column: u16, row: u16) {
+        if delta == 0 {
+            return;
+        }
+
+        if let Some(area) = self.rss_popup_area {
+            if self.rss_feed_popup_state.is_some()
+                && Self::point_in_content_area(area, column, row)
+            {
+                if let Some(popup_state) = &mut self.rss_feed_popup_state {
+                    let steps = delta.unsigned_abs();
+                    for _ in 0..steps {
+                        if delta > 0 {
+                            popup_state.move_selection(1);
+                        } else {
+                            popup_state.move_selection(-1);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        if self.current_tab == CurrentTab::RssFeed {
+            if let Some(area) = self.rss_tab_area {
+                if Self::point_in_content_area(area, column, row) {
+                    let steps = delta.unsigned_abs();
+                    for _ in 0..steps {
+                        if delta > 0 {
+                            self.rss_tab_state.move_selection(1);
+                        } else {
+                            self.rss_tab_state.move_selection(-1);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        if let Some(area) = self.raindrop_area {
+            if Self::point_in_content_area(area, column, row) {
+                let steps = delta.unsigned_abs();
+                for _ in 0..steps {
+                    if delta > 0 {
+                        self.mousescroll_down();
+                    } else {
+                        self.mousescroll_up();
+                    }
+                }
+                return;
+            }
+        }
+
+        self.scroll(delta as f32);
+    }
+
+    fn handle_mouse_event(&mut self, mouse_event: MouseEvent) -> anyhow::Result<()> {
+        if let MouseEventKind::Down(event::MouseButton::Left) = mouse_event.kind {
+            if let Some(area) = self.tab_bar_area {
+                if Self::point_in_tab_area(area, mouse_event.column, mouse_event.row) {
+                    self.handle_mouse_tab_bar(mouse_event)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        if self.rss_feed_popup_state.is_some() {
+            self.handle_mouse_rss_popup(mouse_event)
+        } else if self.current_tab == CurrentTab::RssFeed {
+            self.handle_mouse_rss_tab(mouse_event)
+        } else {
+            self.handle_mouse_raindrops(mouse_event)
+        }
+    }
+
+    fn handle_mouse_tab_bar(&mut self, mouse_event: MouseEvent) -> anyhow::Result<()> {
+        if let MouseEventKind::Down(event::MouseButton::Left) = mouse_event.kind {
+            let column = mouse_event.column;
+            for (range, tab) in &self.tab_bar_hitboxes {
+                if range.contains(&column) {
+                    match tab {
+                        CurrentTab::Raindrops => self.current_tab = CurrentTab::Raindrops,
+                        CurrentTab::RssFeed => {
+                            self.sync_rss_tab_items()?;
+                            self.current_tab = CurrentTab::RssFeed;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_mouse_raindrops(&mut self, mouse_event: MouseEvent) -> anyhow::Result<()> {
+        let area = match self.raindrop_area {
+            Some(area) => area,
+            None => return Ok(()),
+        };
+        match mouse_event.kind {
+            MouseEventKind::Down(event::MouseButton::Left) => {
+                if !Self::point_in_content_area(area, mouse_event.column, mouse_event.row) {
+                    return Ok(());
+                }
+                let click_type =
+                    self.mouse_tracker
+                        .register_click(mouse_event.column, mouse_event.row);
+                let content_top = area.y.saturating_add(1);
+                let relative_row =
+                    mouse_event.row.saturating_sub(content_top) as usize;
+                let clicked_row =
+                    relative_row / ITEM_HEIGHT + self.virtual_state.offset();
                 if clicked_row < self.items.len() {
                     self.virtual_state.select(Some(clicked_row));
                     self.scroll_state = self.scroll_state.position(clicked_row * ITEM_HEIGHT);
+                    if click_type == ClickType::Double {
+                        self.open_current_url()?;
+                    }
                 }
             }
             MouseEventKind::ScrollDown => self.scroll(0.2),
@@ -2356,6 +2544,117 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn handle_mouse_rss_tab(&mut self, mouse_event: MouseEvent) -> anyhow::Result<()> {
+        let area = match self.rss_tab_area {
+            Some(area) => area,
+            None => return Ok(()),
+        };
+        if self.rss_tab_state.items.is_empty() {
+            return Ok(());
+        }
+        match mouse_event.kind {
+            MouseEventKind::Down(event::MouseButton::Left) => {
+                if !Self::point_in_content_area(area, mouse_event.column, mouse_event.row) {
+                    return Ok(());
+                }
+                let click_type =
+                    self.mouse_tracker
+                        .register_click(mouse_event.column, mouse_event.row);
+                let start_y = area.y.saturating_add(1);
+                let relative_row = mouse_event.row.saturating_sub(start_y) as usize;
+                let clicked_row = relative_row + self.rss_tab_state.scroll_offset;
+                if clicked_row < self.rss_tab_state.items.len() {
+                    self.rss_tab_state.selected_index = clicked_row;
+                    if self.rss_tab_state.selected_index < self.rss_tab_state.scroll_offset {
+                        self.rss_tab_state.scroll_offset = self.rss_tab_state.selected_index;
+                    } else if self.rss_tab_state.selected_index
+                        >= self.rss_tab_state.scroll_offset + self.rss_tab_state.visible_items
+                    {
+                        self.rss_tab_state.scroll_offset =
+                            self.rss_tab_state.selected_index - self.rss_tab_state.visible_items + 1;
+                    }
+                    if click_type == ClickType::Double {
+                        self.handle_rss_tab_selection()?;
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => self.rss_tab_state.move_selection(1),
+            MouseEventKind::ScrollUp => self.rss_tab_state.move_selection(-1),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_mouse_rss_popup(&mut self, mouse_event: MouseEvent) -> anyhow::Result<()> {
+        let area = match self.rss_popup_area {
+            Some(area) => area,
+            None => return Ok(()),
+        };
+        match mouse_event.kind {
+            MouseEventKind::Down(event::MouseButton::Left) => {
+                if !Self::point_in_content_area(area, mouse_event.column, mouse_event.row) {
+                    return Ok(());
+                }
+                let click_type =
+                    self.mouse_tracker
+                        .register_click(mouse_event.column, mouse_event.row);
+                if let Some(popup_state) = &mut self.rss_feed_popup_state {
+                    let start_y = area.y.saturating_add(1);
+                    let relative_row = mouse_event.row.saturating_sub(start_y) as usize;
+                    let clicked_row = relative_row + popup_state.scroll_offset;
+                    if clicked_row < popup_state.items.len() {
+                        popup_state.selected_index = clicked_row;
+                        if popup_state.selected_index < popup_state.scroll_offset {
+                            popup_state.scroll_offset = popup_state.selected_index;
+                        } else if popup_state.selected_index
+                            >= popup_state.scroll_offset + popup_state.visible_items
+                        {
+                            popup_state.scroll_offset = popup_state.selected_index
+                                - popup_state.visible_items
+                                + 1;
+                        }
+                        if click_type == ClickType::Double {
+                            self.handle_rss_feed_selection()?;
+                        }
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(popup_state) = &mut self.rss_feed_popup_state {
+                    popup_state.move_selection(1);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(popup_state) = &mut self.rss_feed_popup_state {
+                    popup_state.move_selection(-1);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn point_in_content_area(area: Rect, column: u16, row: u16) -> bool {
+        if area.width <= 2 || area.height <= 2 {
+            return false;
+        }
+        let content_left = area.x.saturating_add(1);
+        let content_right = area.x + area.width - 1;
+        let content_top = area.y.saturating_add(1);
+        let content_bottom = area.y + area.height - 1;
+        column >= content_left
+            && column < content_right
+            && row >= content_top
+            && row < content_bottom
+    }
+
+    fn point_in_tab_area(area: Rect, column: u16, row: u16) -> bool {
+        column >= area.x
+            && column < area.x + area.width
+            && row >= area.y
+            && row < area.y + area.height
     }
     fn scroll(&mut self, delta: f32) {
         self.scroll_accumulator += delta;
@@ -2763,43 +3062,51 @@ fn process_confirmation(app: &mut App, confirmation_type: Confirmation) -> anyho
 
 fn process_search_mode(app: &mut App, mut sstr: SearchMode) -> anyhow::Result<()> {
     if event::poll(Duration::from_millis(100))? {
-        match event::read()? {
-            Event::Key(key) => {
-                if key.kind == KeyEventKind::Press {
-                    use KeyCode::*;
-                    match key.code {
-                        Esc => {
-                            app.clear_all_filters();
-                            app.switch_to_normal_mode_from(AppMode::Search(sstr))
-                        }
-                        Char(ch) => {
-                            sstr.search.push(ch);
-                            app.active_search_filter = Some(sstr.search.clone());
-                            app.app_mode = AppMode::Search(sstr);
-                            app.apply_filter();
-                        }
-                        Backspace => {
-                            sstr.search.pop();
-                            app.active_search_filter = Some(sstr.search.clone());
-                            app.app_mode = AppMode::Search(sstr);
-                            app.apply_filter();
-                        }
-                        Enter => {
-                            app.set_search_filter(sstr.search.clone());
-                            app.switch_to_normal_mode_from(AppMode::Search(sstr));
-                        }
-                        Down => app.next(),
-                        Up => app.previous(),
-                        _ => {} //do nothing
+        let mut pending_event = Some(event::read()?);
+        while let Some(event) = pending_event.take() {
+            match event {
+                Event::Mouse(mouse_event) => {
+                    if let Some(next_event) = app.handle_mouse_event_batched(mouse_event)? {
+                        pending_event = Some(next_event);
+                        continue;
+                    } else {
+                        return Ok(());
                     }
                 }
-            }
-            Event::Mouse(mouse_event) => {
-                app.handle_mouse_event(mouse_event)?;
-            }
-            _ => {
-                // todo: proper logging
-                ()
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        use KeyCode::*;
+                        match key.code {
+                            Esc => {
+                                app.clear_all_filters();
+                                app.switch_to_normal_mode_from(AppMode::Search(sstr));
+                                return Ok(());
+                            }
+                            Char(ch) => {
+                                sstr.search.push(ch);
+                                app.active_search_filter = Some(sstr.search.clone());
+                                app.app_mode = AppMode::Search(sstr.clone());
+                                app.apply_filter();
+                            }
+                            Backspace => {
+                                sstr.search.pop();
+                                app.active_search_filter = Some(sstr.search.clone());
+                                app.app_mode = AppMode::Search(sstr.clone());
+                                app.apply_filter();
+                            }
+                            Enter => {
+                                app.set_search_filter(sstr.search.clone());
+                                app.switch_to_normal_mode_from(AppMode::Search(sstr));
+                                return Ok(());
+                            }
+                            Down => app.next(),
+                            Up => app.previous(),
+                            _ => {} //do nothing
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => return Ok(()),
             }
         }
     }
@@ -2807,11 +3114,27 @@ fn process_search_mode(app: &mut App, mut sstr: SearchMode) -> anyhow::Result<()
 }
 
 fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
-    Ok(if let Event::Key(key) = event::read()? {
-        if key.kind == KeyEventKind::Press {
-            use KeyCode::*;
-            if let Some(doc_popup_state) = &mut app.doc_type_popup_state {
-                match key.code {
+    let mut pending_event: Option<Event> = None;
+    loop {
+        let event = match pending_event.take() {
+            Some(ev) => ev,
+            None => event::read()?,
+        };
+
+        if let Event::Mouse(mouse_event) = event {
+            if let Some(ev) = app.handle_mouse_event_batched(mouse_event)? {
+                pending_event = Some(ev);
+                continue;
+            } else {
+                return Ok(());
+            }
+        }
+
+        if let Event::Key(key) = event {
+            if key.kind == KeyEventKind::Press {
+                use KeyCode::*;
+                if let Some(doc_popup_state) = &mut app.doc_type_popup_state {
+                    match key.code {
                     Char(ch) if ch.is_digit(10) => {
                         if let Some(filter) = doc_popup_state.select_by_number(ch) {
                             app.select_doc_type(filter);
@@ -3135,8 +3458,10 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                     _ => {}
                 }
             }
+            }
+            return Ok(());
         }
-    })
+    }
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
@@ -3320,6 +3645,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
+    app.raindrop_area = Some(area);
     let length = 14; //todo calc the value
 
     let selected = app.virtual_state.selected().unwrap_or(0);
@@ -3466,9 +3792,17 @@ fn constraint_len_calculator<T: TableRow>(items: &[T]) -> (u16, u16, u16) {
     (name_len as u16, title_len as u16, email_len as u16)
 }
 
-fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    app.tab_bar_area = Some(area);
     let rss_count = app.rss_tab_state.items.len();
     let has_updates = app.rss_feed_state.has_updates.load(Ordering::Relaxed);
+
+    let raindrops_label = " Raindrops ".to_string();
+    let rss_label = if rss_count > 0 || has_updates {
+        format!(" RSS ({}) ", rss_count)
+    } else {
+        " RSS ".to_string()
+    };
 
     let raindrops_style = if app.current_tab == CurrentTab::Raindrops {
         Style::default()
@@ -3488,16 +3822,10 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(OCEANIC_NEXT.base_04)
     };
 
-    let rss_label = if rss_count > 0 || has_updates {
-        format!(" RSS ({}) ", rss_count)
-    } else {
-        " RSS ".to_string()
-    };
-
     let mut spans = vec![
-        Span::styled(" Raindrops ", raindrops_style),
+        Span::styled(raindrops_label.clone(), raindrops_style),
         Span::raw(" "),
-        Span::styled(rss_label, rss_style),
+        Span::styled(rss_label.clone(), rss_style),
     ];
 
     // Add update indicator if there are new RSS items
@@ -3513,6 +3841,19 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(OCEANIC_NEXT.base_03),
     ));
 
+    app.tab_bar_hitboxes.clear();
+    let mut cursor = area.x;
+    let raindrops_width = UnicodeWidthStr::width(raindrops_label.as_str()) as u16;
+    app.tab_bar_hitboxes.push((
+        cursor..cursor + raindrops_width,
+        CurrentTab::Raindrops,
+    ));
+    cursor += raindrops_width + 1; // space between tabs
+
+    let rss_width = UnicodeWidthStr::width(rss_label.as_str()) as u16;
+    app.tab_bar_hitboxes
+        .push((cursor..cursor + rss_width, CurrentTab::RssFeed));
+
     let tab_bar =
         Paragraph::new(Line::from(spans)).style(Style::default().bg(app.colors.buffer_bg));
 
@@ -3520,6 +3861,9 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
+    app.rss_tab_area = Some(area);
+    let visible_items = (area.height as usize).saturating_sub(2).max(1);
+    app.rss_tab_state.visible_items = visible_items;
     let popup_state = &app.rss_tab_state;
 
     if popup_state.items.is_empty() {
@@ -3529,9 +3873,6 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(empty_text, area);
         return;
     }
-
-    // Calculate visible items based on area height
-    let visible_items = (area.height as usize).saturating_sub(2);
 
     // Group items by source and count them
     let mut source_counts = std::collections::HashMap::new();
@@ -3848,6 +4189,7 @@ fn render_error_popup(f: &mut Frame, message: &str, area: Rect, colors: &TableCo
 fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(popup_state) = &app.rss_feed_popup_state {
         let popup_area = centered_rect(80, 80, area);
+        app.rss_popup_area = Some(popup_area);
         f.render_widget(Clear, popup_area);
         // Calculate areas for main content and status bar
         let chunks = Layout::vertical([
