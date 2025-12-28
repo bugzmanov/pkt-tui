@@ -1,19 +1,15 @@
 #![allow(clippy::enum_glob_use, clippy::wildcard_imports)]
 
-mod auth;
 mod errors;
 mod logo;
 mod markdown;
-mod pocket;
 mod prss;
 pub mod raindrop;
 mod readingstats;
-pub mod storage;
-mod tokenstorage;
 mod utils;
 
 use anyhow::Context;
-use chrono::{DateTime, Local, Utc};
+use chrono::Local;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -23,7 +19,6 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dom_smoothie::{Article, Config, Readability};
-use itertools::Itertools;
 use log::{error, LevelFilter};
 use prss::{
     metadata::{load_shared_store, SharedMetadataStore},
@@ -33,7 +28,6 @@ use ratatui::{prelude::*, widgets::*};
 use rayon::prelude::*;
 use readingstats::{render_stats, TotalStats};
 use reqwest::blocking::Client;
-use serde_json::json;
 use std::{
     collections::HashMap,
     error::Error,
@@ -48,7 +42,6 @@ use std::{
     thread::{self},
     time::{Duration, Instant},
 };
-use storage::PocketItem;
 use style::palette::tailwind;
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthStr;
@@ -121,118 +114,6 @@ impl TableColors {
     }
 }
 
-impl TableRow for PocketItem {
-    fn id(&self) -> String {
-        self.item_id.to_string()
-    }
-
-    fn date(&self) -> String {
-        let timestamp = self.time_added.parse::<i64>().unwrap();
-        let naive = DateTime::from_timestamp(timestamp, 0).unwrap();
-        let datetime: DateTime<Utc> = naive.to_utc();
-        let newdate = datetime.format("%Y-%m-%d");
-        format!("{}", newdate)
-    }
-
-    fn title(&self) -> &str {
-        &self
-            .given_title
-            .as_deref()
-            .unwrap_or(&self.resolved_title.as_deref().unwrap_or("[empty]"))
-    }
-
-    fn item_type(&self) -> &str {
-        if self.url().contains("youtube.com") {
-            "video"
-        } else if self.url().contains("pdf") {
-            "pdf"
-        } else {
-            "article"
-        }
-    }
-
-    fn tags(&self) -> impl Iterator<Item = &String> {
-        self.tags.keys()
-    }
-
-    fn url(&self) -> &str {
-        (&self.resolved_url).as_deref().unwrap_or("[empty]")
-    }
-
-    fn add_tag(&mut self, tag: &str) {
-        self.tags.insert(tag.to_string(), json!({}));
-    }
-
-    fn remove_tag(&mut self, tag: &str) {
-        self.tags.remove(tag);
-    }
-
-    fn rename_title_to(&mut self, new_title: String) {
-        self.given_title = Some(new_title);
-    }
-
-    fn time_added(&self) -> u64 {
-        self.time_added.parse::<u64>().unwrap()
-    }
-}
-
-impl TableRow for raindrop::Raindrop {
-    fn id(&self) -> String {
-        self.id.to_string()
-    }
-
-    fn date(&self) -> String {
-        raindrop::Raindrop::date(self)
-    }
-
-    fn title(&self) -> &str {
-        self.display_title()
-    }
-
-    fn item_type(&self) -> &str {
-        self.type_str()
-    }
-
-    fn tags(&self) -> impl Iterator<Item = &String> {
-        self.tags.iter()
-    }
-
-    fn url(&self) -> &str {
-        &self.link
-    }
-
-    fn add_tag(&mut self, tag: &str) {
-        raindrop::Raindrop::add_tag(self, tag);
-    }
-
-    fn remove_tag(&mut self, tag: &str) {
-        raindrop::Raindrop::remove_tag(self, tag);
-    }
-
-    fn rename_title_to(&mut self, new_title: String) {
-        self.rename_title(new_title);
-    }
-
-    fn time_added(&self) -> u64 {
-        raindrop::Raindrop::time_added(self)
-    }
-}
-
-//todo: remove
-#[allow(dead_code)]
-trait TableRow {
-    fn id(&self) -> String;
-    fn date(&self) -> String;
-    fn time_added(&self) -> u64;
-    fn title(&self) -> &str;
-    fn item_type(&self) -> &str;
-    fn tags(&self) -> impl Iterator<Item = &String>;
-    fn url(&self) -> &str;
-    fn add_tag(&mut self, tag: &str);
-    fn remove_tag(&mut self, tag: &str);
-    fn rename_title_to(&mut self, new_title: String);
-}
-
 pub struct RssFeedState {
     pub items: Arc<Mutex<Vec<RssFeedItem>>>,
     pub is_loading: Arc<Mutex<bool>>,
@@ -266,7 +147,7 @@ pub struct RssFeedPopupState {
     pub visible_items: usize,
     hidden_items: prss::hidden_items::HiddenItems,
     status_message: Option<(String, Instant)>, // Message and timestamp
-    pending_pocket_item: Option<RssFeedItem>,  // Store item waiting for tags
+    pending_raindrop_item: Option<RssFeedItem>, // Store item waiting for tags
     show_description: bool,
     pub changes_made: bool,
     pending_key: Option<char>, // For multi-char commands like dd, gg
@@ -281,7 +162,7 @@ impl RssFeedPopupState {
             visible_items: 20,
             hidden_items: prss::hidden_items::HiddenItems::new(metadata),
             status_message: None,
-            pending_pocket_item: None,
+            pending_raindrop_item: None,
             show_description: false,
             changes_made: false,
             pending_key: None,
@@ -303,16 +184,16 @@ impl RssFeedPopupState {
             visible_items,
             hidden_items,
             status_message: None,
-            pending_pocket_item: None,
+            pending_raindrop_item: None,
             show_description: false,
             changes_made: false,
             pending_key: None,
         })
     }
 
-    pub fn prepare_add_to_pocket(&mut self) -> Option<RssFeedItem> {
+    pub fn prepare_add_to_raindrop(&mut self) -> Option<RssFeedItem> {
         if let Some(selected_item) = self.items.get(self.selected_index).cloned() {
-            self.pending_pocket_item = Some(selected_item.clone());
+            self.pending_raindrop_item = Some(selected_item.clone());
             Some(selected_item)
         } else {
             None
@@ -371,7 +252,7 @@ impl RssFeedPopupState {
         raindrop_client: &raindrop::RaindropAPISync,
         tags_input: &str,
     ) -> anyhow::Result<()> {
-        if let Some(item) = self.pending_pocket_item.take() {
+        if let Some(item) = self.pending_raindrop_item.take() {
             // Parse tags in the application code
             let tags: Vec<String> = tags_input
                 .split(',')
@@ -427,14 +308,17 @@ impl ReadingStats {
     }
 }
 
-fn collect_stats<T: TableRow>(items: &FilteredItems<T>, start_idx: usize) -> ReadingStats {
+fn collect_stats(items: &FilteredItems<raindrop::Raindrop>, start_idx: usize) -> ReadingStats {
     let mut stats = ReadingStats::new();
-    let current_date = items.get(start_idx).unwrap().date();
+    let Some(current) = items.get(start_idx) else {
+        return stats;
+    };
+    let current_date = current.date();
     for item in items.iter_from(start_idx) {
         if item.date() != current_date {
             break;
         }
-        match item.item_type() {
+        match item.type_str() {
             "article" => stats.articles_total += 1,
             "video" => stats.videos_total += 1,
             "pdf" => stats.pdfs_total += 1,
@@ -610,7 +494,7 @@ struct HelpPopupState {
 
 #[derive(Clone)]
 enum Confirmation {
-    DeletePocketItem,
+    DeleteItem,
 }
 
 #[derive(Clone)]
@@ -759,20 +643,6 @@ struct FilteredItems<T> {
 }
 
 impl<T> FilteredItems<T> {
-    #[allow(dead_code)]
-    pub fn non_archived(data: Vec<PocketItem>) -> FilteredItems<PocketItem> {
-        let filtered = data
-            .into_iter()
-            .filter(|x| x.status != "1")
-            .collect::<Vec<PocketItem>>();
-        let data_vec_size = filtered.len();
-        FilteredItems {
-            items: filtered,
-            is_filter_on: false,
-            filtered: Vec::with_capacity(data_vec_size),
-        }
-    }
-
     pub fn new(data: Vec<T>) -> Self {
         let data_vec_size = data.len();
         FilteredItems {
@@ -986,7 +856,7 @@ impl App {
     ) -> anyhow::Result<App> {
         let cached_tags = data_vec
             .iter()
-            .flat_map(|item| item.tags().map(|tag| tag.to_string()))
+            .flat_map(|item| item.tags.iter().cloned())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -1035,12 +905,12 @@ impl App {
     fn build_raindrop_url_index(items: &[raindrop::Raindrop]) -> HashMap<String, Vec<String>> {
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
         for item in items {
-            let normalized = Self::normalize_url(item.url());
+            let normalized = Self::normalize_url(&item.link);
             if normalized.is_empty() {
                 continue;
             }
             let entry = map.entry(normalized).or_insert_with(Vec::new);
-            for tag in item.tags() {
+            for tag in &item.tags {
                 if !entry.contains(tag) {
                     entry.push(tag.clone());
                 }
@@ -1311,7 +1181,7 @@ impl App {
             if popup_state.changes_made {
                 // Switch to refreshing mode with proper loading message
                 self.app_mode = AppMode::Refreshing(RefreshingPopup::new(
-                    "Refreshing Pocket data ⏳".to_string(),
+                    "Refreshing Raindrop data ⏳".to_string(),
                     LoadingType::Refresh,
                 ));
 
@@ -1334,9 +1204,9 @@ impl App {
             CommandType::Tags,
         ));
     }
-    fn process_add_to_pocket_with_tags(&mut self) -> anyhow::Result<()> {
+    fn process_add_to_raindrop_with_tags(&mut self) -> anyhow::Result<()> {
         if let Some(popup_state) = &mut self.rss_feed_popup_state {
-            if let Some(_item) = popup_state.prepare_add_to_pocket() {
+            if let Some(_item) = popup_state.prepare_add_to_raindrop() {
                 self.switch_to_tags_mode(None);
             }
         }
@@ -1346,7 +1216,7 @@ impl App {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
                 // Get current tags and join them with commas
-                let current_tags = item.tags().join(", ");
+                let current_tags = item.tags.join(", ");
                 self.switch_to_tags_mode(Some(current_tags));
             }
         }
@@ -1371,7 +1241,7 @@ impl App {
 
         // Handle RSS tab item tags
         if self.current_tab == CurrentTab::RssFeed
-            && self.rss_tab_state.pending_pocket_item.is_some()
+            && self.rss_tab_state.pending_raindrop_item.is_some()
         {
             self.rss_tab_state
                 .add_current_to_raindrop(&self.raindrop_client, &tags)?;
@@ -1396,7 +1266,7 @@ impl App {
 
                 // Update local item
                 // First, remove all existing tags
-                let existing_tags: Vec<String> = item.tags().map(|t| t.to_string()).collect();
+                let existing_tags = item.tags.clone();
                 for tag in existing_tags {
                     item.remove_tag(&tag);
                 }
@@ -1414,12 +1284,12 @@ impl App {
     fn download_current_pdf(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
-                if item.item_type() == "pdf" {
+                if item.type_str() == "pdf" {
                     // Create pdfs directory if it doesn't exist
                     fs::create_dir_all("pdfs")?;
 
                     // Extract filename from URL
-                    let url = item.url();
+                    let url = item.link.as_str();
                     let filename = url
                         .split('/')
                         .last()
@@ -1452,7 +1322,7 @@ impl App {
     fn download_and_convert_article(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
-                if item.item_type() == "article" {
+                if item.type_str() == "article" {
                     // Create articles directory if it doesn't exist
                     fs::create_dir_all("articles")?;
 
@@ -1464,7 +1334,7 @@ impl App {
 
                     // Download the article content
                     let response = self.download_client
-                                        .get(item.url())
+                                        .get(item.link.as_str())
                                         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
                                         .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
                                         .header("Accept-Language", "en-US,en;q=0.5")
@@ -1495,9 +1365,12 @@ impl App {
                         ..Default::default()
                     };
 
-                    let mut readability =
-                        Readability::new(html_content.as_str(), Some(item.url()), Some(cfg))?;
-                    // Readability::new(md.as_str(), Some(item.url()), Some(cfg))?;
+                    let mut readability = Readability::new(
+                        html_content.as_str(),
+                        Some(item.link.as_str()),
+                        Some(cfg),
+                    )?;
+                    // Readability::new(md.as_str(), Some(item.link.as_str()), Some(cfg))?;
                     let article: Article = readability.parse()?;
 
                     // Create markdown content with metadata and article details
@@ -1506,7 +1379,7 @@ impl App {
                     // Add YAML frontmatter
                     // content.push_str("---\n");
                     // content.push_str(&format!("title: {}\n", article.title));
-                    // content.push_str(&format!("url: {}\n", item.url()));
+                    // content.push_str(&format!("url: {}\n", item.link));
                     // content.push_str(&format!("date_added: {}\n", item.date()));
 
                     // // Add optional metadata if available
@@ -1710,8 +1583,8 @@ impl App {
         Ok(())
     }
 
-    fn process_add_to_pocket_with_tags_rss_tab(&mut self) -> anyhow::Result<()> {
-        if let Some(_item) = self.rss_tab_state.prepare_add_to_pocket() {
+    fn process_add_to_raindrop_with_tags_rss_tab(&mut self) -> anyhow::Result<()> {
+        if let Some(_item) = self.rss_tab_state.prepare_add_to_raindrop() {
             self.switch_to_tags_mode(None);
         }
         Ok(())
@@ -1887,7 +1760,7 @@ impl App {
 
         self.cached_tags = items
             .iter()
-            .flat_map(|item| item.tags().map(|tag| tag.to_string()))
+            .flat_map(|item| item.tags.iter().cloned())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -1923,7 +1796,7 @@ impl App {
 
         self.cached_tags = items
             .iter()
-            .flat_map(|item| item.tags().map(|tag| tag.to_string()))
+            .flat_map(|item| item.tags.iter().cloned())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -1952,9 +1825,9 @@ impl App {
             .items // Access all items, not just filtered
             .iter()
             .filter(|item| {
-                !item.tags().any(|tag| tag == "read") // Exclude read items
+                !item.tags.iter().any(|tag| tag == "read") // Exclude read items
             })
-            .flat_map(|item| item.tags().map(|tag| tag.to_string()))
+            .flat_map(|item| item.tags.iter().cloned())
             .fold(std::collections::HashMap::new(), |mut acc, tag| {
                 *acc.entry(tag).or_insert(0) += 1;
                 acc
@@ -1965,7 +1838,7 @@ impl App {
             .items
             .items
             .iter()
-            .filter(|item| item.tags().any(|t| t == "archived"))
+            .filter(|item| item.tags.iter().any(|t| t == "archived"))
             .count();
         if archived_count > 0 {
             tag_counts.insert("archived".to_string(), archived_count);
@@ -1985,7 +1858,7 @@ impl App {
 
         // Count domains for each item
         for item in self.items.iter() {
-            let key = Self::extract_domain(item.url()).unwrap_or_else(|| "IGNORE".to_string());
+            let key = Self::extract_domain(&item.link).unwrap_or_else(|| "IGNORE".to_string());
             if key != "IGNORE" {
                 *counts.entry(key).or_insert(0) += 1;
             }
@@ -2007,8 +1880,8 @@ impl App {
             let title_matches = match &self.active_search_filter {
                 Some(filter) => {
                     let filter_lower = filter.to_lowercase();
-                    item.title().to_lowercase().contains(&filter_lower)
-                        || item.url().contains(&filter_lower)
+                    item.display_title().to_lowercase().contains(&filter_lower)
+                        || item.link.to_lowercase().contains(&filter_lower)
                 }
                 None => true,
             };
@@ -2019,25 +1892,25 @@ impl App {
             } else {
                 self.selected_tag_filters
                     .iter()
-                    .all(|tag| item.tags().any(|t| t == tag))
+                    .all(|tag| item.tags.iter().any(|t| t == tag))
             };
 
             // Hide archived items unless explicitly filtering for "archived" tag
             let not_archived = if self.selected_tag_filters.contains("archived") {
                 true // Show archived when filtering for it
             } else {
-                !item.tags().any(|t| t == "archived") // Otherwise hide archived
+                !item.tags.iter().any(|t| t == "archived") // Otherwise hide archived
             };
 
             let type_matches = match self.item_type_filter {
                 ItemTypeFilter::All => true,
-                ItemTypeFilter::Article => item.item_type() == "article",
-                ItemTypeFilter::Video => item.item_type() == "video",
-                ItemTypeFilter::PDF => item.item_type() == "pdf",
+                ItemTypeFilter::Article => item.type_str() == "article",
+                ItemTypeFilter::Video => item.type_str() == "video",
+                ItemTypeFilter::PDF => item.type_str() == "pdf",
             };
 
             let domain_matches = match &self.domain_filter {
-                Some(domain) => Self::extract_domain(item.url())
+                Some(domain) => Self::extract_domain(&item.link)
                     .map(|item_domain| item_domain == *domain)
                     .unwrap_or(false),
                 None => true,
@@ -2119,24 +1992,13 @@ impl App {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx).cloned() {
                 // Domain filtering for all content
-                if let Some(domain) = Self::extract_domain(item.url()) {
+                if let Some(domain) = Self::extract_domain(&item.link) {
                     self.domain_filter = Some(domain);
                     self.apply_filter();
                 }
             }
         }
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn _apply_domain_filter(&mut self, target_domain: &str) {
-        self.items.apply_filter(|item| {
-            if let Some(domain) = Self::extract_domain(item.url()) {
-                domain.contains(target_domain)
-            } else {
-                false
-            }
-        });
     }
 
     fn clear_domain_filter(&mut self) {
@@ -2186,7 +2048,7 @@ impl App {
                 // Mark as read by adding a tag
                 self.raindrop_client.add_tag(item, "read")?;
                 item.add_tag("read");
-                if let Err(e) = webbrowser::open(&item.url()) {
+                if let Err(e) = webbrowser::open(&item.link) {
                     self.app_mode = AppMode::Error(format!("Failed to open browser: {}", e));
                 }
             }
@@ -2223,7 +2085,7 @@ impl App {
     fn toggle_top_tag(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get_mut(idx) {
-                if !item.tags().any(|x| x == "top") {
+                if !item.tags.iter().any(|x| x == "top") {
                     self.raindrop_client.add_tag(item, "top")?;
                     item.add_tag("top");
                 } else {
@@ -2322,10 +2184,10 @@ impl App {
         if let Some(idx) = self.virtual_state.selected() {
             let initial_text = if with_current_title {
                 self.items.get(idx).map_or("".to_string(), |item| {
-                    if item.title().is_empty() {
-                        item.url().to_string()
+                    if item.title.is_empty() {
+                        item.link.clone()
                     } else {
-                        item.title().to_string()
+                        item.title.clone()
                     }
                 })
             } else {
@@ -2346,7 +2208,7 @@ impl App {
                 let normalized_title = current_enter.replace('\n', " ").trim().to_string();
                 let update = raindrop::UpdateRaindrop::new().title(&normalized_title);
                 self.raindrop_client.update_raindrop(item.id, &update)?;
-                item.rename_title_to(current_enter);
+                item.rename_title(current_enter);
             }
             self.save_to_cache()?;
         }
@@ -2395,11 +2257,7 @@ impl App {
                         }
                     },
                     other => {
-                        self.apply_mouse_scroll(
-                            net_scroll,
-                            mouse_event.column,
-                            mouse_event.row,
-                        );
+                        self.apply_mouse_scroll(net_scroll, mouse_event.column, mouse_event.row);
                         return Ok(Some(other));
                     }
                 }
@@ -2419,8 +2277,7 @@ impl App {
         }
 
         if let Some(area) = self.rss_popup_area {
-            if self.rss_feed_popup_state.is_some()
-                && Self::point_in_content_area(area, column, row)
+            if self.rss_feed_popup_state.is_some() && Self::point_in_content_area(area, column, row)
             {
                 if let Some(popup_state) = &mut self.rss_feed_popup_state {
                     let steps = delta.unsigned_abs();
@@ -2517,14 +2374,12 @@ impl App {
                 if !Self::point_in_content_area(area, mouse_event.column, mouse_event.row) {
                     return Ok(());
                 }
-                let click_type =
-                    self.mouse_tracker
-                        .register_click(mouse_event.column, mouse_event.row);
+                let click_type = self
+                    .mouse_tracker
+                    .register_click(mouse_event.column, mouse_event.row);
                 let content_top = area.y.saturating_add(1);
-                let relative_row =
-                    mouse_event.row.saturating_sub(content_top) as usize;
-                let clicked_row =
-                    relative_row / ITEM_HEIGHT + self.virtual_state.offset();
+                let relative_row = mouse_event.row.saturating_sub(content_top) as usize;
+                let clicked_row = relative_row / ITEM_HEIGHT + self.virtual_state.offset();
                 if clicked_row < self.items.len() {
                     self.virtual_state.select(Some(clicked_row));
                     self.scroll_state = self.scroll_state.position(clicked_row * ITEM_HEIGHT);
@@ -2553,9 +2408,9 @@ impl App {
                 if !Self::point_in_content_area(area, mouse_event.column, mouse_event.row) {
                     return Ok(());
                 }
-                let click_type =
-                    self.mouse_tracker
-                        .register_click(mouse_event.column, mouse_event.row);
+                let click_type = self
+                    .mouse_tracker
+                    .register_click(mouse_event.column, mouse_event.row);
                 let start_y = area.y.saturating_add(1);
                 let relative_row = mouse_event.row.saturating_sub(start_y) as usize;
                 let clicked_row = relative_row + self.rss_tab_state.scroll_offset;
@@ -2566,8 +2421,9 @@ impl App {
                     } else if self.rss_tab_state.selected_index
                         >= self.rss_tab_state.scroll_offset + self.rss_tab_state.visible_items
                     {
-                        self.rss_tab_state.scroll_offset =
-                            self.rss_tab_state.selected_index - self.rss_tab_state.visible_items + 1;
+                        self.rss_tab_state.scroll_offset = self.rss_tab_state.selected_index
+                            - self.rss_tab_state.visible_items
+                            + 1;
                     }
                     if click_type == ClickType::Double {
                         self.handle_rss_tab_selection()?;
@@ -2591,9 +2447,9 @@ impl App {
                 if !Self::point_in_content_area(area, mouse_event.column, mouse_event.row) {
                     return Ok(());
                 }
-                let click_type =
-                    self.mouse_tracker
-                        .register_click(mouse_event.column, mouse_event.row);
+                let click_type = self
+                    .mouse_tracker
+                    .register_click(mouse_event.column, mouse_event.row);
                 if let Some(popup_state) = &mut self.rss_feed_popup_state {
                     let start_y = area.y.saturating_add(1);
                     let relative_row = mouse_event.row.saturating_sub(start_y) as usize;
@@ -2605,9 +2461,8 @@ impl App {
                         } else if popup_state.selected_index
                             >= popup_state.scroll_offset + popup_state.visible_items
                         {
-                            popup_state.scroll_offset = popup_state.selected_index
-                                - popup_state.visible_items
-                                + 1;
+                            popup_state.scroll_offset =
+                                popup_state.selected_index - popup_state.visible_items + 1;
                         }
                         if click_type == ClickType::Double {
                             self.handle_rss_feed_selection()?;
@@ -2686,13 +2541,6 @@ impl App {
         self.scroll_state = self.scroll_state.position(new_index * ITEM_HEIGHT);
     }
 }
-
-// Legacy Pocket reload function - not used with Raindrop backend
-// fn reload_data(
-//     delta_file: &Path,
-//     pocket_client: &GetPocketSync,
-//     stats: &mut TotalStats,
-// ) -> anyhow::Result<Vec<PocketItem>> { ... }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let target = Box::new(File::create("log.txt").expect("Can't create file"));
@@ -2873,7 +2721,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                         LoadingType::Download => {
                             if let Some(idx) = app.virtual_state.selected() {
                                 if let Some(item) = app.items.get(idx) {
-                                    match item.item_type() {
+                                    match item.type_str() {
                                         "pdf" => app.download_current_pdf(),
                                         "article" => app.download_and_convert_article(),
                                         _ => Ok(()),
@@ -3043,7 +2891,7 @@ fn process_confirmation(app: &mut App, confirmation_type: Confirmation) -> anyho
                 match key.code {
                     Char('y') | Char('Y') | Char('d') | Char('D') => {
                         match confirmation_type {
-                            Confirmation::DeletePocketItem => app.delete_article()?,
+                            Confirmation::DeleteItem => app.delete_article()?,
                         };
                     }
                     _ => {} // do nothing
@@ -3129,177 +2977,289 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                 use KeyCode::*;
                 if let Some(doc_popup_state) = &mut app.doc_type_popup_state {
                     match key.code {
-                    Char(ch) if ch.is_digit(10) => {
-                        if let Some(filter) = doc_popup_state.select_by_number(ch) {
-                            app.select_doc_type(filter);
-                        }
-                    }
-                    Esc => app.doc_type_popup_state = None,
-                    _ => {}
-                }
-            } else if let Some(tag_popup_state) = &mut app.tag_popup_state {
-                match app.tag_selection_mode {
-                    TagSelectionMode::Normal => match key.code {
-                        Char('j') | Down => tag_popup_state.move_selection(1),
-                        Char('k') | Up => tag_popup_state.move_selection(-1),
-                        Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            tag_popup_state.page_down()
-                        }
-                        Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            tag_popup_state.page_up()
-                        }
-                        Enter => app.select_tag(),
-                        Esc => app.tag_popup_state = None,
-                        Char('/') => {
-                            app.tag_selection_mode = TagSelectionMode::Filtering;
-                        }
-                        _ => {}
-                    },
-                    TagSelectionMode::Filtering => match key.code {
-                        Down => tag_popup_state.move_selection(1),
-                        Up => tag_popup_state.move_selection(-1),
-                        Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            tag_popup_state.page_down()
-                        }
-                        Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            tag_popup_state.page_up()
-                        }
-                        Char(ch) => tag_popup_state.add_to_filter(ch),
-                        Backspace => tag_popup_state.remove_from_filter(),
-                        Esc => {
-                            tag_popup_state.clear_filter();
-                            app.tag_selection_mode = TagSelectionMode::Normal;
-                        }
-                        Enter => {
-                            app.tag_selection_mode = TagSelectionMode::Normal;
-                            app.select_tag();
-                        }
-                        _ => {}
-                    },
-                }
-            } else if let Some(ref mut domain_state) = &mut app.domain_stats_popup_state {
-                match key.code {
-                    Enter => {
-                        if let Some((domain, _)) =
-                            domain_state.stats.get(domain_state.selected_index)
-                        {
-                            // Filter by domain
-                            app.domain_filter = Some(domain.clone());
-                            app.apply_filter();
-                            app.domain_stats_popup_state = None;
-                        }
-                    }
-                    Esc => {
-                        app.domain_stats_popup_state = None;
-                    }
-                    Char('j') | Down => {
-                        domain_state.move_selection(1);
-                    }
-                    Char('k') | Up => {
-                        domain_state.move_selection(-1);
-                    }
-                    _ => { /*do nothing */ }
-                }
-            } else if let Some(ref mut popup_state) = app.rss_feed_popup_state {
-                // Handle multi-char commands first
-                if let Some(pending) = popup_state.pending_key.take() {
-                    match (pending, key.code) {
-                        ('d', Char('d')) => {
-                            popup_state.hide_current_item()?;
-                            return Ok(());
-                        }
-                        ('g', Char('g')) => {
-                            popup_state.scroll_to_beginning();
-                        }
-                        _ => {
-                            // Invalid sequence, ignore
-                        }
-                    }
-                } else {
-                    match key.code {
-                        Char('j') | Down => popup_state.move_selection(1),
-                        Char('k') | Up => popup_state.move_selection(-1),
-                        Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            popup_state.page_down();
-                        }
-                        Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            popup_state.page_up();
-                        }
-                        Char('d') => {
-                            popup_state.pending_key = Some('d');
-                        }
-                        Char('g') => {
-                            popup_state.pending_key = Some('g');
-                        }
-                        Char('G') => {
-                            popup_state.scroll_to_end();
-                        }
-                        Char('p') => popup_state.show_description = !popup_state.show_description,
-                        Char('a') => {
-                            app.process_add_to_pocket_with_tags()?;
-                            return Ok(());
-                        }
-                        Enter => app.handle_rss_feed_selection()?,
-                        Esc => {
-                            if popup_state.show_description {
-                                popup_state.show_description = false;
-                            } else {
-                                app.close_rss_feed_popup()?;
+                        Char(ch) if ch.is_digit(10) => {
+                            if let Some(filter) = doc_popup_state.select_by_number(ch) {
+                                app.select_doc_type(filter);
                             }
                         }
+                        Esc => app.doc_type_popup_state = None,
                         _ => {}
                     }
-                }
-            } else if app.current_tab == CurrentTab::RssFeed {
-                // RSS Tab input handling
-                let popup_state = &mut app.rss_tab_state;
-                // Handle multi-char commands first
-                if let Some(pending) = popup_state.pending_key.take() {
-                    match (pending, key.code) {
-                        ('d', Char('d')) => {
-                            popup_state.hide_current_item()?;
-                            return Ok(());
+                } else if let Some(tag_popup_state) = &mut app.tag_popup_state {
+                    match app.tag_selection_mode {
+                        TagSelectionMode::Normal => match key.code {
+                            Char('j') | Down => tag_popup_state.move_selection(1),
+                            Char('k') | Up => tag_popup_state.move_selection(-1),
+                            Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                tag_popup_state.page_down()
+                            }
+                            Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                tag_popup_state.page_up()
+                            }
+                            Enter => app.select_tag(),
+                            Esc => app.tag_popup_state = None,
+                            Char('/') => {
+                                app.tag_selection_mode = TagSelectionMode::Filtering;
+                            }
+                            _ => {}
+                        },
+                        TagSelectionMode::Filtering => match key.code {
+                            Down => tag_popup_state.move_selection(1),
+                            Up => tag_popup_state.move_selection(-1),
+                            Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                tag_popup_state.page_down()
+                            }
+                            Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                tag_popup_state.page_up()
+                            }
+                            Char(ch) => tag_popup_state.add_to_filter(ch),
+                            Backspace => tag_popup_state.remove_from_filter(),
+                            Esc => {
+                                tag_popup_state.clear_filter();
+                                app.tag_selection_mode = TagSelectionMode::Normal;
+                            }
+                            Enter => {
+                                app.tag_selection_mode = TagSelectionMode::Normal;
+                                app.select_tag();
+                            }
+                            _ => {}
+                        },
+                    }
+                } else if let Some(ref mut domain_state) = &mut app.domain_stats_popup_state {
+                    match key.code {
+                        Enter => {
+                            if let Some((domain, _)) =
+                                domain_state.stats.get(domain_state.selected_index)
+                            {
+                                // Filter by domain
+                                app.domain_filter = Some(domain.clone());
+                                app.apply_filter();
+                                app.domain_stats_popup_state = None;
+                            }
                         }
-                        ('g', Char('g')) => {
-                            popup_state.scroll_to_beginning();
+                        Esc => {
+                            app.domain_stats_popup_state = None;
                         }
-                        _ => {
-                            // Invalid sequence, ignore
+                        Char('j') | Down => {
+                            domain_state.move_selection(1);
+                        }
+                        Char('k') | Up => {
+                            domain_state.move_selection(-1);
+                        }
+                        _ => { /*do nothing */ }
+                    }
+                } else if let Some(ref mut popup_state) = app.rss_feed_popup_state {
+                    // Handle multi-char commands first
+                    if let Some(pending) = popup_state.pending_key.take() {
+                        match (pending, key.code) {
+                            ('d', Char('d')) => {
+                                popup_state.hide_current_item()?;
+                                return Ok(());
+                            }
+                            ('g', Char('g')) => {
+                                popup_state.scroll_to_beginning();
+                            }
+                            _ => {
+                                // Invalid sequence, ignore
+                            }
+                        }
+                    } else {
+                        match key.code {
+                            Char('j') | Down => popup_state.move_selection(1),
+                            Char('k') | Up => popup_state.move_selection(-1),
+                            Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                popup_state.page_down();
+                            }
+                            Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                popup_state.page_up();
+                            }
+                            Char('d') => {
+                                popup_state.pending_key = Some('d');
+                            }
+                            Char('g') => {
+                                popup_state.pending_key = Some('g');
+                            }
+                            Char('G') => {
+                                popup_state.scroll_to_end();
+                            }
+                            Char('p') => {
+                                popup_state.show_description = !popup_state.show_description
+                            }
+                            Char('a') => {
+                                app.process_add_to_raindrop_with_tags()?;
+                                return Ok(());
+                            }
+                            Enter => app.handle_rss_feed_selection()?,
+                            Esc => {
+                                if popup_state.show_description {
+                                    popup_state.show_description = false;
+                                } else {
+                                    app.close_rss_feed_popup()?;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if app.current_tab == CurrentTab::RssFeed {
+                    // RSS Tab input handling
+                    let popup_state = &mut app.rss_tab_state;
+                    // Handle multi-char commands first
+                    if let Some(pending) = popup_state.pending_key.take() {
+                        match (pending, key.code) {
+                            ('d', Char('d')) => {
+                                popup_state.hide_current_item()?;
+                                return Ok(());
+                            }
+                            ('g', Char('g')) => {
+                                popup_state.scroll_to_beginning();
+                            }
+                            _ => {
+                                // Invalid sequence, ignore
+                            }
+                        }
+                    } else {
+                        match key.code {
+                            Tab => {
+                                app.current_tab = CurrentTab::Raindrops;
+                            }
+                            Char('j') | Down => popup_state.move_selection(1),
+                            Char('k') | Up => popup_state.move_selection(-1),
+                            Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                popup_state.page_down();
+                            }
+                            Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                popup_state.page_up();
+                            }
+                            Char('d') => {
+                                popup_state.pending_key = Some('d');
+                            }
+                            Char('g') => {
+                                popup_state.pending_key = Some('g');
+                            }
+                            Char('G') => {
+                                popup_state.scroll_to_end();
+                            }
+                            Char('p') => {
+                                app.rss_tab_state.show_description =
+                                    !app.rss_tab_state.show_description
+                            }
+                            Char('a') => {
+                                app.process_add_to_raindrop_with_tags_rss_tab()?;
+                                return Ok(());
+                            }
+                            Enter => app.handle_rss_tab_selection()?,
+                            Esc => {
+                                if app.rss_tab_state.show_description {
+                                    app.rss_tab_state.show_description = false;
+                                }
+                            }
+                            Char('Q') => {
+                                app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
+                                    "Refreshing ⏳".to_string(),
+                                    LoadingType::Refresh,
+                                ));
+                            }
+                            Char('Z') => {
+                                app.app_mode = AppMode::MulticharNormalModeEnter("Z".to_string());
+                            }
+                            _ => {}
                         }
                     }
                 } else {
+                    //normal mode (Raindrops tab)
                     match key.code {
                         Tab => {
-                            app.current_tab = CurrentTab::Raindrops;
+                            app.sync_rss_tab_items()?;
+                            app.current_tab = CurrentTab::RssFeed;
                         }
-                        Char('j') | Down => popup_state.move_selection(1),
-                        Char('k') | Up => popup_state.move_selection(-1),
-                        Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            popup_state.page_down();
+                        Enter => {
+                            if app.tag_popup_state.is_some() {
+                                app.select_tag();
+                            } else {
+                                app.open_current_url()?;
+                            }
                         }
-                        Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            popup_state.page_up();
+                        Char('Z') => {
+                            app.app_mode = AppMode::MulticharNormalModeEnter("Z".to_string());
                         }
+                        Esc => {
+                            if app.active_search_filter.is_some() {
+                                app.clear_search_filter();
+                            } else if !app.selected_tag_filters.is_empty() {
+                                app.clear_tag_filter();
+                            } else if app.domain_filter.is_some() {
+                                app.clear_domain_filter();
+                            } else if app.item_type_filter != ItemTypeFilter::All {
+                                app.set_item_type_filter(ItemTypeFilter::All);
+                            }
+                            if app.help_popup_state.is_some() {
+                                app.help_popup_state = None;
+                            }
+                        }
+                        Char('j') | Down => {
+                            if let Some(tag_popup_state) = &mut app.tag_popup_state {
+                                tag_popup_state.move_selection(1);
+                            } else {
+                                app.next();
+                            }
+                        }
+                        Char('k') | Up => {
+                            if let Some(tag_popup_state) = &mut app.tag_popup_state {
+                                tag_popup_state.move_selection(-1);
+                            } else {
+                                app.previous();
+                            }
+                        }
+                        Char('/') => app.switch_to_search_mode(),
+                        Char('t') => app.toggle_top_tag()?,
+                        Char('T') => app.switch_to_edit_tags_mode(),
+                        Char('f') | Char('F') => app.archive_article()?,
                         Char('d') => {
-                            popup_state.pending_key = Some('d');
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                app.scroll_down();
+                            } else {
+                                app.switch_to_confirmation(Confirmation::DeleteItem);
+                            }
+                        }
+                        Char('u') => {
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                app.scroll_up();
+                            }
                         }
                         Char('g') => {
-                            popup_state.pending_key = Some('g');
+                            app.app_mode = AppMode::MulticharNormalModeEnter("g".to_string())
                         }
                         Char('G') => {
-                            popup_state.scroll_to_end();
+                            app.scroll_to_end();
                         }
-                        Char('p') => {
-                            app.rss_tab_state.show_description = !app.rss_tab_state.show_description
+                        Char('r') => app.switch_to_rename_mode(true),
+                        Char('R') => app.switch_to_rename_mode(false),
+                        Char('z') => {
+                            if app.tag_popup_state.is_none() {
+                                app.show_tag_popup();
+                            } else {
+                                app.tag_popup_state = None;
+                            }
                         }
-                        Char('a') => {
-                            app.process_add_to_pocket_with_tags_rss_tab()?;
-                            return Ok(());
-                        }
-                        Enter => app.handle_rss_tab_selection()?,
-                        Esc => {
-                            if app.rss_tab_state.show_description {
-                                app.rss_tab_state.show_description = false;
+                        Char('w') => {
+                            if let Some(idx) = app.virtual_state.selected() {
+                                if let Some(item) = app.items.get(idx) {
+                                    match item.type_str() {
+                                        "pdf" | "article" => {
+                                            let message = match item.type_str() {
+                                                "pdf" => "Downloading pdf ⏳",
+                                                "article" => "Downloading article ⏳",
+                                                _ => unreachable!(),
+                                            };
+                                            app.app_mode =
+                                                AppMode::Refreshing(RefreshingPopup::new(
+                                                    message.to_string(),
+                                                    LoadingType::Download,
+                                                ));
+                                        }
+                                        _ => {} // Do nothing for other types
+                                    }
+                                }
                             }
                         }
                         Char('Q') => {
@@ -3308,150 +3268,44 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                                 LoadingType::Refresh,
                             ));
                         }
-                        Char('Z') => {
-                            app.app_mode = AppMode::MulticharNormalModeEnter("Z".to_string());
+                        Char('s') => {
+                            app.filter_by_current_domain()?;
                         }
+                        Char('S') => {
+                            app.show_domain_stats();
+                        }
+                        Char('i') => app.show_doc_type_popup(),
+                        Char('n') => {
+                            if app.rss_feed_popup_state.is_none() {
+                                app.show_rss_feed_popup()?;
+                            }
+                        }
+                        Char('b') => {
+                            match app.handle_neovim_edit() {
+                                Ok(Some(_content)) => {
+                                    // Use the edited content here
+                                    // For example, you could store it in the currently selected item
+                                    if let Some(idx) = app.virtual_state.selected() {
+                                        if let Some(_item) = app.items.get_mut(idx) {
+                                            // Do something with the content
+                                            // For example:
+                                            // item.notes = content;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    // User cancelled or no changes
+                                }
+                                Err(e) => {
+                                    // Show error in the footer or status area
+                                    error!("Neovim edit failed: {}", e);
+                                }
+                            }
+                        }
+                        Char('?') => app.show_help_popup()?,
                         _ => {}
                     }
                 }
-            } else {
-                //normal mode (Raindrops tab)
-                match key.code {
-                    Tab => {
-                        app.sync_rss_tab_items()?;
-                        app.current_tab = CurrentTab::RssFeed;
-                    }
-                    Enter => {
-                        if app.tag_popup_state.is_some() {
-                            app.select_tag();
-                        } else {
-                            app.open_current_url()?;
-                        }
-                    }
-                    Char('Z') => {
-                        app.app_mode = AppMode::MulticharNormalModeEnter("Z".to_string());
-                    }
-                    Esc => {
-                        if app.active_search_filter.is_some() {
-                            app.clear_search_filter();
-                        } else if !app.selected_tag_filters.is_empty() {
-                            app.clear_tag_filter();
-                        } else if app.domain_filter.is_some() {
-                            app.clear_domain_filter();
-                        } else if app.item_type_filter != ItemTypeFilter::All {
-                            app.set_item_type_filter(ItemTypeFilter::All);
-                        }
-                        if app.help_popup_state.is_some() {
-                            app.help_popup_state = None;
-                        }
-                    }
-                    Char('j') | Down => {
-                        if let Some(tag_popup_state) = &mut app.tag_popup_state {
-                            tag_popup_state.move_selection(1);
-                        } else {
-                            app.next();
-                        }
-                    }
-                    Char('k') | Up => {
-                        if let Some(tag_popup_state) = &mut app.tag_popup_state {
-                            tag_popup_state.move_selection(-1);
-                        } else {
-                            app.previous();
-                        }
-                    }
-                    Char('/') => app.switch_to_search_mode(),
-                    Char('t') => app.toggle_top_tag()?,
-                    Char('T') => app.switch_to_edit_tags_mode(),
-                    Char('f') | Char('F') => app.archive_article()?,
-                    Char('d') => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            app.scroll_down();
-                        } else {
-                            app.switch_to_confirmation(Confirmation::DeletePocketItem);
-                        }
-                    }
-                    Char('u') => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            app.scroll_up();
-                        }
-                    }
-                    Char('g') => app.app_mode = AppMode::MulticharNormalModeEnter("g".to_string()),
-                    Char('G') => {
-                        app.scroll_to_end();
-                    }
-                    Char('r') => app.switch_to_rename_mode(true),
-                    Char('R') => app.switch_to_rename_mode(false),
-                    Char('z') => {
-                        if app.tag_popup_state.is_none() {
-                            app.show_tag_popup();
-                        } else {
-                            app.tag_popup_state = None;
-                        }
-                    }
-                    Char('w') => {
-                        if let Some(idx) = app.virtual_state.selected() {
-                            if let Some(item) = app.items.get(idx) {
-                                match item.item_type() {
-                                    "pdf" | "article" => {
-                                        let message = match item.item_type() {
-                                            "pdf" => "Downloading pdf ⏳",
-                                            "article" => "Downloading article ⏳",
-                                            _ => unreachable!(),
-                                        };
-                                        app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
-                                            message.to_string(),
-                                            LoadingType::Download,
-                                        ));
-                                    }
-                                    _ => {} // Do nothing for other types
-                                }
-                            }
-                        }
-                    }
-                    Char('Q') => {
-                        app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
-                            "Refreshing ⏳".to_string(),
-                            LoadingType::Refresh,
-                        ));
-                    }
-                    Char('s') => {
-                        app.filter_by_current_domain()?;
-                    }
-                    Char('S') => {
-                        app.show_domain_stats();
-                    }
-                    Char('i') => app.show_doc_type_popup(),
-                    Char('n') => {
-                        if app.rss_feed_popup_state.is_none() {
-                            app.show_rss_feed_popup()?;
-                        }
-                    }
-                    Char('b') => {
-                        match app.handle_neovim_edit() {
-                            Ok(Some(_content)) => {
-                                // Use the edited content here
-                                // For example, you could store it in the currently selected item
-                                if let Some(idx) = app.virtual_state.selected() {
-                                    if let Some(_item) = app.items.get_mut(idx) {
-                                        // Do something with the content
-                                        // For example:
-                                        // item.notes = content;
-                                    }
-                                }
-                            }
-                            Ok(None) => {
-                                // User cancelled or no changes
-                            }
-                            Err(e) => {
-                                // Show error in the footer or status area
-                                error!("Neovim edit failed: {}", e);
-                            }
-                        }
-                    }
-                    Char('?') => app.show_help_popup()?,
-                    _ => {}
-                }
-            }
             }
             return Ok(());
         }
@@ -3673,8 +3527,8 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
             let multiple_entries_for_date = !is_same_date
                 && actual_index < app.items.len() - 1
                 && data.date() == app.items.get(actual_index + 1).unwrap().date();
-            let is_read = data.tags().any(|x| x == "read");
-            let is_top = data.tags().any(|x| x == "top");
+            let is_read = data.tags.iter().any(|x| x == "read");
+            let is_top = data.tags.iter().any(|x| x == "top");
             let mut base_style = Style::new();
             if is_read {
                 base_style = base_style.add_modifier(Modifier::DIM);
@@ -3694,21 +3548,21 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                         format!(
                             "{}{}",
                             if is_top { "⭐ " } else { "" },
-                            if !data.title().is_empty() {
-                                data.title()
+                            if !data.title.is_empty() {
+                                data.title.as_str()
                             } else {
-                                data.url()
+                                data.link.as_str()
                             }
                         ),
                         base_style.fg(OCEANIC_NEXT.base_07),
                     )),
                     Line::from(vec![
                         Span::styled(
-                            format!("[{}]: ", data.item_type()),
+                            format!("[{}]: ", data.type_str()),
                             base_style.fg(Color::Green).add_modifier(Modifier::ITALIC),
                         ),
                         Span::styled(
-                            format!("{}", data.tags().join(", ")),
+                            format!("{}", data.tags.join(", ")),
                             base_style.fg(OCEANIC_NEXT.base_0e),
                         ),
                     ]),
@@ -3766,11 +3620,11 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 //todo: the thrird column is not needed
-fn constraint_len_calculator<T: TableRow>(items: &[T]) -> (u16, u16, u16) {
+fn constraint_len_calculator(items: &[raindrop::Raindrop]) -> (u16, u16, u16) {
     let name_len = 10;
     let mut title_len = items
         .iter()
-        .map(TableRow::title)
+        .map(raindrop::Raindrop::display_title)
         .flat_map(str::lines)
         .map(UnicodeWidthStr::width)
         .max()
@@ -3843,10 +3697,8 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     app.tab_bar_hitboxes.clear();
     let mut cursor = area.x;
     let raindrops_width = UnicodeWidthStr::width(raindrops_label.as_str()) as u16;
-    app.tab_bar_hitboxes.push((
-        cursor..cursor + raindrops_width,
-        CurrentTab::Raindrops,
-    ));
+    app.tab_bar_hitboxes
+        .push((cursor..cursor + raindrops_width, CurrentTab::Raindrops));
     cursor += raindrops_width + 1; // space between tabs
 
     let rss_width = UnicodeWidthStr::width(rss_label.as_str()) as u16;
@@ -3928,10 +3780,8 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             };
 
-            let source_span = Span::styled(
-                padded_source,
-                Style::default().fg(OCEANIC_NEXT.base_04),
-            );
+            let source_span =
+                Span::styled(padded_source, Style::default().fg(OCEANIC_NEXT.base_04));
 
             // Date (dim)
             let date_span = Span::styled(
@@ -4138,7 +3988,7 @@ fn render_help_popup(f: &mut Frame, app: &mut App, area: Rect) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" GetPocket TUI Help ")
+                    .title(" Raindrop TUI Help ")
                     .border_style(Style::new().fg(app.colors.header_fg))
                     .border_type(BorderType::Rounded),
             )
@@ -4430,17 +4280,17 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                 let item_count = app.rss_tab_state.items.len();
                 (
                     vec![
-                    Span::raw("j/k ↑↓ | "),
-                    Span::raw("Enter: open | "),
-                    Span::raw("dd: hide | "),
-                    Span::raw("p: preview | "),
-                    Span::raw("a: add to Raindrop | "),
-                    Span::raw("Q: refresh | "),
-                    Span::styled(
-                        format!("[{} items]", item_count),
-                        Style::default().fg(OCEANIC_NEXT.base_03),
-                    ),
-                ],
+                        Span::raw("j/k ↑↓ | "),
+                        Span::raw("Enter: open | "),
+                        Span::raw("dd: hide | "),
+                        Span::raw("p: preview | "),
+                        Span::raw("a: add to Raindrop | "),
+                        Span::raw("Q: refresh | "),
+                        Span::styled(
+                            format!("[{} items]", item_count),
+                            Style::default().fg(OCEANIC_NEXT.base_03),
+                        ),
+                    ],
                     Alignment::Center,
                 )
             } else {

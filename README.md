@@ -1,13 +1,13 @@
-# PKT-TUI - A Terminal Interface for GetPocket
+# PKT-TUI - A Terminal Interface for Raindrop.io
 
-A feature-rich terminal user interface for managing your Pocket reading list with style and efficiency. Built with Rust using `ratatui` and offering a seamless terminal-based reading list management experience.
+A feature-rich terminal user interface for managing your Raindrop.io library with style and efficiency. Built with Rust using `ratatui` and offering a seamless terminal-based bookmark management experience.
 
 <img src="https://github.com/user-attachments/assets/3bac3e90-ff27-4ef5-aeb2-43e5a2f00b89"/>
 
 ## ✨ Features
 
 ### 📚 Content Management
-- View and manage your entire Pocket reading list from the terminal
+- View and manage your entire Raindrop collection from the terminal
 - Smart content type detection (articles, videos, PDFs)
 - Efficient tag management and filtering
 - Quick access to favorite and top-rated items
@@ -34,8 +34,8 @@ A feature-rich terminal user interface for managing your Pocket reading list wit
 - Responsive layout adapting to terminal size
 
 ### 🚀 Performance
-- Fast and responsive even with large reading lists
-- Efficient data synchronization with Pocket API
+- Fast and responsive even with large bookmark collections
+- Efficient data synchronization with the Raindrop API
 - Local caching for quick startup
 - Delta updates to minimize data transfer
 
@@ -52,7 +52,7 @@ cargo install --path .
 
 ## 📝 Configuration
 
-On first run, the application will guide you through the authentication process with Pocket. Your authentication token will be securely stored for future use.
+On first run, the application will guide you through the authentication process with Raindrop.io. Your authentication token will be securely stored for future use.
 
 ## ⌨️ Key Bindings
 
@@ -71,7 +71,7 @@ On first run, the application will guide you through the authentication process 
 - `d` - Delete item
 - `r` - Rename item
 - `w` - Download PDF (for PDF items)
-- `s` - Filter by current domain/author
+- `s` - Filter by current domain
 - `S` - Show domain statistics
 - `i` - Filter by document type
 - `?` - Show help
@@ -79,7 +79,7 @@ On first run, the application will guide you through the authentication process 
 ### Filtering
 - `/` - Search mode
 - `Esc` - Clear current filter
-- `Q` - Refresh data from Pocket
+- `Q` - Refresh data from Raindrop
 
 ## 🤝 Contributing
 
