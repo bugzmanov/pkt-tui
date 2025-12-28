@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::Context;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

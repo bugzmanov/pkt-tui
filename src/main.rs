@@ -25,7 +25,6 @@ use crossterm::{
 use dom_smoothie::{Article, Config, Readability};
 use itertools::Itertools;
 use log::{error, LevelFilter};
-use pocket::{GetPocketSync, SendResponse};
 use prss::{
     metadata::{load_shared_store, SharedMetadataStore},
     RssFeedItem, RssManager,
@@ -49,7 +48,7 @@ use std::{
     thread::{self},
     time::{Duration, Instant},
 };
-use storage::{PocketItem, PocketItemUpdate};
+use storage::PocketItem;
 use style::palette::tailwind;
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthStr;
@@ -62,8 +61,6 @@ const PALETTES: [tailwind::Palette; 4] = [
 ];
 const INFO_TEXT: &str = "(ZZ) quit | gg/G/j/k  - start,end,↓,↑ | ? - Help";
 const ITEM_HEIGHT: usize = 3;
-const DELTA_FILE: &str = "snapshot_updates.db";
-
 pub struct Base16Palette {
     pub base_00: Color,
     pub base_01: Color,
@@ -222,6 +219,7 @@ impl TableRow for raindrop::Raindrop {
 }
 
 //todo: remove
+#[allow(dead_code)]
 trait TableRow {
     fn id(&self) -> String;
     fn date(&self) -> String;
@@ -722,14 +720,6 @@ impl CommandEnterMode {
                 .map(|(before, _)| format!("{},", before))
                 .unwrap_or_default();
 
-            // Get the current incomplete tag
-            let current_tag = self
-                .current_enter
-                .split(',')
-                .last()
-                .map(|s| s.trim())
-                .unwrap_or("");
-
             // Complete the tag
             self.current_enter = if prefix.is_empty() {
                 format!("{}, ", suggestion.full_text)
@@ -769,6 +759,7 @@ struct FilteredItems<T> {
 }
 
 impl<T> FilteredItems<T> {
+    #[allow(dead_code)]
     pub fn non_archived(data: Vec<PocketItem>) -> FilteredItems<PocketItem> {
         let filtered = data
             .into_iter()
@@ -1172,6 +1163,7 @@ impl App {
     //     result
     // }
 
+    #[allow(dead_code)]
     fn is_tmux_available() -> bool {
         std::process::Command::new("tmux")
             .arg("-V")
@@ -1179,6 +1171,7 @@ impl App {
             .is_ok()
     }
 
+    #[allow(dead_code)]
     fn is_inside_tmux(&self) -> bool {
         std::env::var("TMUX").is_ok()
     }
@@ -1299,7 +1292,7 @@ impl App {
                 }
             }
 
-            if let Ok(mut meta) = metadata_store.lock() {
+            if let Ok(meta) = metadata_store.lock() {
                 if let Err(e) = meta.save() {
                     error!("Failed to save RSS metadata: {}", e);
                 }
@@ -1359,6 +1352,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn complete_add_to_raindrop(&mut self, tags: String) -> anyhow::Result<()> {
         if let Some(popup_state) = &mut self.rss_feed_popup_state {
             if let Err(e) = popup_state.add_current_to_raindrop(&self.raindrop_client, &tags) {
@@ -2923,7 +2917,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                 //     pop.was_redered = true;
                 // }
             }
-            AppMode::Error(err) => {
+            AppMode::Error(_err) => {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         if KeyCode::Esc == key.code {
@@ -3434,11 +3428,11 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                     }
                     Char('b') => {
                         match app.handle_neovim_edit() {
-                            Ok(Some(content)) => {
+                            Ok(Some(_content)) => {
                                 // Use the edited content here
                                 // For example, you could store it in the currently selected item
                                 if let Some(idx) = app.virtual_state.selected() {
-                                    if let Some(item) = app.items.get_mut(idx) {
+                                    if let Some(_item) = app.items.get_mut(idx) {
                                         // Do something with the content
                                         // For example:
                                         // item.notes = content;
@@ -3507,7 +3501,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 
     if let AppMode::Error(message) = &app.app_mode {
-        render_error_popup(f, message, f.size(), &app.colors);
+        render_error_popup(f, message, f.area(), &app.colors);
     }
 
     // After tag popup rendering, add:
@@ -4303,14 +4297,13 @@ fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
                     .concat(),
                 );
 
-                let mut lines = vec![content];
                 let style = if i + popup_state.scroll_offset == popup_state.selected_index {
                     Style::default().fg(Color::Black).bg(Color::White)
                 } else {
                     Style::default()
                 };
 
-                ListItem::new(lines).style(style)
+                ListItem::new(vec![content]).style(style)
             })
             .collect();
 
@@ -4337,7 +4330,7 @@ fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_stateful_widget(scrollbar, popup_area, &mut scroll_state);
         if popup_state.show_description {
             if let Some(selected_item) = popup_state.items.get(popup_state.selected_index) {
-                let desc_popup_area = centered_rect(70, 40, f.size());
+                let desc_popup_area = centered_rect(70, 40, f.area());
                 f.render_widget(Clear, desc_popup_area);
 
                 let description = selected_item

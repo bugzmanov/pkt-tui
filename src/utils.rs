@@ -5,14 +5,15 @@ use std::path::Path;
 
 pub struct PDFData {
     pub title: Option<String>,
+    #[allow(dead_code)]
     pub text: String,
 }
 
 pub fn extract_pdf_title(path: &Path) -> anyhow::Result<Option<PDFData>> {
     // Read the file content
-    let data =
+    let _data =
         std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
-    let mut extractor = Extractor::new().set_extract_string_max_length(10000);
+    let extractor = Extractor::new().set_extract_string_max_length(10000);
     let (text, metadata) = extractor
         .extract_file_to_string(path.to_str().unwrap())
         .unwrap();

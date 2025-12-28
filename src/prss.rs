@@ -1,12 +1,12 @@
 use anyhow::Context;
-use chrono::{DateTime, Local, Utc};
-use log::{error, LevelFilter};
+use chrono::{DateTime, Utc};
+use log::error;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RssFeedItem {
@@ -63,6 +63,7 @@ impl RssManager {
         Ok(subscriptions)
     }
 
+    #[allow(dead_code)]
     pub fn add_subscription(&self, url: &str) -> anyhow::Result<()> {
         self.ensure_subscriptions_file()?;
 
@@ -76,6 +77,7 @@ impl RssManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn remove_subscription(&self, url: &str) -> anyhow::Result<()> {
         self.ensure_subscriptions_file()?;
 
@@ -287,7 +289,7 @@ pub mod metadata {
     use serde::{Deserialize, Serialize};
     use std::collections::{HashMap, HashSet};
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     const METADATA_FILE: &str = "rss/feed_meta.json";

@@ -13,7 +13,6 @@ const PAGE_SIZE: u32 = 50;
 /// Async Raindrop API client
 #[derive(Debug, Clone)]
 pub struct RaindropAPI {
-    token: String,
     client: Client,
 }
 
@@ -42,7 +41,7 @@ impl RaindropAPI {
             .build()
             .context("Failed to build HTTP client")?;
 
-        Ok(Self { token, client })
+        Ok(Self { client })
     }
 
     /// Get the current user info

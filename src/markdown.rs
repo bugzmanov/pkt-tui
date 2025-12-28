@@ -121,7 +121,7 @@ fn get_list_depth(line: &str) -> usize {
 
 /// Modified to accept an extra flag indicating if we’re in an active list.
 /// If so, and if the marker is composite (e.g. "2.1"), we use the composite indent.
-fn get_block_type(line: &str, is_in_code_block: bool, in_list: bool) -> BlockType {
+fn get_block_type(line: &str, is_in_code_block: bool, _in_list: bool) -> BlockType {
     let trimmed = line.trim_start();
     if trimmed.is_empty() {
         return BlockType::Normal;
