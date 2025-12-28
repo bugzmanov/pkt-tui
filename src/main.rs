@@ -3794,7 +3794,12 @@ fn constraint_len_calculator<T: TableRow>(items: &[T]) -> (u16, u16, u16) {
 
 fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     app.tab_bar_area = Some(area);
-    let rss_count = app.rss_tab_state.items.len();
+    let rss_count = app
+        .rss_feed_state
+        .items
+        .lock()
+        .map(|items| items.len())
+        .unwrap_or(0);
     let has_updates = app.rss_feed_state.has_updates.load(Ordering::Relaxed);
 
     let raindrops_label = " Raindrops ".to_string();
@@ -4427,10 +4432,11 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         | AppMode::Refreshing(_)
         | AppMode::Error(_) => {
             // Different footer content based on current tab
-            let spans = if app.current_tab == CurrentTab::RssFeed {
+            let (spans, alignment) = if app.current_tab == CurrentTab::RssFeed {
                 // RSS Tab footer
                 let item_count = app.rss_tab_state.items.len();
-                vec![
+                (
+                    vec![
                     Span::raw("j/k ↑↓ | "),
                     Span::raw("Enter: open | "),
                     Span::raw("dd: hide | "),
@@ -4441,7 +4447,9 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                         format!("[{} items]", item_count),
                         Style::default().fg(OCEANIC_NEXT.base_03),
                     ),
-                ]
+                ],
+                    Alignment::Center,
+                )
             } else {
                 // Raindrops Tab footer (original logic)
                 let is_filtered = !app.selected_tag_filters.is_empty()
@@ -4450,7 +4458,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                     || app.active_search_filter.is_some();
 
                 let mut spans = if is_filtered {
-                    vec![Span::raw("[Filter]")]
+                    Vec::new()
                 } else {
                     vec![Span::raw(INFO_TEXT)]
                 };
@@ -4500,16 +4508,32 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                         ]);
                     }
                 }
-                spans
+                let alignment = if is_filtered {
+                    Alignment::Left
+                } else {
+                    Alignment::Center
+                };
+                (spans, alignment)
+            };
+
+            let filtered_style = if app.current_tab == CurrentTab::Raindrops
+                && (!app.selected_tag_filters.is_empty()
+                    || app.item_type_filter != ItemTypeFilter::All
+                    || app.domain_filter.is_some()
+                    || app.active_search_filter.is_some())
+            {
+                Style::new()
+                    .fg(OCEANIC_NEXT.base_07)
+                    .bg(app.colors.buffer_bg)
+            } else {
+                Style::new()
+                    .fg(OCEANIC_NEXT.base_03)
+                    .bg(app.colors.buffer_bg)
             };
 
             let info_footer = Paragraph::new(Line::from(spans))
-                .style(
-                    Style::new()
-                        .fg(OCEANIC_NEXT.base_03)
-                        .bg(app.colors.buffer_bg),
-                )
-                .alignment(Alignment::Center)
+                .style(filtered_style)
+                .alignment(alignment)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
