@@ -7,3 +7,9 @@ user.key
 hidden_rss_items.txt
 .DS_Store
 subscriptions
+raindrop.token
+
+raindrop_data.json
+raindrop_delta.jsonl
+raindrop_meta.json
+rss/feed_meta.json
