@@ -8,6 +8,7 @@ pub mod raindrop;
 mod readingstats;
 mod summarize;
 mod utils;
+mod web2epub;
 
 use anyhow::Context;
 use chrono::Local;
@@ -433,6 +434,7 @@ impl DocTypePopupState {
 enum LoadingType {
     Refresh,
     Download,
+    DownloadNative, // Rust-native web2epub
 }
 
 struct RefreshingPopup {
@@ -1423,6 +1425,96 @@ impl App {
             self.download_and_open_epub(&link, &cache_id)?;
         }
         Ok(())
+    }
+
+    /// Native Rust implementation of article to EPUB conversion (for Raindrop items)
+    fn download_and_open_article_epub_native(&mut self) -> anyhow::Result<()> {
+        let item = if let Some(idx) = self.virtual_state.selected() {
+            if let Some(item) = self.items.get(idx) {
+                if item.type_str() == "article" {
+                    Some(item.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(item) = item {
+            let link = item.link.clone();
+            let cache_id = self.make_epub_cache_id(&item.id.to_string());
+            let downloaded = self.download_and_open_epub_native(&link, &cache_id)?;
+            if downloaded {
+                self.raindrop_client.add_tag(&item, "downloaded")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Native Rust implementation of article to EPUB conversion (for RSS items)
+    fn download_and_open_rss_epub_native(&mut self) -> anyhow::Result<()> {
+        if let Some(selected_item) = self
+            .rss_tab_state
+            .items
+            .get(self.rss_tab_state.selected_index)
+        {
+            let link = selected_item.link.clone();
+            let cache_id = self.make_epub_cache_id(&selected_item.item_id);
+            if link.is_empty() {
+                return Ok(());
+            }
+            self.download_and_open_epub_native(&link, &cache_id)?;
+        }
+        Ok(())
+    }
+
+    /// Native Rust implementation: fetch, extract, and convert URL to EPUB
+    fn download_and_open_epub_native(&mut self, url: &str, cache_id: &str) -> anyhow::Result<bool> {
+        let normalized_url = self.normalize_bugzarch_url(url);
+        let epub_path = Path::new(EPUB_DIR).join(format!("{}.epub", cache_id));
+        let mut downloaded = false;
+        let force_redownload = normalized_url != url;
+        let temp_images_dir = Path::new("temp_images").join(cache_id);
+
+        log::info!(
+            "web2epub (native): url='{}' normalized='{}' output='{}' force_redownload={}",
+            url,
+            normalized_url,
+            epub_path.display(),
+            force_redownload
+        );
+
+        if epub_path.exists() && force_redownload {
+            fs::remove_file(&epub_path)?;
+        }
+
+        if !epub_path.exists() {
+            fs::create_dir_all(EPUB_DIR)?;
+
+            // Use native Rust web2epub module
+            web2epub::convert_url_to_epub(
+                &self.download_client,
+                &normalized_url,
+                &epub_path,
+                &temp_images_dir,
+            )?;
+
+            downloaded = true;
+        }
+
+        // Clean up temp images after EPUB is created
+        if temp_images_dir.exists() {
+            let _ = fs::remove_dir_all(&temp_images_dir);
+        }
+
+        let mut command = std::process::Command::new("bookokrat");
+        command.arg(&epub_path).arg("--zen-mode");
+        self.run_external_tui_command("bookokrat", &mut command)?;
+
+        Ok(downloaded)
     }
 
     fn download_and_open_epub(&mut self, url: &str, cache_id: &str) -> anyhow::Result<bool> {
@@ -2916,6 +3008,23 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                                 Ok(())
                             }
                         }
+                        LoadingType::DownloadNative => {
+                            if app.current_tab == CurrentTab::RssFeed {
+                                app.download_and_open_rss_epub_native()
+                            } else if let Some(idx) = app.virtual_state.selected() {
+                                if let Some(item) = app.items.get(idx) {
+                                    if item.type_str() == "article" {
+                                        app.download_and_open_article_epub_native()
+                                    } else {
+                                        Ok(())
+                                    }
+                                } else {
+                                    Ok(())
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        }
                     };
 
                     match refresh_result {
@@ -3397,6 +3506,12 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                                     LoadingType::Download,
                                 ));
                             }
+                            Char('W') => {
+                                app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
+                                    "Opening reader (native) ⏳".to_string(),
+                                    LoadingType::DownloadNative,
+                                ));
+                            }
                             Char('Z') => {
                                 app.app_mode = AppMode::MulticharNormalModeEnter("Z".to_string());
                             }
@@ -3499,6 +3614,20 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                                                 ));
                                         }
                                         _ => {} // Do nothing for other types
+                                    }
+                                }
+                            }
+                        }
+                        Char('W') => {
+                            // Native Rust web2epub (articles only)
+                            if let Some(idx) = app.virtual_state.selected() {
+                                if let Some(item) = app.items.get(idx) {
+                                    if item.type_str() == "article" {
+                                        app.app_mode =
+                                            AppMode::Refreshing(RefreshingPopup::new(
+                                                "Opening reader (native) ⏳".to_string(),
+                                                LoadingType::DownloadNative,
+                                            ));
                                     }
                                 }
                             }

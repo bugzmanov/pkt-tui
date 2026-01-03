@@ -9,6 +9,7 @@
   │ Tab         Switch tabs      │  │  m    Summarize item        │
   └──────────────────────────────┘  │  Q    Refresh data          │ 
                                     │  w    Open in reader (epub) │
+                                    │  W    Open reader (native)   │
                                     └─────────────────────────────┘
   ┌─ Filters ────────────────────┐                                                                 
   │ /     Search title/URL       │  ┌─ Item Indicators ───────────┐
