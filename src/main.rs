@@ -6,6 +6,7 @@ mod markdown;
 mod prss;
 pub mod raindrop;
 mod readingstats;
+mod summarize;
 mod utils;
 
 use anyhow::Context;
@@ -492,6 +493,66 @@ struct HelpPopupState {
     content: String,
 }
 
+struct SummarizePopupState {
+    url: String,
+    title: String,
+    status_message: String,
+    content: String,
+    is_complete: bool,
+    error: Option<String>,
+    meta: Option<summarize::client::SummarizeMeta>,
+    scroll_offset: usize,
+    total_lines: usize,
+    visible_height: usize,
+}
+
+impl SummarizePopupState {
+    fn new(url: String, title: String) -> Self {
+        Self {
+            url,
+            title,
+            status_message: "Starting summarization...".to_string(),
+            content: String::new(),
+            is_complete: false,
+            error: None,
+            meta: None,
+            scroll_offset: 0,
+            total_lines: 0,
+            visible_height: 0,
+        }
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.total_lines.saturating_sub(self.visible_height)
+    }
+
+    fn scroll_down(&mut self) {
+        self.scroll_offset = (self.scroll_offset + 1).min(self.max_scroll());
+    }
+
+    fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = self.max_scroll();
+    }
+
+    fn scroll_half_page_down(&mut self) {
+        let half_page = self.visible_height / 2;
+        self.scroll_offset = (self.scroll_offset + half_page).min(self.max_scroll());
+    }
+
+    fn scroll_half_page_up(&mut self) {
+        let half_page = self.visible_height / 2;
+        self.scroll_offset = self.scroll_offset.saturating_sub(half_page);
+    }
+}
+
 #[derive(Clone)]
 enum Confirmation {
     DeleteItem,
@@ -628,6 +689,7 @@ enum AppMode {
     CommandEnter(CommandEnterMode),
     Refreshing(RefreshingPopup),
     Error(String),
+    Summarizing(SummarizePopupState),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -845,6 +907,8 @@ struct App {
     raindrop_area: Option<Rect>,
     rss_tab_area: Option<Rect>,
     rss_popup_area: Option<Rect>,
+    summarize_shared_state: Option<summarize::client::SummarizeSharedState>,
+    summarize_token: Option<String>,
 }
 
 impl App {
@@ -899,6 +963,8 @@ impl App {
             raindrop_area: None,
             rss_tab_area: None,
             rss_popup_area: None,
+            summarize_shared_state: None,
+            summarize_token: None,
         })
     }
 
@@ -2142,6 +2208,154 @@ impl App {
         }
     }
 
+    fn start_summarize(&mut self) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        // Get token
+        let token = match self.get_summarize_token()? {
+            Some(t) => t,
+            None => {
+                self.app_mode = AppMode::Error(
+                    "Summarize daemon token not configured. Create 'summarize.token' file."
+                        .to_string(),
+                );
+                return Ok(());
+            }
+        };
+
+        // Get selected item URL
+        let (url, title) = if let Some(idx) = self.virtual_state.selected() {
+            if let Some(item) = self.items.get(idx) {
+                (item.link.clone(), item.title.clone())
+            } else {
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        };
+
+        // Check daemon health first
+        if !summarize::token::check_daemon_health() {
+            self.app_mode =
+                AppMode::Error("Summarize daemon not running at http://127.0.0.1:8787".to_string());
+            return Ok(());
+        }
+
+        // Initialize shared state
+        let shared = summarize::client::SummarizeSharedState::new();
+
+        // Clone Arcs for the background thread
+        let content_arc = shared.content.clone();
+        let status_arc = shared.status.clone();
+        let meta_arc = shared.meta.clone();
+        let error_arc = shared.error.clone();
+        let complete_arc = shared.is_complete.clone();
+        let url_clone = url.clone();
+        let token_clone = token.clone();
+
+        // Start background thread
+        thread::spawn(move || {
+            let client = match summarize::client::SummarizeClient::new(token_clone) {
+                Ok(c) => c,
+                Err(e) => {
+                    if let Ok(mut err) = error_arc.lock() {
+                        *err = Some(format!("Client error: {}", e));
+                    }
+                    complete_arc.store(true, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            // Start summarization
+            let session_id = match client.start_summarize(&url_clone) {
+                Ok(id) => id,
+                Err(e) => {
+                    if let Ok(mut err) = error_arc.lock() {
+                        *err = Some(format!("Failed to start: {}", e));
+                    }
+                    complete_arc.store(true, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            // Stream events
+            if let Err(e) = client.stream_events(
+                &session_id,
+                content_arc,
+                status_arc,
+                meta_arc,
+                error_arc.clone(),
+                complete_arc.clone(),
+            ) {
+                if let Ok(mut err) = error_arc.lock() {
+                    if err.is_none() {
+                        *err = Some(format!("Stream error: {}", e));
+                    }
+                }
+                complete_arc.store(true, Ordering::SeqCst);
+            }
+        });
+
+        // Store shared state
+        self.summarize_shared_state = Some(shared);
+
+        // Switch to summarizing mode
+        self.app_mode = AppMode::Summarizing(SummarizePopupState::new(url, title));
+
+        Ok(())
+    }
+
+    fn get_summarize_token(&mut self) -> anyhow::Result<Option<String>> {
+        if self.summarize_token.is_some() {
+            return Ok(self.summarize_token.clone());
+        }
+
+        let token = summarize::token::get_token()?;
+        self.summarize_token.clone_from(&token);
+        Ok(token)
+    }
+
+    fn update_summarize_state(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        if let AppMode::Summarizing(ref mut popup) = self.app_mode {
+            if let Some(ref shared) = self.summarize_shared_state {
+                // Update content
+                if let Ok(content) = shared.content.lock() {
+                    popup.content.clone_from(&content);
+                }
+
+                // Update status
+                if let Ok(status) = shared.status.lock() {
+                    popup.status_message.clone_from(&status);
+                }
+
+                // Update meta
+                if let Ok(meta) = shared.meta.lock() {
+                    popup.meta.clone_from(&meta);
+                }
+
+                // Check for error
+                if let Ok(error) = shared.error.lock() {
+                    if error.is_some() {
+                        popup.error.clone_from(&error);
+                        popup.is_complete = true;
+                    }
+                }
+
+                // Check completion
+                if shared.is_complete.load(Ordering::SeqCst) {
+                    popup.is_complete = true;
+                }
+            }
+        }
+    }
+
+    fn close_summarize_popup(&mut self) {
+        self.summarize_shared_state = None;
+        self.app_mode = AppMode::Normal;
+    }
+
     fn scroll_down(&mut self) {
         let page_size = 13;
         let current = self.virtual_state.selected().unwrap_or(0);
@@ -2774,6 +2988,104 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                     }
                 }
             }
+            AppMode::Summarizing(ref mut _popup) => {
+                // Update from shared state
+                app.update_summarize_state();
+
+                // Handle input with polling for non-blocking updates
+                if event::poll(Duration::from_millis(100))? {
+                    match event::read()? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    app.close_summarize_popup();
+                                }
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    if let AppMode::Summarizing(ref mut p) = app.app_mode {
+                                        p.scroll_down();
+                                    }
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    if let AppMode::Summarizing(ref mut p) = app.app_mode {
+                                        p.scroll_up();
+                                    }
+                                }
+                                KeyCode::Char('G') => {
+                                    if let AppMode::Summarizing(ref mut p) = app.app_mode {
+                                        p.scroll_to_bottom();
+                                    }
+                                }
+                                KeyCode::Char('g') => {
+                                    if let AppMode::Summarizing(ref mut p) = app.app_mode {
+                                        p.scroll_to_top();
+                                    }
+                                }
+                                KeyCode::Char('d')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    if let AppMode::Summarizing(ref mut p) = app.app_mode {
+                                        p.scroll_half_page_down();
+                                    }
+                                }
+                                KeyCode::Char('u')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    if let AppMode::Summarizing(ref mut p) = app.app_mode {
+                                        p.scroll_half_page_up();
+                                    }
+                                }
+                                KeyCode::Char('y') => {
+                                    if let AppMode::Summarizing(ref p) = app.app_mode {
+                                        if !p.content.is_empty() {
+                                            let _ = cli_clipboard::set_contents(p.content.clone());
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        Event::Mouse(mouse) => {
+                            // Batch scroll events for smooth scrolling
+                            if matches!(
+                                mouse.kind,
+                                MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                            ) {
+                                let mut net_scroll: i32 =
+                                    if mouse.kind == MouseEventKind::ScrollDown {
+                                        1
+                                    } else {
+                                        -1
+                                    };
+
+                                // Drain additional scroll events
+                                while event::poll(Duration::from_millis(0))? {
+                                    match event::read()? {
+                                        Event::Mouse(more_mouse) => match more_mouse.kind {
+                                            MouseEventKind::ScrollDown => net_scroll += 1,
+                                            MouseEventKind::ScrollUp => net_scroll -= 1,
+                                            _ => break,
+                                        },
+                                        _ => break,
+                                    }
+                                }
+
+                                // Apply batched scroll
+                                if let AppMode::Summarizing(ref mut p) = app.app_mode {
+                                    let steps = net_scroll.unsigned_abs() as usize;
+                                    for _ in 0..steps {
+                                        if net_scroll > 0 {
+                                            p.scroll_down();
+                                        } else {
+                                            p.scroll_up();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 }
@@ -3241,6 +3553,9 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                                 app.tag_popup_state = None;
                             }
                         }
+                        Char('m') => {
+                            app.start_summarize()?;
+                        }
                         Char('w') => {
                             if let Some(idx) = app.virtual_state.selected() {
                                 if let Some(item) = app.items.get(idx) {
@@ -3464,6 +3779,9 @@ fn ui(f: &mut Frame, app: &mut App) {
 
         f.render_widget(block, popup_area);
     }
+
+    // Summarize popup - render last to cover everything
+    render_summarize_popup(f, app, f.area());
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -3999,6 +4317,282 @@ fn render_help_popup(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+fn render_summarize_popup(f: &mut Frame, app: &mut App, area: Rect) {
+    if let AppMode::Summarizing(ref popup) = app.app_mode {
+        // Dim overlay on entire screen - fill with dark background
+        let full_area = f.area();
+        // Create lines of spaces to fill the entire area with background color
+        let fill_lines: Vec<Line> = (0..full_area.height)
+            .map(|_| Line::from(" ".repeat(full_area.width as usize)))
+            .collect();
+        let dim_overlay = Paragraph::new(fill_lines)
+            .style(Style::default().bg(Color::Rgb(20, 20, 25)));
+        f.render_widget(dim_overlay, full_area);
+
+        let popup_area = centered_rect(70, 80, area);
+
+        // Clear only the popup area
+        f.render_widget(Clear, popup_area);
+
+        // Status indicator
+        let status_indicator = if popup.is_complete {
+            if popup.error.is_some() {
+                "ERROR"
+            } else {
+                "DONE"
+            }
+        } else {
+            let spinners = ['◐', '◓', '◑', '◒'];
+            let idx = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                / 200) as usize
+                % 4;
+            match spinners[idx] {
+                '◐' => "◐",
+                '◓' => "◓",
+                '◑' => "◑",
+                _ => "◒",
+            }
+        };
+
+        // Meta info for border title (dimmed)
+        let meta_info = popup.meta.as_ref().map_or(String::new(), |m| {
+            let mut parts = Vec::new();
+            if let Some(ref model) = m.model_label {
+                parts.push(model.clone());
+            }
+            if let Some(ref input) = m.input_summary {
+                parts.push(input.clone());
+            }
+            if m.from_cache {
+                parts.push("(cached)".to_string());
+            }
+            parts.join(" | ")
+        });
+
+        // Border title - meta info dimmed
+        let border_title = if meta_info.is_empty() {
+            Line::from(Span::styled(
+                " Summary ",
+                Style::default().fg(OCEANIC_NEXT.base_03),
+            ))
+        } else {
+            Line::from(Span::styled(
+                format!(" {} ", meta_info),
+                Style::default().fg(OCEANIC_NEXT.base_03),
+            ))
+        };
+
+        // Footer hints
+        let footer_text = if popup.is_complete {
+            " ESC: close | j/k/^d/^u: scroll | y: copy | g/G: top/bottom "
+        } else {
+            " ESC: cancel | j/k/^d/^u: scroll "
+        };
+
+        // Single unified block for the entire popup
+        let outer_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(app.colors.footer_border_color))
+            .title(border_title)
+            .title_bottom(Line::from(vec![
+                Span::styled(footer_text, Style::default().fg(OCEANIC_NEXT.base_03)),
+            ]))
+            .style(Style::new().bg(OCEANIC_NEXT.base_00));
+
+        f.render_widget(outer_block, popup_area);
+
+        // Content area (inside the block) with 2 char horizontal margins
+        let content_area = popup_area.inner(Margin::new(3, 1));
+
+        // Split content area: title line at top, then summary content
+        let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)])
+            .split(content_area);
+        let title_area = chunks[0];
+        let text_area = chunks[1];
+
+        // Build title line for inside content area
+        let title_truncated = if popup.title.len() > (title_area.width as usize - 10) {
+            let max_len = (title_area.width as usize).saturating_sub(13);
+            format!("{}...", &popup.title[..max_len.min(popup.title.len())])
+        } else {
+            popup.title.clone()
+        };
+
+        // Title style - green when done, red on error, normal otherwise
+        let title_style = if popup.error.is_some() {
+            Style::default().fg(OCEANIC_NEXT.base_08)
+        } else if popup.is_complete {
+            Style::default().fg(OCEANIC_NEXT.base_0b)
+        } else {
+            Style::default().fg(app.colors.row_fg)
+        };
+
+        let title_line = Line::from(vec![
+            Span::styled(
+                format!("{} ", status_indicator),
+                title_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(&title_truncated, title_style),
+            Span::styled(
+                format!(" - {}", popup.status_message),
+                Style::default().fg(OCEANIC_NEXT.base_03),
+            ),
+        ]);
+
+        let title_widget = Paragraph::new(title_line)
+            .style(Style::new().bg(OCEANIC_NEXT.base_00));
+        f.render_widget(title_widget, title_area);
+
+        // Content text
+        let content_text = if let Some(ref err) = popup.error {
+            format!("Error: {}", err)
+        } else if popup.content.is_empty() {
+            popup.status_message.clone()
+        } else {
+            popup.content.clone()
+        };
+
+        let styled_lines = render_markdown_basic(&content_text, app.colors.row_fg);
+
+        // Reduce text_area width by 1 for the scrollbar
+        let text_render_area = Rect {
+            width: text_area.width.saturating_sub(1),
+            ..text_area
+        };
+
+        // Calculate total wrapped lines by counting each line's wrapped segments
+        let content_width = text_render_area.width as usize;
+        let total_lines: usize = content_text
+            .lines()
+            .map(|line| {
+                if line.is_empty() || content_width == 0 {
+                    1
+                } else {
+                    // Count how many visual lines this text line wraps to
+                    let line_width = line.width();
+                    ((line_width + content_width - 1) / content_width).max(1)
+                }
+            })
+            .sum();
+
+        let visible_height = text_area.height as usize;
+        let scroll_offset = popup.scroll_offset;
+
+        let content_widget = Paragraph::new(styled_lines)
+            .style(Style::new().bg(OCEANIC_NEXT.base_00))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_offset as u16, 0));
+
+        f.render_widget(content_widget, text_render_area);
+
+        // Render scrollbar if content exceeds visible height
+        if total_lines > visible_height {
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .style(Style::default().fg(OCEANIC_NEXT.base_03));
+            let mut scrollbar_state = ScrollbarState::new(total_lines).position(scroll_offset);
+            f.render_stateful_widget(scrollbar, text_area, &mut scrollbar_state);
+        }
+    }
+
+    // Update popup scroll metrics after rendering (for accurate bounds)
+    if let AppMode::Summarizing(ref mut popup) = app.app_mode {
+        let popup_area = centered_rect(70, 80, area);
+        let content_area = popup_area.inner(Margin::new(3, 1));
+        let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)])
+            .split(content_area);
+        let text_area = chunks[1];
+
+        let content_text = if let Some(ref err) = popup.error {
+            format!("Error: {}", err)
+        } else if popup.content.is_empty() {
+            popup.status_message.clone()
+        } else {
+            popup.content.clone()
+        };
+
+        let content_width = text_area.width.saturating_sub(1) as usize;
+        popup.total_lines = content_text
+            .lines()
+            .map(|line| {
+                if line.is_empty() || content_width == 0 {
+                    1
+                } else {
+                    let line_width = line.width();
+                    ((line_width + content_width - 1) / content_width).max(1)
+                }
+            })
+            .sum();
+        popup.visible_height = text_area.height as usize;
+
+        // Clamp scroll offset to valid range
+        let max_scroll = popup.max_scroll();
+        if popup.scroll_offset > max_scroll {
+            popup.scroll_offset = max_scroll;
+        }
+    }
+}
+
+/// Basic markdown to styled text conversion
+fn render_markdown_basic(text: &str, base_color: Color) -> Text<'static> {
+    let mut lines = Vec::new();
+
+    for line in text.lines() {
+        let styled_line = if let Some(header) = line.strip_prefix("# ") {
+            // H1 header
+            Line::from(Span::styled(
+                header.to_string(),
+                Style::default()
+                    .fg(OCEANIC_NEXT.base_0a)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else if let Some(header) = line.strip_prefix("## ") {
+            // H2 header
+            Line::from(Span::styled(
+                header.to_string(),
+                Style::default()
+                    .fg(OCEANIC_NEXT.base_0d)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else if let Some(header) = line.strip_prefix("### ") {
+            // H3 header
+            Line::from(Span::styled(
+                header.to_string(),
+                Style::default()
+                    .fg(OCEANIC_NEXT.base_0c)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else if line.starts_with("- ") || line.starts_with("* ") {
+            // Bullet point
+            Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(line.to_string(), Style::default().fg(base_color)),
+            ])
+        } else if line.starts_with("```") {
+            // Code block marker
+            Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(OCEANIC_NEXT.base_03),
+            ))
+        } else if line.trim().is_empty() {
+            Line::from("")
+        } else {
+            // Regular text
+            Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(base_color),
+            ))
+        };
+
+        lines.push(styled_line);
+    }
+
+    Text::from(lines)
+}
+
 fn render_error_popup(f: &mut Frame, message: &str, area: Rect, colors: &TableColors) {
     let popup_area = centered_rect(60, 20, area);
     f.render_widget(Clear, popup_area);
@@ -4273,7 +4867,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         AppMode::Normal
         | AppMode::MulticharNormalModeEnter(_)
         | AppMode::Refreshing(_)
-        | AppMode::Error(_) => {
+        | AppMode::Error(_)
+        | AppMode::Summarizing(_) => {
             // Different footer content based on current tab
             let (spans, alignment) = if app.current_tab == CurrentTab::RssFeed {
                 // RSS Tab footer

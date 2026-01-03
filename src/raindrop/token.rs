@@ -1,24 +1,49 @@
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-const TOKEN_FILE: &str = "raindrop.token";
+const CONFIG_FILE: &str = "config.toml";
+const LEGACY_TOKEN_FILE: &str = "raindrop.token";
+
+#[derive(Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    raindrop: RaindropConfig,
+}
+
+#[derive(Deserialize, Default)]
+struct RaindropConfig {
+    token: Option<String>,
+}
 
 /// Get the stored Raindrop API token
 pub fn get_token() -> Result<Option<String>> {
-    // First check environment variable
+    // Env var takes precedence
     if let Ok(token) = std::env::var("RAINDROP_API_TOKEN") {
         if !token.is_empty() {
             return Ok(Some(token));
         }
     }
 
-    // Then check file
-    let path = Path::new(TOKEN_FILE);
-    if path.exists() {
-        let token = fs::read_to_string(path)
-            .context("Failed to read token file")?
+    // Check config.toml
+    let config_path = Path::new(CONFIG_FILE);
+    if config_path.exists() {
+        let content = fs::read_to_string(config_path).context("Failed to read config file")?;
+        let config: Config = toml::from_str(&content).context("Failed to parse config file")?;
+        if let Some(token) = config.raindrop.token {
+            if !token.is_empty() {
+                return Ok(Some(token));
+            }
+        }
+    }
+
+    // Fall back to legacy token file for backwards compatibility
+    let legacy_path = Path::new(LEGACY_TOKEN_FILE);
+    if legacy_path.exists() {
+        let token = fs::read_to_string(legacy_path)
+            .context("Failed to read legacy token file")?
             .trim()
             .to_string();
         if !token.is_empty() {
@@ -29,12 +54,6 @@ pub fn get_token() -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Store the Raindrop API token to file
-pub fn store_token(token: &str) -> Result<()> {
-    fs::write(TOKEN_FILE, token.trim()).context("Failed to write token file")?;
-    Ok(())
-}
-
 /// Check if a token exists
 pub fn token_exists() -> bool {
     if std::env::var("RAINDROP_API_TOKEN")
@@ -43,7 +62,17 @@ pub fn token_exists() -> bool {
     {
         return true;
     }
-    Path::new(TOKEN_FILE).exists()
+
+    // Check config.toml
+    if let Ok(content) = fs::read_to_string(CONFIG_FILE) {
+        if let Ok(config) = toml::from_str::<Config>(&content) {
+            if config.raindrop.token.is_some() {
+                return true;
+            }
+        }
+    }
+
+    Path::new(LEGACY_TOKEN_FILE).exists()
 }
 
 /// Prompt the user for their Raindrop API token
@@ -76,11 +105,35 @@ pub fn prompt_for_token() -> Result<String> {
         anyhow::bail!("Token cannot be empty");
     }
 
-    // Store the token
-    store_token(&token)?;
-    println!("Token saved successfully!");
+    // Save to config.toml
+    save_token_to_config(&token)?;
+    println!("Token saved to config.toml!");
 
     Ok(token)
+}
+
+fn save_token_to_config(token: &str) -> Result<()> {
+    // Load existing config as a table or create new
+    let mut config: toml::Table = if Path::new(CONFIG_FILE).exists() {
+        let content = fs::read_to_string(CONFIG_FILE)?;
+        toml::from_str(&content).unwrap_or_default()
+    } else {
+        toml::Table::new()
+    };
+
+    // Get or create raindrop section
+    let raindrop = config
+        .entry("raindrop")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+
+    if let toml::Value::Table(ref mut table) = raindrop {
+        table.insert("token".to_string(), toml::Value::String(token.to_string()));
+    }
+
+    let content = toml::to_string_pretty(&config)?;
+    fs::write(CONFIG_FILE, content)?;
+
+    Ok(())
 }
 
 /// Get existing token or prompt for a new one

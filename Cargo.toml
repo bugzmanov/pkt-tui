@@ -50,6 +50,7 @@ rayon = "1.8"
 dom_smoothie = "0.6.1"
 sanitize-filename = "0.6.0"
 fast_html2md = "0.0.47"
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3.10.1"
