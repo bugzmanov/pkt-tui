@@ -29,7 +29,7 @@ use rayon::prelude::*;
 use readingstats::{render_stats, TotalStats};
 use reqwest::blocking::Client;
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
     error::Error,
     fs::{self, File},
     io::{self, Write},
@@ -120,7 +120,6 @@ pub struct RssFeedState {
     pub is_loading: Arc<Mutex<bool>>,
     pub has_updates: Arc<AtomicBool>,
     pub error: Option<String>,
-    pub items_processed: bool,
     pub per_feed_cache: Arc<Mutex<HashMap<String, Vec<RssFeedItem>>>>,
 }
 
@@ -131,13 +130,8 @@ impl RssFeedState {
             is_loading: Arc::new(Mutex::new(false)),
             has_updates: Arc::new(AtomicBool::new(false)),
             error: None,
-            items_processed: false,
             per_feed_cache: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-    pub fn mark_items_processed(&mut self) {
-        self.items_processed = true;
-        self.has_updates.store(false, Ordering::Relaxed); // Clear the updates flag
     }
 }
 
@@ -894,7 +888,6 @@ struct App {
     mouse_tracker: MouseTracker,
     domain_stats_popup_state: Option<DomainStatsPopupState>,
     help_popup_state: Option<HelpPopupState>,
-    rss_feed_popup_state: Option<RssFeedPopupState>,
     download_client: Client,
     cached_tags: Vec<String>,
     rss_feed_state: RssFeedState,
@@ -906,7 +899,6 @@ struct App {
     tab_bar_hitboxes: Vec<(std::ops::Range<u16>, CurrentTab)>,
     raindrop_area: Option<Rect>,
     rss_tab_area: Option<Rect>,
-    rss_popup_area: Option<Rect>,
     summarize_shared_state: Option<summarize::client::SummarizeSharedState>,
     summarize_token: Option<String>,
     force_redraw: bool,
@@ -952,7 +944,6 @@ impl App {
             domain_stats_popup_state: None,
             help_popup_state: None,
             download_client: Client::new(),
-            rss_feed_popup_state: None,
             cached_tags,
             rss_feed_state: RssFeedState::new(),
             current_tab: CurrentTab::Raindrops,
@@ -963,7 +954,6 @@ impl App {
             tab_bar_hitboxes: Vec::new(),
             raindrop_area: None,
             rss_tab_area: None,
-            rss_popup_area: None,
             summarize_shared_state: None,
             summarize_token: None,
             force_redraw: false,
@@ -1181,8 +1171,6 @@ impl App {
                 *is_loading = true;
             }
         }
-        self.rss_feed_state.items_processed = false;
-
         let client = reqwest::blocking::ClientBuilder::new()
             .timeout(Duration::from_secs(10))
             .build()?;
@@ -1296,42 +1284,12 @@ impl App {
 
         Ok(())
     }
-    pub fn close_rss_feed_popup(&mut self) -> anyhow::Result<()> {
-        if let Some(popup_state) = &self.rss_feed_popup_state {
-            // Check if any changes were made
-            if popup_state.changes_made {
-                // Switch to refreshing mode with proper loading message
-                self.app_mode = AppMode::Refreshing(RefreshingPopup::new(
-                    "Refreshing Raindrop data ⏳".to_string(),
-                    LoadingType::Refresh,
-                ));
-
-                // Mark RSS items as processed
-                self.rss_feed_state.mark_items_processed();
-            }
-
-            // Start a new RSS feed check in the background
-            self.start_rss_feed_loading()?;
-        }
-
-        // Clear the popup state
-        self.rss_feed_popup_state = None;
-        Ok(())
-    }
     fn switch_to_tags_mode(&mut self, initial_tags: Option<String>) {
         self.app_mode = AppMode::CommandEnter(CommandEnterMode::new(
             "Enter tags (comma separated): ".to_string(),
             initial_tags.unwrap_or_default(),
             CommandType::Tags,
         ));
-    }
-    fn process_add_to_raindrop_with_tags(&mut self) -> anyhow::Result<()> {
-        if let Some(popup_state) = &mut self.rss_feed_popup_state {
-            if let Some(_item) = popup_state.prepare_add_to_raindrop() {
-                self.switch_to_tags_mode(None);
-            }
-        }
-        Ok(())
     }
     fn switch_to_edit_tags_mode(&mut self) {
         if let Some(idx) = self.virtual_state.selected() {
@@ -1343,23 +1301,8 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
-    fn complete_add_to_raindrop(&mut self, tags: String) -> anyhow::Result<()> {
-        if let Some(popup_state) = &mut self.rss_feed_popup_state {
-            if let Err(e) = popup_state.add_current_to_raindrop(&self.raindrop_client, &tags) {
-                popup_state.set_status(format!("Error: {}", e));
-            }
-        }
-        Ok(())
-    }
 
     fn update_tags(&mut self, tags: String) -> anyhow::Result<()> {
-        // Handle RSS popup item tags
-        if let Some(popup_state) = &mut self.rss_feed_popup_state {
-            popup_state.add_current_to_raindrop(&self.raindrop_client, &tags)?;
-            return Ok(());
-        }
-
         // Handle RSS tab item tags
         if self.current_tab == CurrentTab::RssFeed
             && self.rss_tab_state.pending_raindrop_item.is_some()
@@ -1441,44 +1384,166 @@ impl App {
     }
 
     fn download_and_open_article_epub(&mut self) -> anyhow::Result<()> {
-        if let Some(idx) = self.virtual_state.selected() {
+        let item = if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
                 if item.type_str() == "article" {
-                    let epub_path = Path::new(EPUB_DIR).join(format!("{}.epub", item.id));
-
-                    if !epub_path.exists() {
-                        fs::create_dir_all(EPUB_DIR)?;
-
-                        let status = std::process::Command::new("bugzarch")
-                            .arg(item.link.as_str())
-                            .arg("--output")
-                            .arg(&epub_path)
-                            .status();
-
-                        let status = match status {
-                            Ok(status) => status,
-                            Err(err) => {
-                                if err.kind() == io::ErrorKind::NotFound {
-                                    return Err(anyhow::anyhow!(
-                                        "bugzarch not available on PATH"
-                                    ));
-                                }
-                                return Err(anyhow::anyhow!("Failed to start bugzarch: {}", err));
-                            }
-                        };
-
-                        if !status.success() {
-                            return Err(anyhow::anyhow!("bugzarch exited with {}", status));
-                        }
-                    }
-
-                    let mut command = std::process::Command::new("bookokrat");
-                    command.arg(&epub_path).arg("--zen-mode");
-                    self.run_external_tui_command("bookokrat", &mut command)?;
+                    Some(item.clone())
+                } else {
+                    None
                 }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(item) = item {
+            let link = item.link.clone();
+            let cache_id = self.make_epub_cache_id(&item.id.to_string());
+            let downloaded = self.download_and_open_epub(&link, &cache_id)?;
+            if downloaded {
+                self.raindrop_client.add_tag(&item, "downloaded")?;
             }
         }
         Ok(())
+    }
+
+    fn download_and_open_rss_epub(&mut self) -> anyhow::Result<()> {
+        if let Some(selected_item) = self
+            .rss_tab_state
+            .items
+            .get(self.rss_tab_state.selected_index)
+        {
+            let link = selected_item.link.clone();
+            let cache_id = self.make_epub_cache_id(&selected_item.item_id);
+            if link.is_empty() {
+                return Ok(());
+            }
+            self.download_and_open_epub(&link, &cache_id)?;
+        }
+        Ok(())
+    }
+
+    fn download_and_open_epub(&mut self, url: &str, cache_id: &str) -> anyhow::Result<bool> {
+        let normalized_url = self.normalize_bugzarch_url(url);
+        let epub_path = Path::new(EPUB_DIR).join(format!("{}.epub", cache_id));
+        let mut downloaded = false;
+        let force_redownload = normalized_url != url;
+        let temp_images_dir = Path::new("temp_images").join(cache_id);
+
+        log::info!(
+            "bugzarch: url='{}' normalized='{}' output='{}' force_redownload={}",
+            url,
+            normalized_url,
+            epub_path.display(),
+            force_redownload
+        );
+
+        if epub_path.exists() && force_redownload {
+            fs::remove_file(&epub_path)?;
+        }
+
+        if !epub_path.exists() {
+            fs::create_dir_all(EPUB_DIR)?;
+
+            let output = std::process::Command::new("bugzarch")
+                .arg(&normalized_url)
+                .arg("--output")
+                .arg(&epub_path)
+                .output();
+
+            let output = match output {
+                Ok(output) => output,
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::NotFound {
+                        return Err(anyhow::anyhow!("bugzarch not available on PATH"));
+                    }
+                    return Err(anyhow::anyhow!("Failed to start bugzarch: {}", err));
+                }
+            };
+
+            if !output.stdout.is_empty() {
+                log::info!("bugzarch stdout: {}", String::from_utf8_lossy(&output.stdout));
+            }
+            if !output.stderr.is_empty() {
+                log::warn!("bugzarch stderr: {}", String::from_utf8_lossy(&output.stderr));
+            }
+
+            if !output.status.success() {
+                return Err(anyhow::anyhow!("bugzarch exited with {}", output.status));
+            }
+            downloaded = true;
+        }
+
+        if temp_images_dir.exists() {
+            let _ = fs::remove_dir_all(&temp_images_dir);
+        }
+
+        let mut command = std::process::Command::new("bookokrat");
+        command.arg(&epub_path).arg("--zen-mode");
+        self.run_external_tui_command("bookokrat", &mut command)?;
+
+        Ok(downloaded)
+    }
+
+    fn normalize_bugzarch_url(&self, url: &str) -> String {
+        let trimmed = url.trim();
+        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            return trimmed.to_string();
+        }
+
+        let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+        let (base, query) = match without_fragment.split_once('?') {
+            Some((base, query)) => (base, Some(query)),
+            None => (without_fragment, None),
+        };
+
+        if base.ends_with('/') {
+            return match query {
+                Some(q) => format!("{}?{}", base, q),
+                None => base.to_string(),
+            };
+        }
+
+        let last_segment = base.rsplit('/').next().unwrap_or("");
+        if last_segment.contains('.') {
+            return match query {
+                Some(q) => format!("{}?{}", base, q),
+                None => base.to_string(),
+            };
+        }
+
+        let mut normalized = format!("{}/", base);
+        if let Some(q) = query {
+            normalized.push('?');
+            normalized.push_str(q);
+        }
+        normalized
+    }
+
+    fn make_epub_cache_id(&self, raw: &str) -> String {
+        let mut sanitized = String::new();
+        for ch in raw.chars() {
+            if ch.is_ascii_alphanumeric() {
+                sanitized.push(ch.to_ascii_lowercase());
+            } else {
+                sanitized.push('_');
+            }
+        }
+        let trimmed = sanitized.trim_matches('_');
+        if trimmed.is_empty() {
+            return format!("item_{:x}", self.hash_id(raw));
+        }
+        trimmed.to_string()
+    }
+
+    fn hash_id(&self, value: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
     }
 
     // /// Checks if a line is a markdown header
@@ -1581,54 +1646,6 @@ impl App {
     //         .collect::<Vec<_>>()
     //         .join("\n\n")
     // }
-
-    pub fn show_rss_feed_popup(&mut self) -> anyhow::Result<()> {
-        if let Ok(is_loading) = self.rss_feed_state.is_loading.lock() {
-            if *is_loading {
-                self.app_mode = AppMode::Error("RSS feed is being updated.".to_string());
-                return Ok(());
-            }
-        }
-        if let Ok(items_guard) = self.rss_feed_state.items.lock() {
-            if items_guard.is_empty() {
-                self.app_mode = AppMode::Error("No RSS updates available (yet)".to_string());
-                return Ok(());
-            }
-        }
-        let visible_items = 33;
-        let items = if let Ok(items_guard) = self.rss_feed_state.items.lock() {
-            items_guard.to_vec()
-        } else {
-            Vec::new()
-        };
-
-        // Create popup state with current items
-        self.rss_feed_popup_state = Some(RssFeedPopupState::new(
-            items,
-            visible_items,
-            self.rss_metadata.clone(),
-        )?);
-
-        // If we need to refresh the items, do it in the background
-        if !self.rss_feed_state.items_processed {
-            self.start_rss_feed_loading()?;
-        }
-
-        Ok(())
-    }
-
-    pub fn handle_rss_feed_selection(&mut self) -> anyhow::Result<()> {
-        if let Some(popup_state) = &self.rss_feed_popup_state {
-            if let Some(selected_item) = popup_state.items.get(popup_state.selected_index) {
-                if !selected_item.link.is_empty() {
-                    webbrowser::open(&selected_item.link)
-                        .context("Failed to open link in browser")?;
-                }
-            }
-        }
-        // self.rss_feed_popup_state = None;
-        Ok(())
-    }
 
     pub fn handle_rss_tab_selection(&mut self) -> anyhow::Result<()> {
         if let Some(selected_item) = self
@@ -2205,6 +2222,19 @@ impl App {
     }
 
     fn start_summarize(&mut self) -> anyhow::Result<()> {
+        let (url, title) = if let Some(idx) = self.virtual_state.selected() {
+            if let Some(item) = self.items.get(idx) {
+                (item.link.clone(), item.title.clone())
+            } else {
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        };
+        self.start_summarize_for(url, title)
+    }
+
+    fn start_summarize_for(&mut self, url: String, title: String) -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
 
         // Get token
@@ -2219,16 +2249,9 @@ impl App {
             }
         };
 
-        // Get selected item URL
-        let (url, title) = if let Some(idx) = self.virtual_state.selected() {
-            if let Some(item) = self.items.get(idx) {
-                (item.link.clone(), item.title.clone())
-            } else {
-                return Ok(());
-            }
-        } else {
+        if url.is_empty() {
             return Ok(());
-        };
+        }
 
         // Check daemon health first
         if !summarize::token::check_daemon_health() {
@@ -2298,6 +2321,17 @@ impl App {
         // Switch to summarizing mode
         self.app_mode = AppMode::Summarizing(SummarizePopupState::new(url, title));
 
+        Ok(())
+    }
+
+    fn start_summarize_rss_tab(&mut self) -> anyhow::Result<()> {
+        if let Some(selected_item) = self
+            .rss_tab_state
+            .items
+            .get(self.rss_tab_state.selected_index)
+        {
+            self.start_summarize_for(selected_item.link.clone(), selected_item.title.clone())?;
+        }
         Ok(())
     }
 
@@ -2486,23 +2520,6 @@ impl App {
             return;
         }
 
-        if let Some(area) = self.rss_popup_area {
-            if self.rss_feed_popup_state.is_some() && Self::point_in_content_area(area, column, row)
-            {
-                if let Some(popup_state) = &mut self.rss_feed_popup_state {
-                    let steps = delta.unsigned_abs();
-                    for _ in 0..steps {
-                        if delta > 0 {
-                            popup_state.move_selection(1);
-                        } else {
-                            popup_state.move_selection(-1);
-                        }
-                    }
-                    return;
-                }
-            }
-        }
-
         if self.current_tab == CurrentTab::RssFeed {
             if let Some(area) = self.rss_tab_area {
                 if Self::point_in_content_area(area, column, row) {
@@ -2546,9 +2563,7 @@ impl App {
             }
         }
 
-        if self.rss_feed_popup_state.is_some() {
-            self.handle_mouse_rss_popup(mouse_event)
-        } else if self.current_tab == CurrentTab::RssFeed {
+        if self.current_tab == CurrentTab::RssFeed {
             self.handle_mouse_rss_tab(mouse_event)
         } else {
             self.handle_mouse_raindrops(mouse_event)
@@ -2642,54 +2657,6 @@ impl App {
             }
             MouseEventKind::ScrollDown => self.rss_tab_state.move_selection(1),
             MouseEventKind::ScrollUp => self.rss_tab_state.move_selection(-1),
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn handle_mouse_rss_popup(&mut self, mouse_event: MouseEvent) -> anyhow::Result<()> {
-        let area = match self.rss_popup_area {
-            Some(area) => area,
-            None => return Ok(()),
-        };
-        match mouse_event.kind {
-            MouseEventKind::Down(event::MouseButton::Left) => {
-                if !Self::point_in_content_area(area, mouse_event.column, mouse_event.row) {
-                    return Ok(());
-                }
-                let click_type = self
-                    .mouse_tracker
-                    .register_click(mouse_event.column, mouse_event.row);
-                if let Some(popup_state) = &mut self.rss_feed_popup_state {
-                    let start_y = area.y.saturating_add(1);
-                    let relative_row = mouse_event.row.saturating_sub(start_y) as usize;
-                    let clicked_row = relative_row + popup_state.scroll_offset;
-                    if clicked_row < popup_state.items.len() {
-                        popup_state.selected_index = clicked_row;
-                        if popup_state.selected_index < popup_state.scroll_offset {
-                            popup_state.scroll_offset = popup_state.selected_index;
-                        } else if popup_state.selected_index
-                            >= popup_state.scroll_offset + popup_state.visible_items
-                        {
-                            popup_state.scroll_offset =
-                                popup_state.selected_index - popup_state.visible_items + 1;
-                        }
-                        if click_type == ClickType::Double {
-                            self.handle_rss_feed_selection()?;
-                        }
-                    }
-                }
-            }
-            MouseEventKind::ScrollDown => {
-                if let Some(popup_state) = &mut self.rss_feed_popup_state {
-                    popup_state.move_selection(1);
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                if let Some(popup_state) = &mut self.rss_feed_popup_state {
-                    popup_state.move_selection(-1);
-                }
-            }
             _ => {}
         }
         Ok(())
@@ -2933,7 +2900,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                     let refresh_result = match pop.refresh_type {
                         LoadingType::Refresh => app.refresh_data(),
                         LoadingType::Download => {
-                            if let Some(idx) = app.virtual_state.selected() {
+                            if app.current_tab == CurrentTab::RssFeed {
+                                app.download_and_open_rss_epub()
+                            } else if let Some(idx) = app.virtual_state.selected() {
                                 if let Some(item) = app.items.get(idx) {
                                     match item.type_str() {
                                         "pdf" => app.download_current_pdf(),
@@ -3360,58 +3329,6 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                         }
                         _ => { /*do nothing */ }
                     }
-                } else if let Some(ref mut popup_state) = app.rss_feed_popup_state {
-                    // Handle multi-char commands first
-                    if let Some(pending) = popup_state.pending_key.take() {
-                        match (pending, key.code) {
-                            ('d', Char('d')) => {
-                                popup_state.hide_current_item()?;
-                                return Ok(());
-                            }
-                            ('g', Char('g')) => {
-                                popup_state.scroll_to_beginning();
-                            }
-                            _ => {
-                                // Invalid sequence, ignore
-                            }
-                        }
-                    } else {
-                        match key.code {
-                            Char('j') | Down => popup_state.move_selection(1),
-                            Char('k') | Up => popup_state.move_selection(-1),
-                            Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                popup_state.page_down();
-                            }
-                            Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                popup_state.page_up();
-                            }
-                            Char('d') => {
-                                popup_state.pending_key = Some('d');
-                            }
-                            Char('g') => {
-                                popup_state.pending_key = Some('g');
-                            }
-                            Char('G') => {
-                                popup_state.scroll_to_end();
-                            }
-                            Char('p') => {
-                                popup_state.show_description = !popup_state.show_description
-                            }
-                            Char('a') => {
-                                app.process_add_to_raindrop_with_tags()?;
-                                return Ok(());
-                            }
-                            Enter => app.handle_rss_feed_selection()?,
-                            Esc => {
-                                if popup_state.show_description {
-                                    popup_state.show_description = false;
-                                } else {
-                                    app.close_rss_feed_popup()?;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
                 } else if app.current_tab == CurrentTab::RssFeed {
                     // RSS Tab input handling
                     let popup_state = &mut app.rss_tab_state;
@@ -3469,6 +3386,15 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                                 app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
                                     "Refreshing ⏳".to_string(),
                                     LoadingType::Refresh,
+                                ));
+                            }
+                            Char('m') => {
+                                app.start_summarize_rss_tab()?;
+                            }
+                            Char('w') => {
+                                app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
+                                    "Opening reader ⏳".to_string(),
+                                    LoadingType::Download,
                                 ));
                             }
                             Char('Z') => {
@@ -3590,11 +3516,6 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                             app.show_domain_stats();
                         }
                         Char('i') => app.show_doc_type_popup(),
-                        Char('n') => {
-                            if app.rss_feed_popup_state.is_none() {
-                                app.show_rss_feed_popup()?;
-                            }
-                        }
                         Char('b') => {
                             match app.handle_neovim_edit() {
                                 Ok(Some(_content)) => {
@@ -3666,7 +3587,6 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.current_tab == CurrentTab::Raindrops {
         render_domain_stats_popup(f, app, rects[1]);
         render_help_popup(f, app, rects[1]);
-        render_rss_feed_popup(f, app, rects[1]); //todo: move if out of render
     }
 
     if let AppMode::Error(message) = &app.app_mode {
@@ -4627,238 +4547,6 @@ fn render_error_popup(f: &mut Frame, message: &str, area: Rect, colors: &TableCo
         .alignment(Alignment::Center);
 
     f.render_widget(error_widget, popup_area);
-}
-
-fn render_rss_feed_popup(f: &mut Frame, app: &mut App, area: Rect) {
-    if let Some(popup_state) = &app.rss_feed_popup_state {
-        let popup_area = centered_rect(80, 80, area);
-        app.rss_popup_area = Some(popup_area);
-        f.render_widget(Clear, popup_area);
-        // Calculate areas for main content and status bar
-        let chunks = Layout::vertical([
-            Constraint::Min(3),    // Main content
-            Constraint::Length(1), // Status bar
-        ])
-        .split(popup_area);
-        // Group items by source and count them
-        let mut source_counts = std::collections::HashMap::new();
-        for item in &popup_state.items {
-            *source_counts.entry(&item.source).or_insert(0) += 1;
-        }
-        let source_column_width = source_counts
-            .iter()
-            .map(|(source, count)| format!(" {} ({})", source, count).width())
-            .max()
-            .unwrap_or(0);
-
-        // Keep track of which sources we've seen while rendering
-        let mut seen_sources = std::collections::HashSet::new();
-
-        let items: Vec<ListItem> = popup_state
-            .items
-            .iter()
-            .skip(popup_state.scroll_offset)
-            .take(popup_state.visible_items)
-            .enumerate()
-            .map(|(i, item)| {
-                // Show source info only if we haven't seen this source yet
-                let source_column = if !seen_sources.contains(&item.source) {
-                    seen_sources.insert(&item.source);
-                    let count = source_counts.get(&item.source).unwrap_or(&0);
-                    format!(" {} ({})", item.source, count)
-                } else {
-                    String::new()
-                };
-
-                let is_existing = item
-                    .matched_tags
-                    .as_ref()
-                    .map(|tags| !tags.is_empty())
-                    .unwrap_or(false);
-                let mut display_title = item.title.clone();
-                if let Some(tags) = &item.matched_tags {
-                    if !tags.is_empty() {
-                        let suffix = tags.iter().map(|t| format!("[{}]", t)).collect::<String>();
-                        display_title.push(' ');
-                        display_title.push_str(&suffix);
-                    }
-                }
-                let title_style = if is_existing {
-                    Style::default()
-                        .fg(OCEANIC_NEXT.base_04)
-                        .add_modifier(Modifier::DIM)
-                } else {
-                    Style::default().fg(OCEANIC_NEXT.base_05)
-                };
-
-                let date_and_title = if let Some(pub_date) = &item.pub_date {
-                    vec![
-                        Span::styled(
-                            format!("{:<10}", &pub_date[0..10]),
-                            Style::default().fg(OCEANIC_NEXT.base_03), // Gray for date
-                        ),
-                        Span::raw(": "),
-                        Span::styled(display_title, title_style),
-                    ]
-                } else {
-                    vec![
-                        Span::styled(
-                            format!("{:<10}", "unknown"),
-                            Style::default().fg(OCEANIC_NEXT.base_03),
-                        ),
-                        Span::raw(": "),
-                        Span::styled(display_title, title_style),
-                    ]
-                };
-
-                let padded_source = if source_column_width == 0 {
-                    String::new()
-                } else {
-                    let width = source_column_width;
-                    let current_width = UnicodeWidthStr::width(source_column.as_str());
-                    if current_width >= width {
-                        source_column.clone()
-                    } else {
-                        let mut s = source_column.clone();
-                        s.push_str(&" ".repeat(width - current_width));
-                        s
-                    }
-                };
-
-                let source_span = Span::styled(
-                    padded_source,
-                    Style::default().fg(OCEANIC_NEXT.base_0d), // Distinct color for source
-                );
-
-                let content = Line::from(
-                    [
-                        vec![
-                            source_span,
-                            Span::raw("│ "), // Table separator
-                        ],
-                        date_and_title,
-                    ]
-                    .concat(),
-                );
-
-                let style = if i + popup_state.scroll_offset == popup_state.selected_index {
-                    Style::default().fg(Color::Black).bg(Color::White)
-                } else {
-                    Style::default()
-                };
-
-                ListItem::new(vec![content]).style(style)
-            })
-            .collect();
-
-        let feed_list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" RSS Feeds ")
-                    .border_style(Style::new().fg(app.colors.footer_border_color))
-                    .border_type(BorderType::Rounded),
-            )
-            .style(Style::new().bg(Color::Black));
-
-        f.render_widget(feed_list, popup_area);
-
-        let scrollbar = Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("↑".into()))
-            .end_symbol(Some("↓".into()));
-
-        let mut scroll_state =
-            ScrollbarState::new(popup_state.items.len()).position(popup_state.scroll_offset);
-
-        f.render_stateful_widget(scrollbar, popup_area, &mut scroll_state);
-        if popup_state.show_description {
-            if let Some(selected_item) = popup_state.items.get(popup_state.selected_index) {
-                let desc_popup_area = centered_rect(70, 40, f.area());
-                f.render_widget(Clear, desc_popup_area);
-
-                let description = selected_item
-                    .description
-                    .as_deref()
-                    .unwrap_or("No description available");
-
-                // Wrap text to fit popup width
-                let max_width = (desc_popup_area.width as usize).saturating_sub(4);
-                // let wrapped_text = textwrap::fill(description, max_width);
-
-                let wrapped_text = description
-                    .split_whitespace()
-                    .fold((String::new(), 0), |(mut text, len), word| {
-                        if len + word.len() + 1 > max_width {
-                            text.push('\n');
-                            (text + word, word.len())
-                        } else if text.is_empty() {
-                            (word.to_string(), word.len())
-                        } else {
-                            (text + " " + word, len + word.len() + 1)
-                        }
-                    })
-                    .0;
-
-                let text = Text::from(vec![
-                    Line::from(vec![
-                        Span::styled("Title: ", Style::default().fg(OCEANIC_NEXT.base_0d)),
-                        Span::styled(
-                            &selected_item.title,
-                            Style::default().fg(OCEANIC_NEXT.base_05),
-                        ),
-                    ]),
-                    Line::from(""),
-                    Line::from(vec![
-                        Span::styled("Source: ", Style::default().fg(OCEANIC_NEXT.base_0d)),
-                        Span::styled(
-                            &selected_item.source,
-                            Style::default().fg(OCEANIC_NEXT.base_05),
-                        ),
-                    ]),
-                    Line::from(""),
-                    Line::from(vec![Span::styled(
-                        "Description:",
-                        Style::default().fg(OCEANIC_NEXT.base_0d),
-                    )]),
-                    Line::from(""),
-                    Line::from(vec![Span::styled(
-                        wrapped_text,
-                        Style::default().fg(OCEANIC_NEXT.base_05),
-                    )]),
-                ]);
-
-                let description_widget = Paragraph::new(text)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Article Preview ")
-                            .border_style(Style::new().fg(app.colors.footer_border_color))
-                            .border_type(BorderType::Rounded),
-                    )
-                    .style(Style::new().bg(Color::Black))
-                    .wrap(Wrap { trim: true })
-                    .scroll((0, 0));
-
-                f.render_widget(description_widget, desc_popup_area);
-            }
-        }
-        if let Some((message, timestamp)) = &popup_state.status_message {
-            if timestamp.elapsed() < Duration::from_secs(5) {
-                // Show message for 5 seconds
-                let status_text = Text::from(Line::from(vec![Span::styled(
-                    message,
-                    Style::default().fg(OCEANIC_NEXT.base_0b), // Green for success
-                )]));
-
-                let status_widget = Paragraph::new(status_text)
-                    .style(Style::default().bg(Color::Black))
-                    .alignment(Alignment::Center);
-
-                f.render_widget(status_widget, chunks[1]);
-            }
-        }
-    }
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {

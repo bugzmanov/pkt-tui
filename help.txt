@@ -6,8 +6,9 @@
   │ gg          Jump to start    │  │  f/F  Favorite & archive    │
   │ G           Jump to end      │  │  d    Delete article        │
   │ gd          Jump to date     │  │  r/R  Rename article        │ 
+  │ Tab         Switch tabs      │  │  m    Summarize item        │
   └──────────────────────────────┘  │  Q    Refresh data          │ 
-                                    │  w    Download & rename pdf │
+                                    │  w    Open in reader (epub) │
                                     └─────────────────────────────┘
   ┌─ Filters ────────────────────┐                                                                 
   │ /     Search title/URL       │  ┌─ Item Indicators ───────────┐

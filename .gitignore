@@ -9,6 +9,7 @@ hidden_rss_items.txt
 subscriptions
 raindrop.token
 config.toml
+epubs/
 
 raindrop_data.json
 raindrop_delta.jsonl
