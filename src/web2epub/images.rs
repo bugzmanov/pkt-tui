@@ -85,14 +85,23 @@ fn fetch_image_to_file(
     temp_dir: &Path,
     file_index: usize,
 ) -> Option<String> {
-    let response = client
+    log::debug!("Fetching image: {}", image_url);
+
+    let response = match client
         .get(image_url)
         .header("User-Agent", "pkt-tui-web2epub/0.1")
         .header("Accept", "image/*")
         .send()
-        .ok()?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("Failed to fetch image {}: {}", image_url, e);
+            return None;
+        }
+    };
 
     if !response.status().is_success() {
+        log::warn!("Image fetch failed with status {}: {}", response.status(), image_url);
         return None;
     }
 
@@ -103,7 +112,13 @@ fn fetch_image_to_file(
         .unwrap_or("");
 
     let mime_type = content_type.split(';').next().unwrap_or("").trim();
-    let extension = extension_from_mime(mime_type)?;
+    let extension = match extension_from_mime(mime_type) {
+        Some(ext) => ext,
+        None => {
+            log::warn!("Unknown image MIME type '{}' for {}", mime_type, image_url);
+            return None;
+        }
+    };
 
     let bytes = response.bytes().ok()?;
     let filename = format!("remote-image-{}.{}", file_index, extension);
@@ -163,6 +178,8 @@ pub fn normalize_images(
             }
         };
 
+        log::debug!("Processing image src: {}", src);
+
         let local_filename = if src.starts_with("data:") {
             // Handle data URL
             if let Some((data, ext)) = parse_data_url(src) {
@@ -192,6 +209,8 @@ pub fn normalize_images(
                     .map(|u| u.to_string())
                     .unwrap_or_else(|| src.to_string())
             };
+
+            log::debug!("Resolved absolute URL: {}", absolute_url);
 
             // Check if URL has a known image extension
             let url_ext = get_url_image_extension(&absolute_url);
@@ -228,25 +247,53 @@ pub fn normalize_images(
             continue;
         }
 
+        // The HTML might have HTML-encoded URLs (e.g., &amp; instead of &)
+        // We need to try both the decoded and encoded versions
+        let original_src = &img_info.original_src;
+        let encoded_src = original_src.replace('&', "&amp;");
+
         match &img_info.local_filename {
             Some(filename) => {
                 // Replace the original src with the local filename
                 // For EPUB, we'll reference images by their filename
+
+                // Try decoded version
                 result = result.replace(
-                    &format!("src=\"{}\"", img_info.original_src),
+                    &format!("src=\"{}\"", original_src),
                     &format!("src=\"{}\"", filename),
                 );
                 result = result.replace(
-                    &format!("src='{}'", img_info.original_src),
+                    &format!("src='{}'", original_src),
                     &format!("src='{}'", filename),
                 );
-                // Also handle data-src
+
+                // Try HTML-encoded version
                 result = result.replace(
-                    &format!("data-src=\"{}\"", img_info.original_src),
+                    &format!("src=\"{}\"", encoded_src),
                     &format!("src=\"{}\"", filename),
                 );
                 result = result.replace(
-                    &format!("data-src='{}'", img_info.original_src),
+                    &format!("src='{}'", encoded_src),
+                    &format!("src='{}'", filename),
+                );
+
+                // Also handle data-src (decoded)
+                result = result.replace(
+                    &format!("data-src=\"{}\"", original_src),
+                    &format!("src=\"{}\"", filename),
+                );
+                result = result.replace(
+                    &format!("data-src='{}'", original_src),
+                    &format!("src='{}'", filename),
+                );
+
+                // data-src (encoded)
+                result = result.replace(
+                    &format!("data-src=\"{}\"", encoded_src),
+                    &format!("src=\"{}\"", filename),
+                );
+                result = result.replace(
+                    &format!("data-src='{}'", encoded_src),
                     &format!("src='{}'", filename),
                 );
             }
@@ -254,11 +301,19 @@ pub fn normalize_images(
                 // Remove the image - we'll do this by replacing the img tag
                 // For now, set src to empty (image won't display)
                 result = result.replace(
-                    &format!("src=\"{}\"", img_info.original_src),
+                    &format!("src=\"{}\"", original_src),
                     "src=\"\"",
                 );
                 result = result.replace(
-                    &format!("src='{}'", img_info.original_src),
+                    &format!("src=\"{}\"", encoded_src),
+                    "src=\"\"",
+                );
+                result = result.replace(
+                    &format!("src='{}'", original_src),
+                    "src=''",
+                );
+                result = result.replace(
+                    &format!("src='{}'", encoded_src),
                     "src=''",
                 );
             }

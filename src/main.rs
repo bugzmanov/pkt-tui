@@ -8,7 +8,8 @@ pub mod raindrop;
 mod readingstats;
 mod summarize;
 mod utils;
-mod web2epub;
+
+use pkt_tui::web2epub;
 
 use anyhow::Context;
 use chrono::Local;
