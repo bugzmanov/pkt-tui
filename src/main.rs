@@ -19,7 +19,6 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use dom_smoothie::{Article, Config, Readability};
 use log::{error, LevelFilter};
 use prss::{
     metadata::{load_shared_store, SharedMetadataStore},
@@ -55,6 +54,7 @@ const PALETTES: [tailwind::Palette; 4] = [
 ];
 const INFO_TEXT: &str = "(ZZ) quit | gg/G/j/k  - start,end,↓,↑ | ? - Help";
 const ITEM_HEIGHT: usize = 3;
+const EPUB_DIR: &str = "epubs";
 pub struct Base16Palette {
     pub base_00: Color,
     pub base_01: Color,
@@ -909,6 +909,7 @@ struct App {
     rss_popup_area: Option<Rect>,
     summarize_shared_state: Option<summarize::client::SummarizeSharedState>,
     summarize_token: Option<String>,
+    force_redraw: bool,
 }
 
 impl App {
@@ -965,6 +966,7 @@ impl App {
             rss_popup_area: None,
             summarize_shared_state: None,
             summarize_token: None,
+            force_redraw: false,
         })
     }
 
@@ -1046,6 +1048,59 @@ impl App {
         io::stdout().flush()?;
 
         result
+    }
+
+    fn run_external_tui_command(
+        &mut self,
+        command_name: &str,
+        command: &mut std::process::Command,
+    ) -> anyhow::Result<()> {
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        let status_result = command.status();
+
+        enable_raw_mode()?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+
+        crossterm::queue!(
+            io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        )?;
+        io::stdout().flush()?;
+        self.force_redraw = true;
+
+        let status = match status_result {
+            Ok(status) => status,
+            Err(err) => {
+                if err.kind() == io::ErrorKind::NotFound {
+                    return Err(anyhow::anyhow!(
+                        "{} not available on PATH",
+                        command_name
+                    ));
+                }
+                return Err(anyhow::anyhow!(
+                    "Failed to start {}: {}",
+                    command_name,
+                    err
+                ));
+            }
+        };
+
+        if !status.success() {
+            return Err(anyhow::anyhow!(
+                "{} exited with {}",
+                command_name,
+                status
+            ));
+        }
+
+        Ok(())
     }
 
     //// ------- tmux based popup. working but requires tmux
@@ -1385,100 +1440,41 @@ impl App {
         Ok(())
     }
 
-    fn download_and_convert_article(&mut self) -> anyhow::Result<()> {
+    fn download_and_open_article_epub(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
                 if item.type_str() == "article" {
-                    // Create articles directory if it doesn't exist
-                    fs::create_dir_all("articles")?;
+                    let epub_path = Path::new(EPUB_DIR).join(format!("{}.epub", item.id));
 
-                    // Create sanitized filename from title
-                    // let title = item.title();
-                    // let filename = sanitize_filename::sanitize(title); //sanitazie_filename might be redundant dependency
-                    let filename = item.id.to_string();
-                    let path = Path::new("articles").join(format!("{}.md", filename));
+                    if !epub_path.exists() {
+                        fs::create_dir_all(EPUB_DIR)?;
 
-                    // Download the article content
-                    let response = self.download_client
-                                        .get(item.link.as_str())
-                                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
-                                        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-                                        .header("Accept-Language", "en-US,en;q=0.5")
-                                        .header("Connection", "keep-alive")
-                                        .header("Upgrade-Insecure-Requests", "1")
-                                        .header("Sec-Fetch-Dest", "document")
-                                        .header("Sec-Fetch-Mode", "navigate")
-                                        .header("Sec-Fetch-Site", "none")
-                                        .header("Sec-Fetch-User", "?1")
-                                        .send()?;
-                    let status = response.status();
-                    let html_content = response
-                        .text()
-                        .unwrap_or_else(|_| "No response body".to_string());
-                    if !status.is_success() {
-                        return Err(anyhow::anyhow!(
-                            "Failed to download article: HTTP {} - {}",
-                            status,
-                            html_content
-                        ));
+                        let status = std::process::Command::new("bugzarch")
+                            .arg(item.link.as_str())
+                            .arg("--output")
+                            .arg(&epub_path)
+                            .status();
+
+                        let status = match status {
+                            Ok(status) => status,
+                            Err(err) => {
+                                if err.kind() == io::ErrorKind::NotFound {
+                                    return Err(anyhow::anyhow!(
+                                        "bugzarch not available on PATH"
+                                    ));
+                                }
+                                return Err(anyhow::anyhow!("Failed to start bugzarch: {}", err));
+                            }
+                        };
+
+                        if !status.success() {
+                            return Err(anyhow::anyhow!("bugzarch exited with {}", status));
+                        }
                     }
-                    let md = html2md::rewrite_html(&html_content, true);
 
-                    // Configure and parse with dom_smoothie
-                    let cfg = Config {
-                        max_elements_to_parse: 9000,
-                        text_mode: dom_smoothie::TextMode::Formatted,
-                        ..Default::default()
-                    };
-
-                    let mut readability = Readability::new(
-                        html_content.as_str(),
-                        Some(item.link.as_str()),
-                        Some(cfg),
-                    )?;
-                    // Readability::new(md.as_str(), Some(item.link.as_str()), Some(cfg))?;
-                    let article: Article = readability.parse()?;
-
-                    // Create markdown content with metadata and article details
-                    let mut content = String::new();
-
-                    // Add YAML frontmatter
-                    // content.push_str("---\n");
-                    // content.push_str(&format!("title: {}\n", article.title));
-                    // content.push_str(&format!("url: {}\n", item.link));
-                    // content.push_str(&format!("date_added: {}\n", item.date()));
-
-                    // // Add optional metadata if available
-                    // if let Some(byline) = article.byline {
-                    //     content.push_str(&format!("author: {}\n", byline));
-                    // }
-                    // if let Some(site_name) = article.site_name {
-                    //     content.push_str(&format!("site_name: {}\n", site_name));
-                    // }
-                    // if let Some(published_time) = article.published_time {
-                    //     content.push_str(&format!("published_time: {}\n", published_time));
-                    // }
-                    // if let Some(modified_time) = article.modified_time {
-                    //     content.push_str(&format!("modified_time: {}\n", modified_time));
-                    // }
-                    // if let Some(excerpt) = article.excerpt {
-                    //     content.push_str(&format!("excerpt: {}\n", excerpt));
-                    // }
-                    // content.push_str("---\n\n");
-
-                    // Add article content
-                    let result = markdown::normalize_markdown(&md, &article.text_content);
-                    content.push_str(&article.text_content);
-                    content.push_str("--------\n\n");
-                    content.push_str(&md);
-                    content.push_str("--------\n\n");
-                    content.push_str(&result);
-
-                    // Save to file
-                    fs::write(&path, content)?;
-
-                    // Mark as downloaded by adding a tag
-                    self.raindrop_client.add_tag(item, "downloaded")?;
+                    let mut command = std::process::Command::new("bookokrat");
+                    command.arg(&epub_path).arg("--zen-mode");
+                    self.run_external_tui_command("bookokrat", &mut command)?;
                 }
             }
         }
@@ -2899,6 +2895,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Result<()> {
     loop {
+        if app.force_redraw {
+            terminal.clear().context("Failed to clear terminal")?;
+            app.force_redraw = false;
+        }
         terminal
             .draw(|f| ui(f, &mut app))
             .context("Failed to draw UI")?;
@@ -2937,7 +2937,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                                 if let Some(item) = app.items.get(idx) {
                                     match item.type_str() {
                                         "pdf" => app.download_current_pdf(),
-                                        "article" => app.download_and_convert_article(),
+                                        "article" => app.download_and_open_article_epub(),
                                         _ => Ok(()),
                                     }
                                 } else {
@@ -3563,7 +3563,7 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                                         "pdf" | "article" => {
                                             let message = match item.type_str() {
                                                 "pdf" => "Downloading pdf ⏳",
-                                                "article" => "Downloading article ⏳",
+                                                "article" => "Opening reader ⏳",
                                                 _ => unreachable!(),
                                             };
                                             app.app_mode =
