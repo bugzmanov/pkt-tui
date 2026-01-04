@@ -134,8 +134,66 @@ fn fetch_image_to_file(
 struct ImageInfo {
     /// Original src or data-src value
     original_src: String,
+    /// Attribute name where the original src was found
+    source_attr: String,
+    /// Optional placeholder src attribute value
+    placeholder_src: Option<String>,
     /// Local filename after processing (None if removed)
     local_filename: Option<String>,
+}
+
+#[derive(Debug)]
+struct ImageSource {
+    attr_name: &'static str,
+    raw_value: String,
+    resolved_value: String,
+    placeholder_src: Option<String>,
+}
+
+fn first_src_from_srcset(srcset: &str) -> Option<String> {
+    let first_entry = srcset.split(',').next()?.trim();
+    let url = first_entry.split_whitespace().next()?.trim();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
+fn pick_image_source(element: &scraper::ElementRef<'_>) -> Option<ImageSource> {
+    let placeholder_src = element.value().attr("src").map(|s| s.to_string());
+
+    let candidates = [
+        "data-src",
+        "data-original",
+        "data-lazy-src",
+        "data-srcset",
+        "srcset",
+        "src",
+    ];
+
+    for attr_name in candidates {
+        if let Some(raw_value) = element.value().attr(attr_name) {
+            if raw_value.is_empty() {
+                continue;
+            }
+
+            let resolved_value = if attr_name.ends_with("srcset") {
+                first_src_from_srcset(raw_value)?
+            } else {
+                raw_value.to_string()
+            };
+
+            return Some(ImageSource {
+                attr_name,
+                raw_value: raw_value.to_string(),
+                resolved_value,
+                placeholder_src: placeholder_src.clone(),
+            });
+        }
+    }
+
+    None
 }
 
 /// Normalizes images in HTML content.
@@ -162,27 +220,20 @@ pub fn normalize_images(
 
     // First pass: collect all images and process them
     for element in document.select(&img_selector) {
-        let src = element
-            .value()
-            .attr("src")
-            .or_else(|| element.value().attr("data-src"));
-
-        let src = match src {
-            Some(s) if !s.is_empty() => s,
-            _ => {
-                images.push(ImageInfo {
-                    original_src: String::new(),
-                    local_filename: None,
-                });
-                continue;
-            }
+        let source = match pick_image_source(&element) {
+            Some(source) => source,
+            None => continue,
         };
 
-        log::debug!("Processing image src: {}", src);
+        log::debug!(
+            "Processing image src ({}): {}",
+            source.attr_name,
+            source.resolved_value
+        );
 
-        let local_filename = if src.starts_with("data:") {
+        let local_filename = if source.resolved_value.starts_with("data:") {
             // Handle data URL
-            if let Some((data, ext)) = parse_data_url(src) {
+            if let Some((data, ext)) = parse_data_url(&source.resolved_value) {
                 let filename = format!("data-image-{}.{}", data_index, ext);
                 let file_path = temp_dir.join(&filename);
                 data_index += 1;
@@ -194,20 +245,22 @@ pub fn normalize_images(
             } else {
                 None
             }
-        } else if src.starts_with("blob:") {
+        } else if source.resolved_value.starts_with("blob:") {
             // Remove blob URLs - cannot be processed
             None
         } else {
             // Handle remote URL
-            let absolute_url = if src.starts_with("http://") || src.starts_with("https://") {
-                src.to_string()
+            let absolute_url = if source.resolved_value.starts_with("http://")
+                || source.resolved_value.starts_with("https://")
+            {
+                source.resolved_value.to_string()
             } else {
                 // Resolve relative URL
                 Url::parse(base_url)
                     .ok()
-                    .and_then(|base| base.join(src).ok())
+                    .and_then(|base| base.join(&source.resolved_value).ok())
                     .map(|u| u.to_string())
-                    .unwrap_or_else(|| src.to_string())
+                    .unwrap_or_else(|| source.resolved_value.to_string())
             };
 
             log::debug!("Resolved absolute URL: {}", absolute_url);
@@ -232,7 +285,9 @@ pub fn normalize_images(
         };
 
         images.push(ImageInfo {
-            original_src: src.to_string(),
+            original_src: source.raw_value,
+            source_attr: source.attr_name.to_string(),
+            placeholder_src: source.placeholder_src,
             local_filename,
         });
     }
@@ -250,6 +305,7 @@ pub fn normalize_images(
         // The HTML might have HTML-encoded URLs (e.g., &amp; instead of &)
         // We need to try both the decoded and encoded versions
         let original_src = &img_info.original_src;
+        let source_attr = &img_info.source_attr;
         let encoded_src = original_src.replace('&', "&amp;");
 
         match &img_info.local_filename {
@@ -259,61 +315,63 @@ pub fn normalize_images(
 
                 // Try decoded version
                 result = result.replace(
-                    &format!("src=\"{}\"", original_src),
+                    &format!("{}=\"{}\"", source_attr, original_src),
                     &format!("src=\"{}\"", filename),
                 );
                 result = result.replace(
-                    &format!("src='{}'", original_src),
+                    &format!("{}='{}'", source_attr, original_src),
                     &format!("src='{}'", filename),
                 );
 
                 // Try HTML-encoded version
                 result = result.replace(
-                    &format!("src=\"{}\"", encoded_src),
+                    &format!("{}=\"{}\"", source_attr, encoded_src),
                     &format!("src=\"{}\"", filename),
                 );
                 result = result.replace(
-                    &format!("src='{}'", encoded_src),
+                    &format!("{}='{}'", source_attr, encoded_src),
                     &format!("src='{}'", filename),
                 );
 
-                // Also handle data-src (decoded)
-                result = result.replace(
-                    &format!("data-src=\"{}\"", original_src),
-                    &format!("src=\"{}\"", filename),
-                );
-                result = result.replace(
-                    &format!("data-src='{}'", original_src),
-                    &format!("src='{}'", filename),
-                );
-
-                // data-src (encoded)
-                result = result.replace(
-                    &format!("data-src=\"{}\"", encoded_src),
-                    &format!("src=\"{}\"", filename),
-                );
-                result = result.replace(
-                    &format!("data-src='{}'", encoded_src),
-                    &format!("src='{}'", filename),
-                );
+                if source_attr != "src" {
+                    if let Some(placeholder_src) = &img_info.placeholder_src {
+                        let encoded_placeholder = placeholder_src.replace('&', "&amp;");
+                        result = result.replace(
+                            &format!("src=\"{}\"", placeholder_src),
+                            &format!("src=\"{}\"", filename),
+                        );
+                        result = result.replace(
+                            &format!("src='{}'", placeholder_src),
+                            &format!("src='{}'", filename),
+                        );
+                        result = result.replace(
+                            &format!("src=\"{}\"", encoded_placeholder),
+                            &format!("src=\"{}\"", filename),
+                        );
+                        result = result.replace(
+                            &format!("src='{}'", encoded_placeholder),
+                            &format!("src='{}'", filename),
+                        );
+                    }
+                }
             }
             None => {
                 // Remove the image - we'll do this by replacing the img tag
                 // For now, set src to empty (image won't display)
                 result = result.replace(
-                    &format!("src=\"{}\"", original_src),
+                    &format!("{}=\"{}\"", source_attr, original_src),
                     "src=\"\"",
                 );
                 result = result.replace(
-                    &format!("src=\"{}\"", encoded_src),
+                    &format!("{}=\"{}\"", source_attr, encoded_src),
                     "src=\"\"",
                 );
                 result = result.replace(
-                    &format!("src='{}'", original_src),
+                    &format!("{}='{}'", source_attr, original_src),
                     "src=''",
                 );
                 result = result.replace(
-                    &format!("src='{}'", encoded_src),
+                    &format!("{}='{}'", source_attr, encoded_src),
                     "src=''",
                 );
             }

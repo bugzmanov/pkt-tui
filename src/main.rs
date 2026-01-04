@@ -4508,11 +4508,8 @@ fn render_summarize_popup(f: &mut Frame, app: &mut App, area: Rect) {
 
         let styled_lines = render_markdown_basic(&content_text, app.colors.row_fg);
 
-        // Reduce text_area width by 1 for the scrollbar
-        let text_render_area = Rect {
-            width: text_area.width.saturating_sub(1),
-            ..text_area
-        };
+        // Render text at full width; scrollbar will sit on the border column.
+        let text_render_area = text_area;
 
         // Calculate total wrapped lines by counting each line's wrapped segments
         let content_width = text_render_area.width as usize;
@@ -4541,10 +4538,19 @@ fn render_summarize_popup(f: &mut Frame, app: &mut App, area: Rect) {
 
         // Render scrollbar if content exceeds visible height
         if total_lines > visible_height {
+            let scrollbar_area = Rect {
+                x: popup_area.x + popup_area.width.saturating_sub(1),
+                y: text_area.y,
+                width: 1,
+                height: text_area.height,
+            };
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .style(Style::default().fg(OCEANIC_NEXT.base_03));
+                .track_symbol(Some("│"))
+                .thumb_symbol("█")
+                .track_style(Style::default().fg(app.colors.footer_border_color))
+                .thumb_style(Style::default().fg(OCEANIC_NEXT.base_05));
             let mut scrollbar_state = ScrollbarState::new(total_lines).position(scroll_offset);
-            f.render_stateful_widget(scrollbar, text_area, &mut scrollbar_state);
+            f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
         }
     }
 
@@ -4564,7 +4570,7 @@ fn render_summarize_popup(f: &mut Frame, app: &mut App, area: Rect) {
             popup.content.clone()
         };
 
-        let content_width = text_area.width.saturating_sub(1) as usize;
+        let content_width = text_area.width as usize;
         popup.total_lines = content_text
             .lines()
             .map(|line| {

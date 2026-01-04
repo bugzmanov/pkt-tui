@@ -202,7 +202,7 @@ pub fn load_raindrop_delta() -> Vec<RaindropUpdate> {
                     Ok(json_str) => {
                         debug!(
                             "Parsing delta line: {}",
-                            &json_str[..json_str.len().min(100)]
+                            preview_text(&json_str, 100)
                         );
                         match serde_json::from_str::<RaindropUpdate>(&json_str) {
                             Ok(update) => {
@@ -238,9 +238,9 @@ pub fn load_raindrop_delta() -> Vec<RaindropUpdate> {
 
 /// Apply delta updates to build the current state
 /// Returns a HashMap of id -> Raindrop (deleted items are removed)
-fn preview_title(title: &str, max_chars: usize) -> String {
+fn preview_text(text: &str, max_chars: usize) -> String {
     let mut result = String::new();
-    for (i, ch) in title.chars().enumerate() {
+    for (i, ch) in text.chars().enumerate() {
         if i >= max_chars {
             result.push_str("...");
             return result;
@@ -272,7 +272,7 @@ pub fn apply_delta_to_state(
                 info!(
                     "Delta: upserting item {} '{}'",
                     item.id,
-                    preview_title(&item.title, 30)
+                    preview_text(&item.title, 30)
                 );
                 items_map.insert(item.id, item.clone());
             }
