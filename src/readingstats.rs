@@ -38,26 +38,45 @@ impl TotalStats {
     }
 
     pub fn track_raindrop(&mut self, item: &Raindrop, today: &DateTime<Utc>) {
-        let is_read = item.tags.iter().any(|t| t == "read");
+        let is_read = item.tags.iter().any(|t| t == "archived");
         let item_type = item.item_type.as_str();
 
-        // Parse created date
+        // Parse created date for "added" stats
         let created = match DateTime::parse_from_rfc3339(&item.created) {
             Ok(dt) => dt.with_timezone(&Utc),
             Err(_) => return,
         };
 
-        let duration = *today - created;
-
+        // Track "added" items based on created date
+        let created_duration = *today - created;
         if today.date_naive() == created.date_naive() {
-            self.today_stats.increment(item_type, is_read);
-            self.week_stats.increment(item_type, is_read);
-            self.month_stats.increment(item_type, is_read);
-        } else if duration.num_days() <= 7 {
-            self.week_stats.increment(item_type, is_read);
-            self.month_stats.increment(item_type, is_read);
-        } else if duration.num_days() <= 30 {
-            self.month_stats.increment(item_type, is_read);
+            self.today_stats.increment_added(item_type);
+            self.week_stats.increment_added(item_type);
+            self.month_stats.increment_added(item_type);
+        } else if created_duration.num_days() <= 7 {
+            self.week_stats.increment_added(item_type);
+            self.month_stats.increment_added(item_type);
+        } else if created_duration.num_days() <= 30 {
+            self.month_stats.increment_added(item_type);
+        }
+
+        // Track "read" items based on last_update date (when archived)
+        if is_read {
+            let last_update = match DateTime::parse_from_rfc3339(&item.last_update) {
+                Ok(dt) => dt.with_timezone(&Utc),
+                Err(_) => return,
+            };
+            let read_duration = *today - last_update;
+            if today.date_naive() == last_update.date_naive() {
+                self.today_stats.increment_read(item_type);
+                self.week_stats.increment_read(item_type);
+                self.month_stats.increment_read(item_type);
+            } else if read_duration.num_days() <= 7 {
+                self.week_stats.increment_read(item_type);
+                self.month_stats.increment_read(item_type);
+            } else if read_duration.num_days() <= 30 {
+                self.month_stats.increment_read(item_type);
+            }
         }
     }
 }
@@ -74,33 +93,22 @@ impl Stats {
         }
     }
 
-    fn increment(&mut self, item_type: &str, is_read: bool) {
+    fn increment_added(&mut self, item_type: &str) {
         match item_type {
-            "pdf" => {
-                if is_read {
-                    self.pdfs_read += 1;
-                } else {
-                    self.pdfs_added += 1;
-                }
-            }
-            "video" => {
-                if is_read {
-                    self.videos_read += 1;
-                } else {
-                    self.videos_added += 1;
-                }
-            }
-            "article" => {
-                if is_read {
-                    self.articles_read += 1;
-                } else {
-                    self.articles_added += 1;
-                }
-            }
-            _ => {
-                todo!("impossible")
-            }
-        };
+            "pdf" => self.pdfs_added += 1,
+            "video" => self.videos_added += 1,
+            "article" => self.articles_added += 1,
+            _ => {}
+        }
+    }
+
+    fn increment_read(&mut self, item_type: &str) {
+        match item_type {
+            "pdf" => self.pdfs_read += 1,
+            "video" => self.videos_read += 1,
+            "article" => self.articles_read += 1,
+            _ => {}
+        }
     }
 }
 
@@ -120,33 +128,46 @@ pub fn render_stats(_today_stats: &Stats, week_stats: &Stats, _month_stats: &Sta
 
     let mut output = String::new();
 
-    let max_read = std::cmp::max(
+    // Find max value to scale bars proportionally
+    let max_val = [
         week_stats.articles_read,
-        std::cmp::max(week_stats.videos_read, week_stats.pdfs_read),
-    );
-    let max_added = std::cmp::max(
         week_stats.articles_added,
-        std::cmp::max(week_stats.videos_added, week_stats.pdfs_added),
-    );
+        week_stats.videos_read,
+        week_stats.videos_added,
+        week_stats.pdfs_read,
+        week_stats.pdfs_added,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(1)
+    .max(1);
 
-    let wdth = std::cmp::max(std::cmp::min(45, max_added), std::cmp::min(45, max_read));
+    const BAR_WIDTH: usize = 25;
+
+    let make_bar = |value: usize| -> String {
+        let bar_len = if max_val > 0 {
+            (value * BAR_WIDTH) / max_val.max(1)
+        } else {
+            0
+        };
+        let bar_len = bar_len.min(BAR_WIDTH);
+        let filled = "■".repeat(bar_len);
+        let empty = "░".repeat(BAR_WIDTH - bar_len);
+        format!("{}{}", filled, empty)
+    };
+
     let progress_bar =
-        |label: &str, read: usize, added: usize, output: &mut String, draw_notch: bool| {
-            let progress_added = "■".repeat(std::cmp::min(added, 45))
-                + &" ".repeat(0.max(30_usize.saturating_sub(added))); // todo empty space should depend on screen size
-            let progress_read = "■".repeat(std::cmp::min(read, 45))
-                + &" ".repeat(0.max(30_usize.saturating_sub(read))); //todo empty space should depend on screen size
-            let notch = if draw_notch { "_" } else { " " };
+        |label: &str, read: usize, added: usize, output: &mut String| {
+            let bar_added = make_bar(added);
+            let bar_read = make_bar(read);
             write!(
                 output,
-                "{}: {:width$} │ {:3} added\n      {:width$}{notch}│ {:3}  read\n",
+                "{}: {} {:3} +\n      {} {:3} ✓\n",
                 label,
-                progress_added,
+                bar_added,
                 added,
-                progress_read,
+                bar_read,
                 read,
-                notch = notch,
-                width = wdth //max_added.max(max_read)
             )
             .unwrap();
         };
@@ -156,24 +177,19 @@ pub fn render_stats(_today_stats: &Stats, week_stats: &Stats, _month_stats: &Sta
         week_stats.articles_read,
         week_stats.articles_added,
         &mut output,
-        true,
     );
     progress_bar(
         "Vids",
         week_stats.videos_read,
         week_stats.videos_added,
         &mut output,
-        true,
     );
     progress_bar(
         "PDFs",
         week_stats.pdfs_read,
         week_stats.pdfs_added,
         &mut output,
-        false,
     );
-
-    output.push_str("\n");
 
     output
 }

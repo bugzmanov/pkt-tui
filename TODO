@@ -62,6 +62,8 @@ Low priority:
  [ ] auto-tagging
 
 Bugs:
+ [ ] https://www.pentadact.com/2026-01-08-15-years-of-indie-dev-in-4-bits-of-advice/ <--- this packs into epub poorly: folded sections are skipped, images are skipped
+ [ ] https://every.to/guides/agent-native  <--- a lot of html elements are packed in epub incorrectly. lists, definition list etc
  [ ] add timeouts to pocket requests
  [ ] Filter and search behaviour '/' is somewhat confusing
  [ ] Weekly starts shows no data in a blank state mode - when delta is empty.

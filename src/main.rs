@@ -54,7 +54,7 @@ const PALETTES: [tailwind::Palette; 4] = [
     tailwind::INDIGO,
     tailwind::RED,
 ];
-const INFO_TEXT: &str = "(ZZ) quit | gg/G/j/k  - start,end,↓,↑ | ? - Help";
+const INFO_TEXT: &str = "(q/ZZ) quit | gg/G/j/k  - start,end,↓,↑ | ? - Help";
 const ITEM_HEIGHT: usize = 3;
 const EPUB_DIR: &str = "epubs";
 pub struct Base16Palette {
@@ -436,6 +436,7 @@ enum LoadingType {
     Refresh,
     Download,
     DownloadNative, // Rust-native web2epub
+    PdfToEpub,      // PDF to EPUB conversion
 }
 
 struct RefreshingPopup {
@@ -1386,6 +1387,96 @@ impl App {
         Ok(())
     }
 
+    /// Downloads a PDF, converts it to EPUB, and opens it in bookokrat.
+    /// This is the handler for the "W" keybinding on PDF items.
+    fn download_convert_and_open_pdf(&mut self) -> anyhow::Result<()> {
+        // Extract item data first to avoid borrow conflicts
+        let item_data = if let Some(idx) = self.virtual_state.selected() {
+            if let Some(item) = self.items.get(idx) {
+                if item.type_str() == "pdf" {
+                    Some((item.link.clone(), item.id))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((url, item_id)) = item_data {
+            // Create directories
+            fs::create_dir_all("pdfs")?;
+            fs::create_dir_all(EPUB_DIR)?;
+
+            // Extract filename from URL
+            let filename = url
+                .split('/')
+                .last()
+                .unwrap_or("download.pdf")
+                .replace("%20", "_");
+
+            // Construct PDF path
+            let pdf_path = std::path::PathBuf::from("pdfs").join(&filename);
+
+            // Download the PDF if not already downloaded
+            if !pdf_path.exists() {
+                log::info!("pdf2epub: Downloading PDF from {}", url);
+                let response = self.download_client.get(&url).send()?;
+                let content = response.bytes()?;
+                std::fs::write(&pdf_path, content)?;
+            }
+
+            // Extract title and rename item
+            if let Some(pdf_info) = utils::extract_pdf_title(&pdf_path)? {
+                if let Some(title) = pdf_info.title {
+                    self.rename_current_item(title)?;
+                }
+            }
+
+            // Create cache ID from item ID
+            let cache_id = format!("pdf_{}", item_id);
+            let epub_path = Path::new(EPUB_DIR).join(format!("{}.epub", cache_id));
+            let temp_dir = Path::new("temp_images").join(&cache_id);
+
+            // Convert PDF to EPUB
+            log::info!(
+                "pdf2epub: Converting {} to {}",
+                pdf_path.display(),
+                epub_path.display()
+            );
+
+            if let Err(err) =
+                pkt_tui::pdf2epub::convert_pdf_to_epub_pdfium(&pdf_path, &epub_path, &temp_dir)
+            {
+                log::warn!(
+                    "pdf2epub: pdfium conversion failed ({}), falling back to extractous",
+                    err
+                );
+                pkt_tui::pdf2epub::convert_pdf_to_epub(&pdf_path, &epub_path, &temp_dir)?;
+            }
+
+            // Clean up temp directory
+            if temp_dir.exists() {
+                let _ = fs::remove_dir_all(&temp_dir);
+            }
+
+            // Mark as downloaded - get item reference again
+            if let Some(idx) = self.virtual_state.selected() {
+                if let Some(item) = self.items.get(idx) {
+                    self.raindrop_client.add_tag(item, "downloaded")?;
+                }
+            }
+
+            // Open in bookokrat
+            let mut command = std::process::Command::new("bookokrat");
+            command.arg(&epub_path).arg("--zen-mode");
+            self.run_external_tui_command("bookokrat", &mut command)?;
+        }
+        Ok(())
+    }
+
     fn download_and_open_article_epub(&mut self) -> anyhow::Result<()> {
         let item = if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
@@ -1936,7 +2027,16 @@ impl App {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        self.stats = TotalStats::from_items(&items);
+        // Include trash items in stats (deleted items count as "read")
+        let mut stats_items: Vec<_> = items.clone();
+        let mut trash_for_stats = trash_items;
+        for item in &mut trash_for_stats {
+            if !item.tags.contains(&"archived".to_string()) {
+                item.tags.push("archived".to_string());
+            }
+        }
+        stats_items.extend(trash_for_stats);
+        self.stats = TotalStats::from_items(&stats_items);
         self.items = FilteredItems::new(items);
         self.apply_filter();
         Ok(())
@@ -1972,7 +2072,18 @@ impl App {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        self.stats = TotalStats::from_items(&items);
+        // Include trash items in stats (deleted items count as "read")
+        let mut stats_items: Vec<_> = items.clone();
+        let mut trash_items = self
+            .raindrop_client
+            .get_all_raindrops(raindrop::COLLECTION_TRASH)?;
+        for item in &mut trash_items {
+            if !item.tags.contains(&"archived".to_string()) {
+                item.tags.push("archived".to_string());
+            }
+        }
+        stats_items.extend(trash_items);
+        self.stats = TotalStats::from_items(&stats_items);
         self.items = FilteredItems::new(items);
         self.apply_filter();
         Ok(())
@@ -2931,7 +3042,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let stats = TotalStats::from_items(&items);
+    // Include trash items in stats (deleted items count as "read")
+    let mut stats_items: Vec<_> = items.clone();
+    let mut trash_items = raindrop_client.get_all_raindrops(raindrop::COLLECTION_TRASH)?;
+    for item in &mut trash_items {
+        if !item.tags.contains(&"archived".to_string()) {
+            item.tags.push("archived".to_string());
+        }
+    }
+    stats_items.extend(trash_items);
+    let stats = TotalStats::from_items(&stats_items);
 
     let mut app = App::new(items, raindrop_client, stats, archive_collection_id)?;
     app.start_rss_feed_loading()?;
@@ -3016,6 +3136,21 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                                 if let Some(item) = app.items.get(idx) {
                                     if item.type_str() == "article" {
                                         app.download_and_open_article_epub_native()
+                                    } else {
+                                        Ok(())
+                                    }
+                                } else {
+                                    Ok(())
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        LoadingType::PdfToEpub => {
+                            if let Some(idx) = app.virtual_state.selected() {
+                                if let Some(item) = app.items.get(idx) {
+                                    if item.type_str() == "pdf" {
+                                        app.download_convert_and_open_pdf()
                                     } else {
                                         Ok(())
                                     }
@@ -3516,6 +3651,9 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                             Char('Z') => {
                                 app.app_mode = AppMode::MulticharNormalModeEnter("Z".to_string());
                             }
+                            Char('q') => {
+                                panic!("Exit");
+                            }
                             _ => {}
                         }
                     }
@@ -3535,6 +3673,9 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                         }
                         Char('Z') => {
                             app.app_mode = AppMode::MulticharNormalModeEnter("Z".to_string());
+                        }
+                        Char('q') => {
+                            panic!("Exit");
                         }
                         Esc => {
                             if app.active_search_filter.is_some() {
@@ -3620,15 +3761,25 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                             }
                         }
                         Char('W') => {
-                            // Native Rust web2epub (articles only)
+                            // Native Rust conversions (articles: web2epub, PDFs: pdf2epub)
                             if let Some(idx) = app.virtual_state.selected() {
                                 if let Some(item) = app.items.get(idx) {
-                                    if item.type_str() == "article" {
-                                        app.app_mode =
-                                            AppMode::Refreshing(RefreshingPopup::new(
-                                                "Opening reader (native) ⏳".to_string(),
-                                                LoadingType::DownloadNative,
-                                            ));
+                                    match item.type_str() {
+                                        "article" => {
+                                            app.app_mode =
+                                                AppMode::Refreshing(RefreshingPopup::new(
+                                                    "Opening reader (native) ⏳".to_string(),
+                                                    LoadingType::DownloadNative,
+                                                ));
+                                        }
+                                        "pdf" => {
+                                            app.app_mode =
+                                                AppMode::Refreshing(RefreshingPopup::new(
+                                                    "Converting PDF to EPUB ⏳".to_string(),
+                                                    LoadingType::PdfToEpub,
+                                                ));
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }

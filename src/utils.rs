@@ -15,15 +15,16 @@ pub fn extract_pdf_title(path: &Path) -> anyhow::Result<Option<PDFData>> {
         std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
     let extractor = Extractor::new().set_extract_string_max_length(10000);
     let (text, metadata) = extractor
-        .extract_file_to_string(path.to_str().unwrap())
-        .unwrap();
+        .extract_file_to_string(
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid path: {}", path.display()))?,
+        )
+        .with_context(|| format!("Failed to extract PDF text: {}", path.display()))?;
 
     let mut title_opt: Option<String> = None;
-    if None == metadata.get("pdf:PDFVersion") {
-        error!("PDF Metadate that doesn't have PDFVersion: {:?}", metadata);
-        return anyhow::Result::Err(anyhow::anyhow!(
-            "No pdf metadata found. The file is not a pdf file."
-        ));
+    if metadata.get("pdf:PDFVersion").is_none() {
+        error!("PDF metadata missing PDFVersion: {:?}", metadata);
+        return Ok(None);
     }
 
     //todo: sometimes title metadata contains garbage
