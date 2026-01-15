@@ -166,8 +166,10 @@ pub struct RssFeedPopupState {
     pending_raindrop_item: Option<RssFeedItem>, // Store item waiting for tags
     show_description: bool,
     pub changes_made: bool,
-    pending_key: Option<char>, // For multi-char commands like dd, gg
+    pub pending_key: Option<char>, // For multi-char commands like dd, gg
     order_mode: RssOrderMode,
+    pub search_query: Option<String>,
+    pub search_matches: Vec<usize>,
 }
 
 impl RssFeedPopupState {
@@ -184,6 +186,8 @@ impl RssFeedPopupState {
             changes_made: false,
             pending_key: None,
             order_mode: RssOrderMode::Date,
+            search_query: None,
+            search_matches: Vec::new(),
         }
     }
 
@@ -207,7 +211,85 @@ impl RssFeedPopupState {
             changes_made: false,
             pending_key: None,
             order_mode: RssOrderMode::Date,
+            search_query: None,
+            search_matches: Vec::new(),
         })
+    }
+
+    pub fn perform_search(&mut self, query: String) {
+        if query.is_empty() {
+            self.search_query = None;
+            self.search_matches.clear();
+            return;
+        }
+
+        let query_lower = query.to_lowercase();
+        self.search_matches = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.title.to_lowercase().contains(&query_lower)
+                    || item.link.to_lowercase().contains(&query_lower)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        self.search_query = Some(query);
+
+        if let Some(&first_match) = self.search_matches.first() {
+            self.selected_index = first_match;
+            self.ensure_visible(first_match);
+        }
+        
+        self.set_status(format!("Found {} matches", self.search_matches.len()));
+    }
+
+    pub fn next_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+
+        // Find the first match that is strictly greater than current selection
+        let next_idx = self
+            .search_matches
+            .iter()
+            .find(|&&idx| idx > self.selected_index)
+            .copied()
+            .or_else(|| self.search_matches.first().copied()); // Wrap around
+
+        if let Some(idx) = next_idx {
+            self.selected_index = idx;
+            self.ensure_visible(idx);
+        }
+    }
+
+    pub fn previous_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+
+        // Find the last match that is strictly less than current selection
+        let prev_idx = self
+            .search_matches
+            .iter()
+            .rev()
+            .find(|&&idx| idx < self.selected_index)
+            .copied()
+            .or_else(|| self.search_matches.last().copied()); // Wrap around
+
+        if let Some(idx) = prev_idx {
+            self.selected_index = idx;
+            self.ensure_visible(idx);
+        }
+    }
+
+    fn ensure_visible(&mut self, idx: usize) {
+        if idx < self.scroll_offset {
+            self.scroll_offset = idx;
+        } else if idx >= self.scroll_offset + self.visible_items {
+            self.scroll_offset = idx.saturating_sub(self.visible_items.saturating_sub(1));
+        }
     }
 
     pub fn prepare_add_to_raindrop(&mut self) -> Option<RssFeedItem> {
@@ -2524,10 +2606,15 @@ impl App {
     }
 
     fn switch_to_search_mode(&mut self) {
-        self.app_mode = AppMode::Search(SearchMode::new((
-            self.virtual_state.offset(),
-            self.virtual_state.selected().unwrap(),
-        )));
+        let pos = if self.current_tab == CurrentTab::Raindrops {
+            (
+                self.virtual_state.offset(),
+                self.virtual_state.selected().unwrap_or(0),
+            )
+        } else {
+            (0, 0)
+        };
+        self.app_mode = AppMode::Search(SearchMode::new(pos));
     }
 
     fn switch_to_confirmation(&mut self, confirm_type: Confirmation) {
@@ -2601,9 +2688,11 @@ impl App {
         self.app_mode = AppMode::Normal;
         match from {
             AppMode::Search(x) => {
-                self.apply_filter();
-                *self.virtual_state.offset_mut() = x.normal_mode_positions.0;
-                self.virtual_state.select(Some(x.normal_mode_positions.1));
+                if self.current_tab == CurrentTab::Raindrops {
+                    self.apply_filter();
+                    *self.virtual_state.offset_mut() = x.normal_mode_positions.0;
+                    self.virtual_state.select(Some(x.normal_mode_positions.1));
+                }
             }
             _ => {} // do nothing
         }
@@ -3684,19 +3773,32 @@ fn process_search_mode(app: &mut App, mut sstr: SearchMode) -> anyhow::Result<()
                             }
                             Char(ch) => {
                                 sstr.search.push(ch);
-                                app.active_search_filter = Some(sstr.search.clone());
-                                app.app_mode = AppMode::Search(sstr.clone());
-                                app.apply_filter();
+                                if app.current_tab == CurrentTab::Raindrops {
+                                    app.active_search_filter = Some(sstr.search.clone());
+                                    app.app_mode = AppMode::Search(sstr.clone());
+                                    app.apply_filter();
+                                } else {
+                                    app.app_mode = AppMode::Search(sstr.clone());
+                                }
                             }
                             Backspace => {
                                 sstr.search.pop();
-                                app.active_search_filter = Some(sstr.search.clone());
-                                app.app_mode = AppMode::Search(sstr.clone());
-                                app.apply_filter();
+                                if app.current_tab == CurrentTab::Raindrops {
+                                    app.active_search_filter = Some(sstr.search.clone());
+                                    app.app_mode = AppMode::Search(sstr.clone());
+                                    app.apply_filter();
+                                } else {
+                                    app.app_mode = AppMode::Search(sstr.clone());
+                                }
                             }
                             Enter => {
-                                app.set_search_filter(sstr.search.clone());
-                                app.switch_to_normal_mode_from(AppMode::Search(sstr));
+                                if app.current_tab == CurrentTab::Raindrops {
+                                    app.set_search_filter(sstr.search.clone());
+                                    app.switch_to_normal_mode_from(AppMode::Search(sstr));
+                                } else {
+                                    app.rss_tab_state.perform_search(sstr.search.clone());
+                                    app.switch_to_normal_mode_from(AppMode::Search(sstr));
+                                }
                                 return Ok(());
                             }
                             Down => app.next(),
@@ -3860,6 +3962,16 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                             Char('a') => {
                                 app.process_add_to_raindrop_with_tags_rss_tab()?;
                                 return Ok(());
+                            }
+                            Char('/') => {
+                                app.switch_to_search_mode();
+                                return Ok(());
+                            }
+                            Char('n') => {
+                                popup_state.next_match();
+                            }
+                            Char('N') => {
+                                popup_state.previous_match();
                             }
                             Enter => app.handle_rss_tab_selection()?,
                             Esc => {
