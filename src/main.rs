@@ -9,10 +9,11 @@ mod readingstats;
 mod summarize;
 mod utils;
 
+use pkt_tui::bundle::{self, BundleItem, BundleItemType, BundlingPhase, BundlingState};
 use pkt_tui::web2epub;
 
 use anyhow::Context;
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -31,6 +32,7 @@ use rayon::prelude::*;
 use readingstats::{render_stats, TotalStats};
 use reqwest::blocking::Client;
 use std::{
+    cmp::Ordering as CmpOrdering,
     collections::{hash_map::DefaultHasher, HashMap},
     error::Error,
     fs::{self, File},
@@ -123,6 +125,7 @@ pub struct RssFeedState {
     pub has_updates: Arc<AtomicBool>,
     pub error: Option<String>,
     pub per_feed_cache: Arc<Mutex<HashMap<String, Vec<RssFeedItem>>>>,
+    pub feed_order: Arc<Mutex<Vec<String>>>,
 }
 
 impl RssFeedState {
@@ -133,6 +136,22 @@ impl RssFeedState {
             has_updates: Arc::new(AtomicBool::new(false)),
             error: None,
             per_feed_cache: Arc::new(Mutex::new(HashMap::new())),
+            feed_order: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RssOrderMode {
+    Date,
+    Source,
+}
+
+impl RssOrderMode {
+    fn label(self) -> &'static str {
+        match self {
+            RssOrderMode::Date => "date",
+            RssOrderMode::Source => "source",
         }
     }
 }
@@ -148,6 +167,7 @@ pub struct RssFeedPopupState {
     show_description: bool,
     pub changes_made: bool,
     pending_key: Option<char>, // For multi-char commands like dd, gg
+    order_mode: RssOrderMode,
 }
 
 impl RssFeedPopupState {
@@ -163,6 +183,7 @@ impl RssFeedPopupState {
             show_description: false,
             changes_made: false,
             pending_key: None,
+            order_mode: RssOrderMode::Date,
         }
     }
 
@@ -185,6 +206,7 @@ impl RssFeedPopupState {
             show_description: false,
             changes_made: false,
             pending_key: None,
+            order_mode: RssOrderMode::Date,
         })
     }
 
@@ -244,6 +266,85 @@ impl RssFeedPopupState {
         self.status_message = Some((message, Instant::now()));
     }
 
+    pub fn toggle_order_mode(&mut self) {
+        self.order_mode = match self.order_mode {
+            RssOrderMode::Date => RssOrderMode::Source,
+            RssOrderMode::Source => RssOrderMode::Date,
+        };
+        self.set_status(format!("Order: {}", self.order_mode.label()));
+    }
+
+    pub fn apply_ordering(&mut self, feed_order: Option<&[String]>) {
+        if self.items.is_empty() {
+            return;
+        }
+
+        let selected_id = self.items.get(self.selected_index).map(|item| item.item_id.clone());
+        let mut date_cache = HashMap::new();
+        for item in &self.items {
+            date_cache.insert(item.item_id.clone(), rss_item_date(item));
+        }
+
+        let cmp_date_desc = |a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>| -> CmpOrdering {
+            match (a, b) {
+                (Some(a), Some(b)) => b.cmp(&a),
+                (Some(_), None) => CmpOrdering::Less,
+                (None, Some(_)) => CmpOrdering::Greater,
+                (None, None) => CmpOrdering::Equal,
+            }
+        };
+
+        match self.order_mode {
+            RssOrderMode::Date => {
+                self.items.sort_by(|a, b| {
+                    let a_date = date_cache.get(&a.item_id).cloned().flatten();
+                    let b_date = date_cache.get(&b.item_id).cloned().flatten();
+                    cmp_date_desc(a_date, b_date)
+                });
+            }
+            RssOrderMode::Source => {
+                let mut order_index = HashMap::new();
+                if let Some(order) = feed_order {
+                    for (idx, source) in order.iter().enumerate() {
+                        order_index.insert(source.clone(), idx);
+                    }
+                }
+                self.items.sort_by(|a, b| {
+                    let a_idx = order_index.get(&a.source).copied().unwrap_or(usize::MAX);
+                    let b_idx = order_index.get(&b.source).copied().unwrap_or(usize::MAX);
+                    match a_idx.cmp(&b_idx) {
+                        CmpOrdering::Equal => {
+                            if a.source == b.source {
+                                let a_date = date_cache.get(&a.item_id).cloned().flatten();
+                                let b_date = date_cache.get(&b.item_id).cloned().flatten();
+                                cmp_date_desc(a_date, b_date)
+                            } else {
+                                a.source.cmp(&b.source)
+                            }
+                        }
+                        ord => ord,
+                    }
+                });
+            }
+        }
+
+        if let Some(id) = selected_id {
+            if let Some(idx) = self.items.iter().position(|item| item.item_id == id) {
+                self.selected_index = idx;
+                if self.selected_index < self.scroll_offset {
+                    self.scroll_offset = self.selected_index;
+                } else if self.selected_index >= self.scroll_offset + self.visible_items {
+                    self.scroll_offset = self
+                        .selected_index
+                        .saturating_sub(self.visible_items.saturating_sub(1));
+                }
+            } else {
+                self.selected_index = 0;
+                self.scroll_offset = 0;
+            }
+        }
+    }
+
     pub fn add_current_to_raindrop(
         &mut self,
         raindrop_client: &raindrop::RaindropAPISync,
@@ -281,6 +382,17 @@ impl RssFeedPopupState {
             Err(anyhow::anyhow!("No item selected"))
         }
     }
+}
+
+fn rss_item_date(item: &RssFeedItem) -> Option<DateTime<Utc>> {
+    let Some(pub_date) = item.pub_date.as_deref() else {
+        return None;
+    };
+
+    DateTime::parse_from_rfc3339(pub_date)
+        .or_else(|_| DateTime::parse_from_rfc2822(pub_date))
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
 }
 
 struct ReadingStats {
@@ -688,6 +800,7 @@ enum AppMode {
     Refreshing(RefreshingPopup),
     Error(String),
     Summarizing(SummarizePopupState),
+    Bundling(BundlingState),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -906,6 +1019,8 @@ struct App {
     summarize_shared_state: Option<summarize::client::SummarizeSharedState>,
     summarize_token: Option<String>,
     force_redraw: bool,
+    /// Items marked for offline bundling
+    marked_items: std::collections::HashSet<i64>,
 }
 
 impl App {
@@ -961,6 +1076,7 @@ impl App {
             summarize_shared_state: None,
             summarize_token: None,
             force_redraw: false,
+            marked_items: std::collections::HashSet::new(),
         })
     }
 
@@ -1186,6 +1302,9 @@ impl App {
         let raindrop_index = self.raindrop_url_index.clone();
         let has_updates_flag = self.rss_feed_state.has_updates.clone();
         let feed_order = feeds.clone();
+        if let Ok(mut order) = self.rss_feed_state.feed_order.lock() {
+            *order = feed_order.clone();
+        }
 
         thread::spawn(move || {
             let combined_items = Arc::new(Mutex::new(HashMap::new()));
@@ -1862,7 +1981,13 @@ impl App {
                     .filter(|item| !hidden_items.is_hidden(&item.item_id))
                     .cloned()
                     .collect();
-                self.rss_tab_state.items = filtered_items;
+                if let Ok(order) = self.rss_feed_state.feed_order.lock() {
+                    self.rss_tab_state.items = filtered_items;
+                    self.rss_tab_state.apply_ordering(Some(&order));
+                } else {
+                    self.rss_tab_state.items = filtered_items;
+                    self.rss_tab_state.apply_ordering(None);
+                }
                 // Reset scroll position if needed
                 if self.rss_tab_state.selected_index >= self.rss_tab_state.items.len() {
                     self.rss_tab_state.selected_index = 0;
@@ -2411,6 +2536,65 @@ impl App {
 
     fn switch_to_normal_mode(&mut self) {
         self.app_mode = AppMode::Normal;
+    }
+
+    /// Toggle mark on the currently selected item for bundling
+    fn toggle_mark(&mut self) {
+        if let Some(idx) = self.virtual_state.selected() {
+            if let Some(item) = self.items.get(idx) {
+                let id = item.id;
+                if self.marked_items.contains(&id) {
+                    self.marked_items.remove(&id);
+                } else {
+                    self.marked_items.insert(id);
+                }
+            }
+        }
+    }
+
+    /// Clear all marks
+    fn clear_all_marks(&mut self) {
+        self.marked_items.clear();
+    }
+
+    /// Check if an item is marked
+    fn is_marked(&self, id: i64) -> bool {
+        self.marked_items.contains(&id)
+    }
+
+    /// Start the bundling process for all marked items
+    fn start_bundling(&mut self) {
+        if self.marked_items.is_empty() {
+            return;
+        }
+
+        let bundle_path = bundle::default_bundle_path();
+        let state = BundlingState::new(self.marked_items.len(), bundle_path);
+        self.app_mode = AppMode::Bundling(state);
+    }
+
+    /// Convert marked Raindrop items to BundleItems
+    fn get_marked_bundle_items(&self) -> Vec<BundleItem> {
+        self.items
+            .items
+            .iter()
+            .filter(|item| self.marked_items.contains(&item.id))
+            .map(|item| {
+                let item_type = match item.type_str() {
+                    "video" => BundleItemType::Video,
+                    "pdf" => BundleItemType::Pdf,
+                    _ => BundleItemType::Article,
+                };
+                BundleItem {
+                    id: item.id,
+                    title: item.title.clone(),
+                    link: item.link.clone(),
+                    item_type,
+                    domain: item.domain.clone(),
+                    tags: item.tags.clone(),
+                }
+            })
+            .collect()
     }
 
     fn switch_to_normal_mode_from(&mut self, from: AppMode) {
@@ -3300,6 +3484,54 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                     }
                 }
             }
+            AppMode::Bundling(ref state) => {
+                // Handle bundling process based on phase
+                let phase = state.phase.clone();
+                let bundle_path = state.bundle_path.clone();
+
+                match phase {
+                    BundlingPhase::Complete | BundlingPhase::Failed(_) => {
+                        // Wait for key press to dismiss
+                        if event::poll(Duration::from_millis(100))? {
+                            if let Event::Key(key) = event::read()? {
+                                if key.kind == KeyEventKind::Press {
+                                    app.marked_items.clear();
+                                    app.switch_to_normal_mode();
+                                }
+                            }
+                        }
+                    }
+                    BundlingPhase::Preparing => {
+                        // Get data needed for bundling before mutating app_mode
+                        let bundle_items = app.get_marked_bundle_items();
+                        let client = app.download_client.clone();
+                        let total_items = bundle_items.len();
+
+                        // Execute bundling synchronously (blocking)
+                        let result = bundle::create_bundle(&bundle_items, &bundle_path, &client, |idx, title, phase| {
+                            log::info!("Bundling {}/{}: {} - {:?}", idx + 1, total_items, title, phase);
+                        });
+
+                        // Update app_mode with result
+                        match result {
+                            Ok(_manifest) => {
+                                if let AppMode::Bundling(ref mut s) = app.app_mode {
+                                    s.current_item = s.total_items;
+                                    s.phase = BundlingPhase::Complete;
+                                }
+                            }
+                            Err(e) => {
+                                if let AppMode::Bundling(ref mut s) = app.app_mode {
+                                    s.phase = BundlingPhase::Failed(e.to_string());
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // Other phases are handled by the bundling process itself
+                    }
+                }
+            }
         }
     }
 }
@@ -3617,6 +3849,14 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                                 app.rss_tab_state.show_description =
                                     !app.rss_tab_state.show_description
                             }
+                            Char('o') => {
+                                popup_state.toggle_order_mode();
+                                if let Ok(order) = app.rss_feed_state.feed_order.lock() {
+                                    popup_state.apply_ordering(Some(&order));
+                                } else {
+                                    popup_state.apply_ordering(None);
+                                }
+                            }
                             Char('a') => {
                                 app.process_add_to_raindrop_with_tags_rss_tab()?;
                                 return Ok(());
@@ -3820,6 +4060,10 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                             }
                         }
                         Char('?') => app.show_help_popup()?,
+                        // Marking system for offline bundles
+                        Char('M') => app.toggle_mark(),
+                        Char('U') => app.clear_all_marks(),
+                        Char('B') => app.start_bundling(),
                         _ => {}
                     }
                 }
@@ -3872,6 +4116,11 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if let AppMode::Error(message) = &app.app_mode {
         render_error_popup(f, message, f.area(), &app.colors);
+    }
+
+    // Bundling progress popup
+    if let AppMode::Bundling(state) = &app.app_mode {
+        render_bundling_popup(f, state, f.area(), &app.colors);
     }
 
     // After tag popup rendering, add:
@@ -4048,6 +4297,7 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                 && data.date() == app.items.get(actual_index + 1).unwrap().date();
             let is_read = data.tags.iter().any(|x| x == "read");
             let is_top = data.tags.iter().any(|x| x == "top");
+            let is_marked = app.is_marked(data.id);
             let mut base_style = Style::new();
             if is_read {
                 base_style = base_style.add_modifier(Modifier::DIM);
@@ -4065,7 +4315,8 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                 Cell::from(Text::from(vec![
                     Line::from(Span::styled(
                         format!(
-                            "{}{}",
+                            "{}{}{}",
+                            if is_marked { "✓ " } else { "" },
                             if is_top { "⭐ " } else { "" },
                             if !data.title.is_empty() {
                                 data.title.as_str()
@@ -4073,7 +4324,11 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                                 data.link.as_str()
                             }
                         ),
-                        base_style.fg(OCEANIC_NEXT.base_07),
+                        if is_marked {
+                            base_style.fg(OCEANIC_NEXT.base_0b) // Green for marked
+                        } else {
+                            base_style.fg(OCEANIC_NEXT.base_07)
+                        },
                     )),
                     Line::from(vec![
                         Span::styled(
@@ -4244,16 +4499,27 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // Group items by source and count them
+    let is_grouped = popup_state.order_mode == RssOrderMode::Source;
     let mut source_counts = std::collections::HashMap::new();
-    for item in &popup_state.items {
-        *source_counts.entry(&item.source).or_insert(0) += 1;
+    if is_grouped {
+        for item in &popup_state.items {
+            *source_counts.entry(&item.source).or_insert(0) += 1;
+        }
     }
-    let source_column_width = source_counts
-        .iter()
-        .map(|(source, count)| format!(" {} ({})", source, count).width())
-        .max()
-        .unwrap_or(0);
+    let source_column_width = if is_grouped {
+        source_counts
+            .iter()
+            .map(|(source, count)| format!(" {} ({})", source, count).width())
+            .max()
+            .unwrap_or(0)
+    } else {
+        popup_state
+            .items
+            .iter()
+            .map(|item| format!(" {}", item.source).width())
+            .max()
+            .unwrap_or(0)
+    };
 
     // Keep track of which sources we've seen while rendering
     let mut seen_sources = std::collections::HashSet::new();
@@ -4266,12 +4532,16 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(i, item)| {
             // Show source info only if we haven't seen this source yet
-            let source_column = if !seen_sources.contains(&item.source) {
-                seen_sources.insert(&item.source);
-                let count = source_counts.get(&item.source).unwrap_or(&0);
-                format!(" {} ({})", item.source, count)
+            let source_column = if is_grouped {
+                if !seen_sources.contains(&item.source) {
+                    seen_sources.insert(&item.source);
+                    let count = source_counts.get(&item.source).unwrap_or(&0);
+                    format!(" {} ({})", item.source, count)
+                } else {
+                    String::new()
+                }
             } else {
-                String::new()
+                format!(" {}", item.source)
             };
 
             let date_str = if let Some(pub_date) = &item.pub_date {
@@ -4662,20 +4932,9 @@ fn render_summarize_popup(f: &mut Frame, app: &mut App, area: Rect) {
         // Render text at full width; scrollbar will sit on the border column.
         let text_render_area = text_area;
 
-        // Calculate total wrapped lines by counting each line's wrapped segments
+        // Calculate total wrapped lines based on rendered (styled) content.
         let content_width = text_render_area.width as usize;
-        let total_lines: usize = content_text
-            .lines()
-            .map(|line| {
-                if line.is_empty() || content_width == 0 {
-                    1
-                } else {
-                    // Count how many visual lines this text line wraps to
-                    let line_width = line.width();
-                    ((line_width + content_width - 1) / content_width).max(1)
-                }
-            })
-            .sum();
+        let total_lines = wrapped_line_count(&styled_lines, content_width);
 
         let visible_height = text_area.height as usize;
         let scroll_offset = popup.scroll_offset;
@@ -4721,18 +4980,9 @@ fn render_summarize_popup(f: &mut Frame, app: &mut App, area: Rect) {
             popup.content.clone()
         };
 
+        let styled_lines = render_markdown_basic(&content_text, app.colors.row_fg);
         let content_width = text_area.width as usize;
-        popup.total_lines = content_text
-            .lines()
-            .map(|line| {
-                if line.is_empty() || content_width == 0 {
-                    1
-                } else {
-                    let line_width = line.width();
-                    ((line_width + content_width - 1) / content_width).max(1)
-                }
-            })
-            .sum();
+        popup.total_lines = wrapped_line_count(&styled_lines, content_width);
         popup.visible_height = text_area.height as usize;
 
         // Clamp scroll offset to valid range
@@ -4741,6 +4991,76 @@ fn render_summarize_popup(f: &mut Frame, app: &mut App, area: Rect) {
             popup.scroll_offset = max_scroll;
         }
     }
+}
+
+fn wrapped_line_count(text: &Text<'_>, content_width: usize) -> usize {
+    if content_width == 0 {
+        return text.lines.len().max(1);
+    }
+
+    text.lines
+        .iter()
+        .map(|line| {
+            let line_str = line.to_string();
+            if line_str.is_empty() {
+                return 1;
+            }
+
+            let mut tokens = Vec::new();
+            let mut buf = String::new();
+            let mut in_whitespace = None;
+            for ch in line_str.chars() {
+                let is_ws = ch.is_whitespace();
+                match in_whitespace {
+                    None => {
+                        in_whitespace = Some(is_ws);
+                        buf.push(ch);
+                    }
+                    Some(current_ws) if current_ws == is_ws => {
+                        buf.push(ch);
+                    }
+                    Some(_) => {
+                        tokens.push(buf);
+                        buf = String::new();
+                        buf.push(ch);
+                        in_whitespace = Some(is_ws);
+                    }
+                }
+            }
+            if !buf.is_empty() {
+                tokens.push(buf);
+            }
+
+            let mut line_count = 1;
+            let mut current_width = 0;
+            for token in tokens {
+                let token_width = UnicodeWidthStr::width(token.as_str());
+                if token_width == 0 {
+                    continue;
+                }
+
+                if current_width == 0 && token_width > content_width {
+                    line_count += (token_width - 1) / content_width;
+                    current_width = token_width % content_width;
+                    continue;
+                }
+
+                if current_width + token_width <= content_width {
+                    current_width += token_width;
+                } else {
+                    line_count += 1;
+                    if token_width > content_width {
+                        line_count += (token_width - 1) / content_width;
+                        current_width = token_width % content_width;
+                    } else {
+                        current_width = token_width;
+                    }
+                }
+            }
+
+            line_count
+        })
+        .sum()
 }
 
 /// Basic markdown to styled text conversion
@@ -4836,6 +5156,97 @@ fn render_error_popup(f: &mut Frame, message: &str, area: Rect, colors: &TableCo
     f.render_widget(error_widget, popup_area);
 }
 
+fn render_bundling_popup(f: &mut Frame, state: &BundlingState, area: Rect, colors: &TableColors) {
+    let popup_area = centered_rect(60, 30, area);
+    f.render_widget(Clear, popup_area);
+
+    let progress_text = format!("{}/{}", state.current_item, state.total_items);
+    let phase_text = match &state.phase {
+        BundlingPhase::Preparing => "Preparing bundle...".to_string(),
+        BundlingPhase::DownloadingItem(title) => {
+            let truncated = if title.len() > 40 {
+                format!("{}...", &title[..40])
+            } else {
+                title.clone()
+            };
+            format!("Downloading: {}", truncated)
+        }
+        BundlingPhase::GeneratingThumbnail(title) => {
+            let truncated = if title.len() > 40 {
+                format!("{}...", &title[..40])
+            } else {
+                title.clone()
+            };
+            format!("Thumbnail: {}", truncated)
+        }
+        BundlingPhase::GeneratingIndex => "Generating index...".to_string(),
+        BundlingPhase::Complete => "Bundle complete!".to_string(),
+        BundlingPhase::Failed(msg) => format!("Failed: {}", msg),
+    };
+
+    let status_color = match &state.phase {
+        BundlingPhase::Complete => OCEANIC_NEXT.base_0b, // Green
+        BundlingPhase::Failed(_) => OCEANIC_NEXT.base_08, // Red
+        _ => colors.row_fg,
+    };
+
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            "Creating Offline Bundle",
+            Style::default()
+                .fg(OCEANIC_NEXT.base_0d)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(phase_text, Style::default().fg(status_color))]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("Progress: {}", progress_text),
+            Style::default().fg(OCEANIC_NEXT.base_03),
+        )]),
+    ];
+
+    // Add errors if any
+    if !state.errors.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("Errors: {}", state.errors.len()),
+            Style::default().fg(OCEANIC_NEXT.base_08),
+        )]));
+    }
+
+    // Add dismiss instruction for complete/failed states
+    if matches!(state.phase, BundlingPhase::Complete | BundlingPhase::Failed(_)) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Press any key to continue",
+            Style::default().fg(OCEANIC_NEXT.base_03),
+        )]));
+        if matches!(state.phase, BundlingPhase::Complete) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                format!("Bundle saved to: {}", state.bundle_path.display()),
+                Style::default().fg(OCEANIC_NEXT.base_0b),
+            )]));
+        }
+    }
+
+    let text = Text::from(lines);
+
+    let bundling_widget = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Bundling ")
+                .border_style(Style::new().fg(OCEANIC_NEXT.base_0d))
+                .border_type(BorderType::Rounded),
+        )
+        .style(Style::new().bg(Color::Black))
+        .alignment(Alignment::Center);
+
+    f.render_widget(bundling_widget, popup_area);
+}
+
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     match &app.app_mode {
         AppMode::Initialize => panic!("Should not get here!"),
@@ -4843,7 +5254,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         | AppMode::MulticharNormalModeEnter(_)
         | AppMode::Refreshing(_)
         | AppMode::Error(_)
-        | AppMode::Summarizing(_) => {
+        | AppMode::Summarizing(_)
+        | AppMode::Bundling(_) => {
             // Different footer content based on current tab
             let (spans, alignment) = if app.current_tab == CurrentTab::RssFeed {
                 // RSS Tab footer
@@ -4854,6 +5266,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                         Span::raw("Enter: open | "),
                         Span::raw("dd: hide | "),
                         Span::raw("p: preview | "),
+                        Span::raw("o: order | "),
                         Span::raw("a: add to Raindrop | "),
                         Span::raw("Q: refresh | "),
                         Span::styled(
@@ -4920,6 +5333,23 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                             ),
                         ]);
                     }
+                }
+                // Show marked items count for offline bundling
+                if !app.marked_items.is_empty() {
+                    spans.extend_from_slice(&[
+                        Span::raw(" | "),
+                        Span::styled(
+                            format!(" {} marked ", app.marked_items.len()),
+                            Style::default()
+                                .bg(OCEANIC_NEXT.base_0d) // Blue background
+                                .fg(OCEANIC_NEXT.base_00) // Dark text for contrast
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            " (B bundle, U clear)",
+                            Style::default().fg(OCEANIC_NEXT.base_03),
+                        ),
+                    ]);
                 }
                 let alignment = if is_filtered {
                     Alignment::Left

@@ -150,9 +150,65 @@ struct ImageSource {
     placeholder_src: Option<String>,
 }
 
+/// Extracts the first URL from a srcset attribute.
+///
+/// srcset format: "url1 descriptor1, url2 descriptor2, ..."
+/// where descriptors are like "424w" (width) or "2x" (pixel density).
+///
+/// The tricky part is that URLs can contain commas (e.g., Substack CDN URLs),
+/// so we can't just split on commas. Instead, we look for the pattern
+/// `\s+\d+[wx]\s*,` which marks the end of a srcset entry.
 fn first_src_from_srcset(srcset: &str) -> Option<String> {
-    let first_entry = srcset.split(',').next()?.trim();
-    let url = first_entry.split_whitespace().next()?.trim();
+    let srcset = srcset.trim();
+    if srcset.is_empty() {
+        return None;
+    }
+
+    // Strategy: Find the first width/density descriptor (e.g., "424w" or "2x")
+    // that's followed by a comma or end of string. The URL is everything before
+    // that descriptor.
+
+    // Look for patterns like " 424w," or " 424w" at end, or " 2x," etc.
+    // The descriptor is always preceded by whitespace and optionally followed by comma.
+
+    let mut chars: Vec<char> = srcset.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Look for whitespace followed by digits followed by 'w' or 'x'
+        if chars[i].is_whitespace() {
+            let ws_start = i;
+            // Skip whitespace
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            if i >= chars.len() {
+                break;
+            }
+
+            // Check if we have digits followed by 'w' or 'x'
+            let digit_start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+
+            if i > digit_start && i < chars.len() {
+                let descriptor_char = chars[i].to_ascii_lowercase();
+                if descriptor_char == 'w' || descriptor_char == 'x' {
+                    // Found a descriptor! The URL is from start to ws_start
+                    let url: String = chars[..ws_start].iter().collect();
+                    let url = url.trim();
+                    if !url.is_empty() {
+                        return Some(url.to_string());
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Fallback: if no descriptor found, try simple whitespace split
+    let url = srcset.split_whitespace().next()?.trim();
     if url.is_empty() {
         None
     } else {
@@ -313,6 +369,21 @@ pub fn normalize_images(
                 // Replace the original src with the local filename
                 // For EPUB, we'll reference images by their filename
 
+                // If source was data-src (or similar), we need to:
+                // 1. Remove the original src attribute (placeholder) first
+                // 2. Then replace data-src with src
+                if source_attr != "src" {
+                    if let Some(placeholder_src) = &img_info.placeholder_src {
+                        let encoded_placeholder = placeholder_src.replace('&', "&amp;");
+                        // Remove the placeholder src attribute entirely
+                        result = result.replace(&format!(" src=\"{}\"", placeholder_src), "");
+                        result = result.replace(&format!(" src='{}'", placeholder_src), "");
+                        result = result.replace(&format!(" src=\"{}\"", encoded_placeholder), "");
+                        result = result.replace(&format!(" src='{}'", encoded_placeholder), "");
+                    }
+                }
+
+                // Now replace the source attribute with src
                 // Try decoded version
                 result = result.replace(
                     &format!("{}=\"{}\"", source_attr, original_src),
@@ -332,28 +403,6 @@ pub fn normalize_images(
                     &format!("{}='{}'", source_attr, encoded_src),
                     &format!("src='{}'", filename),
                 );
-
-                if source_attr != "src" {
-                    if let Some(placeholder_src) = &img_info.placeholder_src {
-                        let encoded_placeholder = placeholder_src.replace('&', "&amp;");
-                        result = result.replace(
-                            &format!("src=\"{}\"", placeholder_src),
-                            &format!("src=\"{}\"", filename),
-                        );
-                        result = result.replace(
-                            &format!("src='{}'", placeholder_src),
-                            &format!("src='{}'", filename),
-                        );
-                        result = result.replace(
-                            &format!("src=\"{}\"", encoded_placeholder),
-                            &format!("src=\"{}\"", filename),
-                        );
-                        result = result.replace(
-                            &format!("src='{}'", encoded_placeholder),
-                            &format!("src='{}'", filename),
-                        );
-                    }
-                }
             }
             None => {
                 // Remove the image - we'll do this by replacing the img tag
@@ -449,5 +498,56 @@ mod tests {
             Some("png".to_string())
         );
         assert_eq!(get_url_image_extension("https://example.com/noext"), None);
+    }
+
+    #[test]
+    fn test_first_src_from_srcset_simple() {
+        // Simple srcset with width descriptor
+        assert_eq!(
+            first_src_from_srcset("https://example.com/img.jpg 424w"),
+            Some("https://example.com/img.jpg".to_string())
+        );
+
+        // Multiple entries
+        assert_eq!(
+            first_src_from_srcset("https://example.com/small.jpg 424w, https://example.com/large.jpg 848w"),
+            Some("https://example.com/small.jpg".to_string())
+        );
+
+        // With pixel density descriptor
+        assert_eq!(
+            first_src_from_srcset("https://example.com/img.jpg 2x"),
+            Some("https://example.com/img.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn test_first_src_from_srcset_with_commas_in_url() {
+        // Substack-style URLs with commas as parameters (the bug that was fixed)
+        let substack_srcset = "https://substackcdn.com/image/fetch/$s_!ksVf!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fimage.png 424w, https://substackcdn.com/image/fetch/$s_!ksVf!,w_848,c_limit,f_auto/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fimage.png 848w";
+
+        let result = first_src_from_srcset(substack_srcset);
+        assert!(result.is_some());
+        let url = result.unwrap();
+
+        // The URL should contain the full Substack CDN path including commas
+        assert!(url.contains("substackcdn.com"));
+        assert!(url.contains(",w_424,c_limit"));
+        assert!(url.ends_with("image.png"));
+    }
+
+    #[test]
+    fn test_first_src_from_srcset_edge_cases() {
+        // Empty string
+        assert_eq!(first_src_from_srcset(""), None);
+
+        // Whitespace only
+        assert_eq!(first_src_from_srcset("   "), None);
+
+        // URL without descriptor (fallback to whitespace split)
+        assert_eq!(
+            first_src_from_srcset("https://example.com/img.jpg"),
+            Some("https://example.com/img.jpg".to_string())
+        );
     }
 }

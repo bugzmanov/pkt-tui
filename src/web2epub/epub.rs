@@ -130,6 +130,9 @@ blockquote {
         html_escape(source_url)
     );
 
+    // Convert HTML content to valid XHTML
+    let xhtml_content = html_to_xhtml(&article.content_html);
+
     let full_content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
@@ -148,7 +151,7 @@ blockquote {
         html_escape(&article.title),
         title_html,
         source_html,
-        article.content_html
+        xhtml_content
     );
 
     // Add the main content
@@ -174,4 +177,67 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
+}
+
+/// Converts HTML to valid XHTML by fixing self-closing tags.
+fn html_to_xhtml(html: &str) -> String {
+    let mut result = html.to_string();
+
+    // List of void elements that need to be self-closing in XHTML
+    let void_elements = ["img", "br", "hr", "meta", "link", "input", "area", "base", "col", "embed", "source", "track", "wbr"];
+
+    for tag in void_elements {
+        // Match <tag ...> (not already self-closing) and convert to <tag ... />
+        // This is a simple approach - handles most common cases
+
+        // Pattern: <tag followed by attributes, ending with > but not />
+        let mut pos = 0;
+        let mut new_result = String::new();
+
+        while pos < result.len() {
+            // Look for opening tag
+            if let Some(tag_start) = result[pos..].find(&format!("<{}", tag)) {
+                let absolute_start = pos + tag_start;
+
+                // Check if this is actually the tag (not e.g., <imgage)
+                let after_tag = absolute_start + 1 + tag.len();
+                if after_tag < result.len() {
+                    let next_char = result.chars().nth(after_tag).unwrap_or('x');
+                    if next_char.is_alphanumeric() {
+                        // Not our tag, continue
+                        new_result.push_str(&result[pos..absolute_start + 1]);
+                        pos = absolute_start + 1;
+                        continue;
+                    }
+                }
+
+                // Find the closing >
+                if let Some(tag_end) = result[absolute_start..].find('>') {
+                    let absolute_end = absolute_start + tag_end;
+
+                    // Check if already self-closing
+                    if absolute_end > 0 && result.chars().nth(absolute_end - 1) == Some('/') {
+                        // Already self-closing, copy as-is
+                        new_result.push_str(&result[pos..absolute_end + 1]);
+                    } else {
+                        // Need to make it self-closing
+                        new_result.push_str(&result[pos..absolute_end]);
+                        new_result.push_str(" />");
+                    }
+                    pos = absolute_end + 1;
+                } else {
+                    // No closing >, just copy the rest
+                    new_result.push_str(&result[pos..]);
+                    pos = result.len();
+                }
+            } else {
+                // No more tags of this type, copy the rest
+                new_result.push_str(&result[pos..]);
+                break;
+            }
+        }
+        result = new_result;
+    }
+
+    result
 }
