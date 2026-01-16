@@ -216,7 +216,7 @@ impl RssFeedPopupState {
         })
     }
 
-    pub fn perform_search(&mut self, query: String) {
+    pub fn perform_search(&mut self, query: String, start_index: Option<usize>) {
         if query.is_empty() {
             self.search_query = None;
             self.search_matches.clear();
@@ -237,9 +237,17 @@ impl RssFeedPopupState {
 
         self.search_query = Some(query);
 
-        if let Some(&first_match) = self.search_matches.first() {
-            self.selected_index = first_match;
-            self.ensure_visible(first_match);
+        let target_match = if let Some(start) = start_index {
+            self.search_matches.iter().find(|&&idx| idx >= start).copied()
+        } else {
+            self.search_matches.first().copied()
+        };
+
+        let final_match = target_match.or_else(|| self.search_matches.first().copied());
+
+        if let Some(idx) = final_match {
+            self.selected_index = idx;
+            self.ensure_visible(idx);
         }
         
         self.set_status(format!("Found {} matches", self.search_matches.len()));
@@ -630,7 +638,6 @@ enum LoadingType {
     Refresh,
     Download,
     DownloadNative, // Rust-native web2epub
-    PdfToEpub,      // PDF to EPUB conversion
 }
 
 struct RefreshingPopup {
@@ -1558,20 +1565,51 @@ impl App {
                     fs::create_dir_all("pdfs")?;
 
                     // Extract filename from URL
-                    let url = item.link.as_str();
-                    let filename = url
-                        .split('/')
-                        .last()
-                        .unwrap_or("download.pdf")
-                        .replace("%20", "_");
+                    let url = utils::normalize_acm_pdf_url(&item.link);
+
+                    let mut filename = if !item.title.trim().is_empty() {
+                        utils::sanitize_filename(&item.title)
+                    } else {
+                        url.split('?')
+                            .next()
+                            .unwrap_or(&url)
+                            .split('/')
+                            .last()
+                            .unwrap_or("download.pdf")
+                            .replace("%20", "_")
+                    };
+                    if !filename.ends_with(".pdf") {
+                        filename.push_str(".pdf");
+                    }
 
                     // Construct full path
                     let mut path = std::path::PathBuf::from("pdfs");
                     path.push(&filename);
 
                     // Download the file
-                    let response = self.download_client.get(url).send()?;
+                    let response = self
+                        .download_client
+                        .get(&url)
+                        .header(reqwest::header::ACCEPT, "application/pdf")
+                        .header(
+                            reqwest::header::USER_AGENT,
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                        )
+                        .send()?;
+                    let content_type = response
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
                     let content = response.bytes()?;
+                    if !content_type.contains("application/pdf")
+                        && utils::looks_like_html(&content)
+                    {
+                        let _ = webbrowser::open(&url);
+                        anyhow::bail!(
+                            "PDF download blocked (HTML returned). Opened in browser for manual download."
+                        );
+                    }
                     std::fs::write(path.clone(), content)?;
 
                     // Mark as downloaded by adding a tag
@@ -1584,96 +1622,6 @@ impl App {
                     }
                 }
             }
-        }
-        Ok(())
-    }
-
-    /// Downloads a PDF, converts it to EPUB, and opens it in bookokrat.
-    /// This is the handler for the "W" keybinding on PDF items.
-    fn download_convert_and_open_pdf(&mut self) -> anyhow::Result<()> {
-        // Extract item data first to avoid borrow conflicts
-        let item_data = if let Some(idx) = self.virtual_state.selected() {
-            if let Some(item) = self.items.get(idx) {
-                if item.type_str() == "pdf" {
-                    Some((item.link.clone(), item.id))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some((url, item_id)) = item_data {
-            // Create directories
-            fs::create_dir_all("pdfs")?;
-            fs::create_dir_all(EPUB_DIR)?;
-
-            // Extract filename from URL
-            let filename = url
-                .split('/')
-                .last()
-                .unwrap_or("download.pdf")
-                .replace("%20", "_");
-
-            // Construct PDF path
-            let pdf_path = std::path::PathBuf::from("pdfs").join(&filename);
-
-            // Download the PDF if not already downloaded
-            if !pdf_path.exists() {
-                log::info!("pdf2epub: Downloading PDF from {}", url);
-                let response = self.download_client.get(&url).send()?;
-                let content = response.bytes()?;
-                std::fs::write(&pdf_path, content)?;
-            }
-
-            // Extract title and rename item
-            if let Some(pdf_info) = utils::extract_pdf_title(&pdf_path)? {
-                if let Some(title) = pdf_info.title {
-                    self.rename_current_item(title)?;
-                }
-            }
-
-            // Create cache ID from item ID
-            let cache_id = format!("pdf_{}", item_id);
-            let epub_path = Path::new(EPUB_DIR).join(format!("{}.epub", cache_id));
-            let temp_dir = Path::new("temp_images").join(&cache_id);
-
-            // Convert PDF to EPUB
-            log::info!(
-                "pdf2epub: Converting {} to {}",
-                pdf_path.display(),
-                epub_path.display()
-            );
-
-            if let Err(err) =
-                pkt_tui::pdf2epub::convert_pdf_to_epub_pdfium(&pdf_path, &epub_path, &temp_dir)
-            {
-                log::warn!(
-                    "pdf2epub: pdfium conversion failed ({}), falling back to extractous",
-                    err
-                );
-                pkt_tui::pdf2epub::convert_pdf_to_epub(&pdf_path, &epub_path, &temp_dir)?;
-            }
-
-            // Clean up temp directory
-            if temp_dir.exists() {
-                let _ = fs::remove_dir_all(&temp_dir);
-            }
-
-            // Mark as downloaded - get item reference again
-            if let Some(idx) = self.virtual_state.selected() {
-                if let Some(item) = self.items.get(idx) {
-                    self.raindrop_client.add_tag(item, "downloaded")?;
-                }
-            }
-
-            // Open in bookokrat
-            let mut command = std::process::Command::new("bookokrat");
-            command.arg(&epub_path).arg("--zen-mode");
-            self.run_external_tui_command("bookokrat", &mut command)?;
         }
         Ok(())
     }
@@ -2612,7 +2560,10 @@ impl App {
                 self.virtual_state.selected().unwrap_or(0),
             )
         } else {
-            (0, 0)
+            (
+                self.rss_tab_state.scroll_offset,
+                self.rss_tab_state.selected_index,
+            )
         };
         self.app_mode = AppMode::Search(SearchMode::new(pos));
     }
@@ -3419,21 +3370,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                                 Ok(())
                             }
                         }
-                        LoadingType::PdfToEpub => {
-                            if let Some(idx) = app.virtual_state.selected() {
-                                if let Some(item) = app.items.get(idx) {
-                                    if item.type_str() == "pdf" {
-                                        app.download_convert_and_open_pdf()
-                                    } else {
-                                        Ok(())
-                                    }
-                                } else {
-                                    Ok(())
-                                }
-                            } else {
-                                Ok(())
-                            }
-                        }
                     };
 
                     match refresh_result {
@@ -3767,7 +3703,14 @@ fn process_search_mode(app: &mut App, mut sstr: SearchMode) -> anyhow::Result<()
                         use KeyCode::*;
                         match key.code {
                             Esc => {
-                                app.clear_all_filters();
+                                if app.current_tab == CurrentTab::Raindrops {
+                                    app.clear_all_filters();
+                                } else {
+                                    app.rss_tab_state.perform_search(String::new(), None);
+                                    // Restore position
+                                    app.rss_tab_state.scroll_offset = sstr.normal_mode_positions.0;
+                                    app.rss_tab_state.selected_index = sstr.normal_mode_positions.1;
+                                }
                                 app.switch_to_normal_mode_from(AppMode::Search(sstr));
                                 return Ok(());
                             }
@@ -3779,6 +3722,7 @@ fn process_search_mode(app: &mut App, mut sstr: SearchMode) -> anyhow::Result<()
                                     app.apply_filter();
                                 } else {
                                     app.app_mode = AppMode::Search(sstr.clone());
+                                    app.rss_tab_state.perform_search(sstr.search.clone(), Some(sstr.normal_mode_positions.1));
                                 }
                             }
                             Backspace => {
@@ -3789,6 +3733,7 @@ fn process_search_mode(app: &mut App, mut sstr: SearchMode) -> anyhow::Result<()
                                     app.apply_filter();
                                 } else {
                                     app.app_mode = AppMode::Search(sstr.clone());
+                                    app.rss_tab_state.perform_search(sstr.search.clone(), Some(sstr.normal_mode_positions.1));
                                 }
                             }
                             Enter => {
@@ -3796,7 +3741,7 @@ fn process_search_mode(app: &mut App, mut sstr: SearchMode) -> anyhow::Result<()
                                     app.set_search_filter(sstr.search.clone());
                                     app.switch_to_normal_mode_from(AppMode::Search(sstr));
                                 } else {
-                                    app.rss_tab_state.perform_search(sstr.search.clone());
+                                    app.rss_tab_state.perform_search(sstr.search.clone(), Some(sstr.normal_mode_positions.1));
                                     app.switch_to_normal_mode_from(AppMode::Search(sstr));
                                 }
                                 return Ok(());
@@ -3977,6 +3922,9 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                             Esc => {
                                 if app.rss_tab_state.show_description {
                                     app.rss_tab_state.show_description = false;
+                                } else if app.rss_tab_state.search_query.is_some() {
+                                    app.rss_tab_state.perform_search(String::new(), None);
+                                    app.rss_tab_state.status_message = None; // Clear "Found X matches" status
                                 }
                             }
                             Char('Q') => {
@@ -4122,13 +4070,6 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                                                 AppMode::Refreshing(RefreshingPopup::new(
                                                     "Opening reader (native) ⏳".to_string(),
                                                     LoadingType::DownloadNative,
-                                                ));
-                                        }
-                                        "pdf" => {
-                                            app.app_mode =
-                                                AppMode::Refreshing(RefreshingPopup::new(
-                                                    "Converting PDF to EPUB ⏳".to_string(),
-                                                    LoadingType::PdfToEpub,
                                                 ));
                                         }
                                         _ => {}
@@ -4597,6 +4538,52 @@ fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(tab_bar, area);
 }
 
+fn highlight_search_match(text: &str, query: &str, base_color: Color) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let text_lower = text.to_lowercase();
+    let query_lower = query.to_lowercase();
+    
+    if query_lower.is_empty() {
+        return vec![Span::styled(text.to_string(), Style::default().fg(base_color))];
+    }
+
+    let mut last_idx = 0;
+    
+    // Simple matching: find all non-overlapping occurrences
+    let mut search_start = 0;
+    while let Some(idx) = text_lower[search_start..].find(&query_lower) {
+        let abs_idx = search_start + idx;
+        
+        if abs_idx > last_idx {
+            spans.push(Span::styled(
+                text[last_idx..abs_idx].to_string(),
+                Style::default().fg(base_color),
+            ));
+        }
+        
+        spans.push(Span::styled(
+            text[abs_idx..abs_idx + query_lower.len()].to_string(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+        
+        last_idx = abs_idx + query_lower.len();
+        search_start = last_idx;
+    }
+    
+    if last_idx < text.len() {
+        spans.push(Span::styled(
+            text[last_idx..].to_string(),
+            Style::default().fg(base_color),
+        ));
+    }
+    
+    if spans.is_empty() {
+        vec![Span::styled(text.to_string(), Style::default().fg(base_color))]
+    } else {
+        spans
+    }
+}
+
 fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
     app.rss_tab_area = Some(area);
     let visible_items = (area.height as usize).saturating_sub(2).max(1);
@@ -4643,6 +4630,8 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .take(visible_items)
         .enumerate()
         .map(|(i, item)| {
+            let is_selected = i + popup_state.scroll_offset == popup_state.selected_index;
+
             // Show source info only if we haven't seen this source yet
             let source_column = if is_grouped {
                 if !seen_sources.contains(&item.source) {
@@ -4681,13 +4670,22 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             };
 
-            let source_span =
-                Span::styled(padded_source, Style::default().fg(OCEANIC_NEXT.base_04));
+            let source_color = if is_selected {
+                Color::Black
+            } else {
+                OCEANIC_NEXT.base_04
+            };
+            let source_span = Span::styled(padded_source, Style::default().fg(source_color));
 
             // Date (dim)
+            let date_color = if is_selected {
+                Color::Black
+            } else {
+                OCEANIC_NEXT.base_03
+            };
             let date_span = Span::styled(
                 format!("{:<10}", date_str),
-                Style::default().fg(OCEANIC_NEXT.base_03),
+                Style::default().fg(date_color),
             );
 
             let mut display_title = item.title.clone();
@@ -4703,25 +4701,36 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 .as_ref()
                 .map(|tags| !tags.is_empty())
                 .unwrap_or(false);
+            
             // Title (bright like Raindrop, dim if already saved)
-            let title_style = if is_existing {
-                Style::default()
-                    .fg(OCEANIC_NEXT.base_04)
-                    .add_modifier(Modifier::DIM)
+            let title_color = if is_selected {
+                Color::Black
+            } else if is_existing {
+                OCEANIC_NEXT.base_04
             } else {
-                Style::default().fg(OCEANIC_NEXT.base_07)
+                OCEANIC_NEXT.base_07
             };
-            let title_span = Span::styled(display_title, title_style);
 
-            let content = Line::from(vec![
+            let title_spans = if let Some(query) = &popup_state.search_query {
+                highlight_search_match(&display_title, query, title_color)
+            } else {
+                vec![Span::styled(
+                    display_title,
+                    Style::default().fg(title_color).add_modifier(if is_existing && !is_selected { Modifier::DIM } else { Modifier::empty() }),
+                )]
+            };
+
+            let mut spans = vec![
                 source_span,
                 Span::raw("│ "),
                 date_span,
                 Span::raw(": "),
-                title_span,
-            ]);
+            ];
+            spans.extend(title_spans);
 
-            let style = if i + popup_state.scroll_offset == popup_state.selected_index {
+            let content = Line::from(spans);
+
+            let style = if is_selected {
                 Style::default().fg(Color::Black).bg(Color::White)
             } else {
                 Style::default()

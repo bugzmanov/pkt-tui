@@ -174,7 +174,13 @@ impl Raindrop {
     pub fn type_str(&self) -> &str {
         match self.item_type {
             RaindropType::Video => "video",
-            RaindropType::Article => "article",
+            RaindropType::Article => {
+                if self.link.contains(".pdf") || crate::utils::is_acm_pdf_url(&self.link) {
+                    "pdf"
+                } else {
+                    "article"
+                }
+            }
             RaindropType::Document => "pdf",
             RaindropType::Image => "image",
             RaindropType::Audio => "audio",
@@ -184,7 +190,7 @@ impl Raindrop {
                 // Check URL for hints
                 if self.link.contains("youtube.com") || self.link.contains("youtu.be") {
                     "video"
-                } else if self.link.contains(".pdf") {
+                } else if self.link.contains(".pdf") || crate::utils::is_acm_pdf_url(&self.link) {
                     "pdf"
                 } else {
                     "article"

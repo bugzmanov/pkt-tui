@@ -19,14 +19,6 @@ path = "src/bin/test_raindrop.rs"
 name = "raindrop_tui"
 path = "src/bin/raindrop_tui.rs"
 
-[[bin]]
-name = "test_pdf2epub"
-path = "src/bin/test_pdf2epub.rs"
-
-[[bin]]
-name = "test_pdfium"
-path = "src/bin/test_pdfium.rs"
-
 [dependencies]
 crossterm = "0.27.0"
 ratatui = "0.29"
@@ -39,11 +31,6 @@ serde_json = "1.0.114"
 tui-textarea = "0.7.0"
 reqwest = { version = "0.12.2", features = ["json", "blocking"] }
 
-# Lightweight PDF extraction - we keep extractous as fallback for edge cases
-extractous = "0.3.0"
-
-# Advanced PDF library using Google's Pdfium - gives us text positions, paths (lines), images
-pdfium-render = { git = "https://github.com/ajrcarey/pdfium-render", features = ["image_latest", "pdfium_latest"] }
 image = "0.25"
 
 # Alternatives that are very hard to use:
