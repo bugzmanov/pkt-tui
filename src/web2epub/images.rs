@@ -150,7 +150,7 @@ struct ImageSource {
     placeholder_src: Option<String>,
 }
 
-/// Extracts the first URL from a srcset attribute.
+/// Extracts the largest URL from a srcset attribute.
 ///
 /// srcset format: "url1 descriptor1, url2 descriptor2, ..."
 /// where descriptors are like "424w" (width) or "2x" (pixel density).
@@ -158,21 +158,53 @@ struct ImageSource {
 /// The tricky part is that URLs can contain commas (e.g., Substack CDN URLs),
 /// so we can't just split on commas. Instead, we look for the pattern
 /// `\s+\d+[wx]\s*,` which marks the end of a srcset entry.
+///
+/// We parse all entries and return the one with the largest width descriptor,
+/// or the last one if using pixel density descriptors.
 fn first_src_from_srcset(srcset: &str) -> Option<String> {
     let srcset = srcset.trim();
     if srcset.is_empty() {
         return None;
     }
 
-    // Strategy: Find the first width/density descriptor (e.g., "424w" or "2x")
-    // that's followed by a comma or end of string. The URL is everything before
-    // that descriptor.
+    // Parse all srcset entries and find the largest one
+    let entries = parse_srcset_entries(srcset);
 
-    // Look for patterns like " 424w," or " 424w" at end, or " 2x," etc.
-    // The descriptor is always preceded by whitespace and optionally followed by comma.
+    if entries.is_empty() {
+        // Fallback: if no entries parsed, try simple whitespace split
+        let url = srcset.split_whitespace().next()?.trim();
+        if url.is_empty() {
+            return None;
+        }
+        log::debug!("srcset fallback (no entries parsed): {}", url);
+        return Some(url.to_string());
+    }
 
-    let mut chars: Vec<char> = srcset.chars().collect();
+    // Find the entry with the largest width (or highest pixel density)
+    let best = entries
+        .iter()
+        .max_by_key(|(_, width)| *width)
+        .map(|(url, width)| {
+            log::debug!(
+                "srcset: picked {}w from {} entries (range: {}w-{}w)",
+                width,
+                entries.len(),
+                entries.iter().map(|(_, w)| w).min().unwrap_or(&0),
+                entries.iter().map(|(_, w)| w).max().unwrap_or(&0)
+            );
+            url.clone()
+        });
+
+    best
+}
+
+/// Parses srcset into (url, width) pairs.
+/// For pixel density descriptors (e.g., "2x"), we convert to approximate pixel widths.
+fn parse_srcset_entries(srcset: &str) -> Vec<(String, u32)> {
+    let mut entries = Vec::new();
+    let chars: Vec<char> = srcset.chars().collect();
     let mut i = 0;
+    let mut entry_start = 0;
 
     while i < chars.len() {
         // Look for whitespace followed by digits followed by 'w' or 'x'
@@ -195,25 +227,48 @@ fn first_src_from_srcset(srcset: &str) -> Option<String> {
             if i > digit_start && i < chars.len() {
                 let descriptor_char = chars[i].to_ascii_lowercase();
                 if descriptor_char == 'w' || descriptor_char == 'x' {
-                    // Found a descriptor! The URL is from start to ws_start
-                    let url: String = chars[..ws_start].iter().collect();
-                    let url = url.trim();
+                    // Found a descriptor! The URL is from entry_start to ws_start
+                    let url: String = chars[entry_start..ws_start].iter().collect();
+                    let url = url.trim().to_string();
+
+                    // Parse the width/density value
+                    let value_str: String = chars[digit_start..i].iter().collect();
+                    let value: u32 = value_str.parse().unwrap_or(0);
+
+                    // Convert density to approximate width (assume 1000px base)
+                    let width = if descriptor_char == 'x' {
+                        value * 1000
+                    } else {
+                        value
+                    };
+
                     if !url.is_empty() {
-                        return Some(url.to_string());
+                        entries.push((url, width));
                     }
+
+                    // Skip past the descriptor and any following comma/whitespace
+                    i += 1; // skip 'w' or 'x'
+                    while i < chars.len() && (chars[i].is_whitespace() || chars[i] == ',') {
+                        i += 1;
+                    }
+                    entry_start = i;
+                    continue;
                 }
             }
         }
         i += 1;
     }
 
-    // Fallback: if no descriptor found, try simple whitespace split
-    let url = srcset.split_whitespace().next()?.trim();
-    if url.is_empty() {
-        None
-    } else {
-        Some(url.to_string())
+    // Handle any remaining content (URL without descriptor)
+    if entry_start < chars.len() {
+        let remaining: String = chars[entry_start..].iter().collect();
+        let url = remaining.split_whitespace().next().unwrap_or("").trim();
+        if !url.is_empty() {
+            entries.push((url.to_string(), 0));
+        }
     }
+
+    entries
 }
 
 fn pick_image_source(element: &scraper::ElementRef<'_>) -> Option<ImageSource> {
@@ -508,10 +563,10 @@ mod tests {
             Some("https://example.com/img.jpg".to_string())
         );
 
-        // Multiple entries
+        // Multiple entries - should pick the LARGEST (848w)
         assert_eq!(
             first_src_from_srcset("https://example.com/small.jpg 424w, https://example.com/large.jpg 848w"),
-            Some("https://example.com/small.jpg".to_string())
+            Some("https://example.com/large.jpg".to_string())
         );
 
         // With pixel density descriptor
@@ -524,6 +579,7 @@ mod tests {
     #[test]
     fn test_first_src_from_srcset_with_commas_in_url() {
         // Substack-style URLs with commas as parameters (the bug that was fixed)
+        // Should pick the LARGER one (848w)
         let substack_srcset = "https://substackcdn.com/image/fetch/$s_!ksVf!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fimage.png 424w, https://substackcdn.com/image/fetch/$s_!ksVf!,w_848,c_limit,f_auto/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fimage.png 848w";
 
         let result = first_src_from_srcset(substack_srcset);
@@ -531,8 +587,9 @@ mod tests {
         let url = result.unwrap();
 
         // The URL should contain the full Substack CDN path including commas
+        // and should be the 848w version (larger)
         assert!(url.contains("substackcdn.com"));
-        assert!(url.contains(",w_424,c_limit"));
+        assert!(url.contains(",w_848,c_limit"));
         assert!(url.ends_with("image.png"));
     }
 
@@ -549,5 +606,18 @@ mod tests {
             first_src_from_srcset("https://example.com/img.jpg"),
             Some("https://example.com/img.jpg".to_string())
         );
+    }
+
+    #[test]
+    fn test_first_src_from_srcset_picks_largest() {
+        // LessWrong-style srcset with many sizes
+        let lesswrong_srcset = "https://cdn.example.com/w_120 120w, https://cdn.example.com/w_240 240w, https://cdn.example.com/w_480 480w, https://cdn.example.com/w_960 960w, https://cdn.example.com/w_1132 1132w";
+
+        let result = first_src_from_srcset(lesswrong_srcset);
+        assert!(result.is_some());
+        let url = result.unwrap();
+
+        // Should pick the largest (1132w)
+        assert!(url.contains("w_1132"));
     }
 }

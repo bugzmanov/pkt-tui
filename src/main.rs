@@ -636,8 +636,7 @@ impl DocTypePopupState {
 
 enum LoadingType {
     Refresh,
-    Download,
-    DownloadNative, // Rust-native web2epub
+    Download { force: bool }, // Download + open in bookokrat; force=true skips cache
 }
 
 struct RefreshingPopup {
@@ -1557,79 +1556,10 @@ impl App {
         Ok(())
     }
 
-    fn download_current_pdf(&mut self) -> anyhow::Result<()> {
-        if let Some(idx) = self.virtual_state.selected() {
-            if let Some(item) = self.items.get(idx) {
-                if item.type_str() == "pdf" {
-                    // Create pdfs directory if it doesn't exist
-                    fs::create_dir_all("pdfs")?;
-
-                    // Extract filename from URL
-                    let url = utils::normalize_acm_pdf_url(&item.link);
-
-                    let mut filename = if !item.title.trim().is_empty() {
-                        utils::sanitize_filename(&item.title)
-                    } else {
-                        url.split('?')
-                            .next()
-                            .unwrap_or(&url)
-                            .split('/')
-                            .last()
-                            .unwrap_or("download.pdf")
-                            .replace("%20", "_")
-                    };
-                    if !filename.ends_with(".pdf") {
-                        filename.push_str(".pdf");
-                    }
-
-                    // Construct full path
-                    let mut path = std::path::PathBuf::from("pdfs");
-                    path.push(&filename);
-
-                    // Download the file
-                    let response = self
-                        .download_client
-                        .get(&url)
-                        .header(reqwest::header::ACCEPT, "application/pdf")
-                        .header(
-                            reqwest::header::USER_AGENT,
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                        )
-                        .send()?;
-                    let content_type = response
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let content = response.bytes()?;
-                    if !content_type.contains("application/pdf")
-                        && utils::looks_like_html(&content)
-                    {
-                        let _ = webbrowser::open(&url);
-                        anyhow::bail!(
-                            "PDF download blocked (HTML returned). Opened in browser for manual download."
-                        );
-                    }
-                    std::fs::write(path.clone(), content)?;
-
-                    // Mark as downloaded by adding a tag
-                    self.raindrop_client.add_tag(item, "downloaded")?;
-
-                    if let Some(pdf_info) = utils::extract_pdf_title(path.as_path())? {
-                        if let Some(title) = pdf_info.title {
-                            self.rename_current_item(title)?;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn download_and_open_article_epub(&mut self) -> anyhow::Result<()> {
+    fn download_and_open_pdf(&mut self, force: bool) -> anyhow::Result<()> {
         let item = if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
-                if item.type_str() == "article" {
+                if item.type_str() == "pdf" {
                     Some(item.clone())
                 } else {
                     None
@@ -1642,34 +1572,74 @@ impl App {
         };
 
         if let Some(item) = item {
-            let link = item.link.clone();
-            let cache_id = self.make_epub_cache_id(&item.id.to_string());
-            let downloaded = self.download_and_open_epub(&link, &cache_id)?;
-            if downloaded {
-                self.raindrop_client.add_tag(&item, "downloaded")?;
-            }
-        }
-        Ok(())
-    }
+            fs::create_dir_all("pdfs")?;
 
-    fn download_and_open_rss_epub(&mut self) -> anyhow::Result<()> {
-        if let Some(selected_item) = self
-            .rss_tab_state
-            .items
-            .get(self.rss_tab_state.selected_index)
-        {
-            let link = selected_item.link.clone();
-            let cache_id = self.make_epub_cache_id(&selected_item.item_id);
-            if link.is_empty() {
-                return Ok(());
+            let url = utils::normalize_acm_pdf_url(&item.link);
+            let mut filename = if !item.title.trim().is_empty() {
+                utils::sanitize_filename(&item.title)
+            } else {
+                url.split('?')
+                    .next()
+                    .unwrap_or(&url)
+                    .split('/')
+                    .last()
+                    .unwrap_or("download.pdf")
+                    .replace("%20", "_")
+            };
+            if !filename.ends_with(".pdf") {
+                filename.push_str(".pdf");
             }
-            self.download_and_open_epub(&link, &cache_id)?;
+
+            let path = std::path::PathBuf::from("pdfs").join(&filename);
+
+            // Download if not cached or force redownload
+            if force || !path.exists() {
+                let response = self
+                    .download_client
+                    .get(&url)
+                    .header(reqwest::header::ACCEPT, "application/pdf")
+                    .header(
+                        reqwest::header::USER_AGENT,
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    )
+                    .send()?;
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let content = response.bytes()?;
+
+                let final_content = if !content_type.contains("application/pdf")
+                    && utils::looks_like_html(&content)
+                {
+                    bundle::downloader::download_pdf_via_browser(&url)?
+                } else {
+                    content.to_vec()
+                };
+                std::fs::write(&path, final_content)?;
+
+                self.raindrop_client.add_tag(&item, "downloaded")?;
+
+                // Extract PDF title and rename item if possible
+                if let Some(pdf_info) = utils::extract_pdf_title(path.as_path())? {
+                    if let Some(title) = pdf_info.title {
+                        self.rename_current_item(title)?;
+                    }
+                }
+            }
+
+            // Open in bookokrat
+            let mut command = std::process::Command::new("bookokrat");
+            command.arg(&path).arg("--zen-mode");
+            self.run_external_tui_command("bookokrat", &mut command)?;
         }
         Ok(())
     }
 
     /// Native Rust implementation of article to EPUB conversion (for Raindrop items)
-    fn download_and_open_article_epub_native(&mut self) -> anyhow::Result<()> {
+    fn download_and_open_article_epub_native(&mut self, force: bool) -> anyhow::Result<()> {
         let item = if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
                 if item.type_str() == "article" {
@@ -1687,7 +1657,7 @@ impl App {
         if let Some(item) = item {
             let link = item.link.clone();
             let cache_id = self.make_epub_cache_id(&item.id.to_string());
-            let downloaded = self.download_and_open_epub_native(&link, &cache_id)?;
+            let downloaded = self.download_and_open_epub_native(&link, &cache_id, force)?;
             if downloaded {
                 self.raindrop_client.add_tag(&item, "downloaded")?;
             }
@@ -1696,7 +1666,7 @@ impl App {
     }
 
     /// Native Rust implementation of article to EPUB conversion (for RSS items)
-    fn download_and_open_rss_epub_native(&mut self) -> anyhow::Result<()> {
+    fn download_and_open_rss_epub_native(&mut self, force: bool) -> anyhow::Result<()> {
         if let Some(selected_item) = self
             .rss_tab_state
             .items
@@ -1707,17 +1677,22 @@ impl App {
             if link.is_empty() {
                 return Ok(());
             }
-            self.download_and_open_epub_native(&link, &cache_id)?;
+            self.download_and_open_epub_native(&link, &cache_id, force)?;
         }
         Ok(())
     }
 
     /// Native Rust implementation: fetch, extract, and convert URL to EPUB
-    fn download_and_open_epub_native(&mut self, url: &str, cache_id: &str) -> anyhow::Result<bool> {
+    fn download_and_open_epub_native(
+        &mut self,
+        url: &str,
+        cache_id: &str,
+        force: bool,
+    ) -> anyhow::Result<bool> {
         let normalized_url = self.normalize_bugzarch_url(url);
         let epub_path = Path::new(EPUB_DIR).join(format!("{}.epub", cache_id));
         let mut downloaded = false;
-        let force_redownload = normalized_url != url;
+        let force_redownload = force || normalized_url != url;
         let temp_images_dir = Path::new("temp_images").join(cache_id);
 
         log::info!(
@@ -1747,68 +1722,6 @@ impl App {
         }
 
         // Clean up temp images after EPUB is created
-        if temp_images_dir.exists() {
-            let _ = fs::remove_dir_all(&temp_images_dir);
-        }
-
-        let mut command = std::process::Command::new("bookokrat");
-        command.arg(&epub_path).arg("--zen-mode");
-        self.run_external_tui_command("bookokrat", &mut command)?;
-
-        Ok(downloaded)
-    }
-
-    fn download_and_open_epub(&mut self, url: &str, cache_id: &str) -> anyhow::Result<bool> {
-        let normalized_url = self.normalize_bugzarch_url(url);
-        let epub_path = Path::new(EPUB_DIR).join(format!("{}.epub", cache_id));
-        let mut downloaded = false;
-        let force_redownload = normalized_url != url;
-        let temp_images_dir = Path::new("temp_images").join(cache_id);
-
-        log::info!(
-            "bugzarch: url='{}' normalized='{}' output='{}' force_redownload={}",
-            url,
-            normalized_url,
-            epub_path.display(),
-            force_redownload
-        );
-
-        if epub_path.exists() && force_redownload {
-            fs::remove_file(&epub_path)?;
-        }
-
-        if !epub_path.exists() {
-            fs::create_dir_all(EPUB_DIR)?;
-
-            let output = std::process::Command::new("bugzarch")
-                .arg(&normalized_url)
-                .arg("--output")
-                .arg(&epub_path)
-                .output();
-
-            let output = match output {
-                Ok(output) => output,
-                Err(err) => {
-                    if err.kind() == io::ErrorKind::NotFound {
-                        return Err(anyhow::anyhow!("bugzarch not available on PATH"));
-                    }
-                    return Err(anyhow::anyhow!("Failed to start bugzarch: {}", err));
-                }
-            };
-
-            if !output.stdout.is_empty() {
-                log::info!("bugzarch stdout: {}", String::from_utf8_lossy(&output.stdout));
-            }
-            if !output.stderr.is_empty() {
-                log::warn!("bugzarch stderr: {}", String::from_utf8_lossy(&output.stderr));
-            }
-
-            if !output.status.success() {
-                return Err(anyhow::anyhow!("bugzarch exited with {}", output.status));
-            }
-            downloaded = true;
-        }
-
         if temp_images_dir.exists() {
             let _ = fs::remove_dir_all(&temp_images_dir);
         }
@@ -3336,32 +3249,15 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                 if pop.was_redered {
                     let refresh_result = match pop.refresh_type {
                         LoadingType::Refresh => app.refresh_data(),
-                        LoadingType::Download => {
+                        LoadingType::Download { force } => {
                             if app.current_tab == CurrentTab::RssFeed {
-                                app.download_and_open_rss_epub()
+                                app.download_and_open_rss_epub_native(force)
                             } else if let Some(idx) = app.virtual_state.selected() {
                                 if let Some(item) = app.items.get(idx) {
                                     match item.type_str() {
-                                        "pdf" => app.download_current_pdf(),
-                                        "article" => app.download_and_open_article_epub(),
+                                        "article" => app.download_and_open_article_epub_native(force),
+                                        "pdf" => app.download_and_open_pdf(force),
                                         _ => Ok(()),
-                                    }
-                                } else {
-                                    Ok(())
-                                }
-                            } else {
-                                Ok(())
-                            }
-                        }
-                        LoadingType::DownloadNative => {
-                            if app.current_tab == CurrentTab::RssFeed {
-                                app.download_and_open_rss_epub_native()
-                            } else if let Some(idx) = app.virtual_state.selected() {
-                                if let Some(item) = app.items.get(idx) {
-                                    if item.type_str() == "article" {
-                                        app.download_and_open_article_epub_native()
-                                    } else {
-                                        Ok(())
                                     }
                                 } else {
                                     Ok(())
@@ -3939,13 +3835,13 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                             Char('w') => {
                                 app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
                                     "Opening reader ⏳".to_string(),
-                                    LoadingType::Download,
+                                    LoadingType::Download { force: false },
                                 ));
                             }
                             Char('W') => {
                                 app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
-                                    "Opening reader (native) ⏳".to_string(),
-                                    LoadingType::DownloadNative,
+                                    "Force redownloading ⏳".to_string(),
+                                    LoadingType::Download { force: true },
                                 ));
                             }
                             Char('Z') => {
@@ -4045,14 +3941,14 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                                     match item.type_str() {
                                         "pdf" | "article" => {
                                             let message = match item.type_str() {
-                                                "pdf" => "Downloading pdf ⏳",
+                                                "pdf" => "Opening PDF ⏳",
                                                 "article" => "Opening reader ⏳",
                                                 _ => unreachable!(),
                                             };
                                             app.app_mode =
                                                 AppMode::Refreshing(RefreshingPopup::new(
                                                     message.to_string(),
-                                                    LoadingType::Download,
+                                                    LoadingType::Download { force: false },
                                                 ));
                                         }
                                         _ => {} // Do nothing for other types
@@ -4061,15 +3957,20 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                             }
                         }
                         Char('W') => {
-                            // Native Rust conversions (articles: web2epub, PDFs: pdf2epub)
+                            // Force redownload (skip cache)
                             if let Some(idx) = app.virtual_state.selected() {
                                 if let Some(item) = app.items.get(idx) {
                                     match item.type_str() {
-                                        "article" => {
+                                        "pdf" | "article" => {
+                                            let message = match item.type_str() {
+                                                "pdf" => "Force redownloading PDF ⏳",
+                                                "article" => "Force redownloading ⏳",
+                                                _ => unreachable!(),
+                                            };
                                             app.app_mode =
                                                 AppMode::Refreshing(RefreshingPopup::new(
-                                                    "Opening reader (native) ⏳".to_string(),
-                                                    LoadingType::DownloadNative,
+                                                    message.to_string(),
+                                                    LoadingType::Download { force: true },
                                                 ));
                                         }
                                         _ => {}

@@ -1,5 +1,6 @@
 //! HTML fetching and article extraction using dom_smoothie.
 
+use regex::Regex;
 use reqwest::blocking::Client;
 use thiserror::Error;
 use url::Url;
@@ -52,8 +53,77 @@ fn extract_hostname(url: &str) -> String {
         .unwrap_or_else(|| "Unknown".to_string())
 }
 
+/// Check if URL is from LessWrong or related sites that use Apollo SSR.
+fn is_lesswrong_url(url: &str) -> bool {
+    url.contains("lesswrong.com") || url.contains("alignmentforum.org")
+}
+
+/// Unescape Unicode sequences like \u003c to actual characters.
+fn unescape_unicode(s: &str) -> String {
+    let re = Regex::new(r"\\u([0-9a-fA-F]{4})").unwrap();
+    re.replace_all(s, |caps: &regex::Captures| {
+        let hex = &caps[1];
+        if let Ok(code) = u32::from_str_radix(hex, 16) {
+            if let Some(ch) = char::from_u32(code) {
+                return ch.to_string();
+            }
+        }
+        caps[0].to_string()
+    })
+    .to_string()
+}
+
+/// Extract article content from LessWrong's Apollo SSR data.
+fn extract_lesswrong_article(html: &str) -> Option<Article> {
+    // Extract title from: "post":{"result":{"_id":"...","slug":"...","title":"The Title"
+    let title_re = Regex::new(r#""post":\s*\{\s*"result":\s*\{[^}]*"title"\s*:\s*"([^"]+)""#).ok()?;
+    let title = title_re
+        .captures(html)
+        .map(|c| c.get(1).unwrap().as_str().to_string())
+        .unwrap_or_else(|| "Untitled".to_string());
+
+    // Extract author from: "displayName":"Author Name"
+    let author_re = Regex::new(r#""user":\s*\{[^}]*"displayName"\s*:\s*"([^"]+)""#).ok()?;
+    let author = author_re
+        .captures(html)
+        .map(|c| c.get(1).unwrap().as_str().to_string())
+        .unwrap_or_else(|| "LessWrong".to_string());
+
+    // Extract content from: "tableOfContents":{"html":"<content>"
+    // The content ends at ","sections": or similar
+    let content_re =
+        Regex::new(r#""tableOfContents"\s*:\s*\{\s*"html"\s*:\s*"((?:[^"\\]|\\.)*)""#).ok()?;
+    let content_match = content_re.captures(html)?;
+    let raw_content = content_match.get(1)?.as_str();
+
+    // Unescape Unicode and other escape sequences
+    let content_html = unescape_unicode(raw_content)
+        .replace("\\\"", "\"")
+        .replace("\\/", "/")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t");
+
+    if content_html.is_empty() {
+        return None;
+    }
+
+    Some(Article {
+        title,
+        author,
+        content_html,
+    })
+}
+
 /// Extracts article content from HTML using dom_smoothie (Mozilla Readability port).
 pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
+    // Try LessWrong-specific extraction first for Apollo SSR sites
+    if is_lesswrong_url(url) {
+        if let Some(article) = extract_lesswrong_article(html) {
+            return Ok(article);
+        }
+        // Fall through to standard extraction if LessWrong-specific fails
+    }
+
     use dom_smoothie::{Config, Readability};
 
     let config = Config {
