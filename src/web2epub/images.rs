@@ -1,6 +1,7 @@
 //! Image downloading and normalization for EPUB generation.
 
 use base64::Engine;
+use regex::Regex;
 use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 use std::collections::HashSet;
@@ -482,33 +483,18 @@ pub fn normalize_images(
         }
     }
 
-    // Remove srcset and sizes attributes
-    let srcset_patterns = [
-        (r#" srcset="[^"]*""#, ""),
-        (r#" srcset='[^']*'"#, ""),
-        (r#" sizes="[^"]*""#, ""),
-        (r#" sizes='[^']*'"#, ""),
+    // Remove srcset and sizes attributes from img tags only
+    // Use regex to ensure we only match attributes inside <img> tags
+    let attr_patterns = [
+        r#"(<img[^>]*)\s+srcset="[^"]*""#,
+        r#"(<img[^>]*)\s+srcset='[^']*'"#,
+        r#"(<img[^>]*)\s+sizes="[^"]*""#,
+        r#"(<img[^>]*)\s+sizes='[^']*'"#,
     ];
 
-    for (pattern, _replacement) in srcset_patterns {
-        // Simple regex-like replacement
-        while let Some(start) = result.find(pattern.trim_start_matches(' ').split('=').next().unwrap()) {
-            if let Some(rel_start) = result[start..].find('=') {
-                let quote_start = start + rel_start + 1;
-                if quote_start < result.len() {
-                    let quote_char = result.chars().nth(quote_start).unwrap();
-                    if quote_char == '"' || quote_char == '\'' {
-                        if let Some(quote_end) = result[quote_start + 1..].find(quote_char) {
-                            let full_end = quote_start + 1 + quote_end + 1;
-                            // Find the start of the attribute name
-                            let attr_start = result[..start].rfind(' ').map(|p| p).unwrap_or(start);
-                            result = format!("{}{}", &result[..attr_start], &result[full_end..]);
-                            continue;
-                        }
-                    }
-                }
-            }
-            break;
+    for pattern in attr_patterns {
+        if let Ok(re) = Regex::new(pattern) {
+            result = re.replace_all(&result, "$1").to_string();
         }
     }
 

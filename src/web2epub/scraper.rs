@@ -1,7 +1,10 @@
 //! HTML fetching and article extraction using dom_smoothie.
 
+use headless_chrome::{Browser, LaunchOptions};
 use regex::Regex;
 use reqwest::blocking::Client;
+use scraper::{Html, Selector};
+use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
@@ -18,6 +21,9 @@ pub enum ScraperError {
 
     #[error("DOM parsing error: {0}")]
     DomError(String),
+
+    #[error("Browser error: {0}")]
+    BrowserError(String),
 }
 
 /// Extracted article content.
@@ -45,6 +51,98 @@ pub fn fetch_html(client: &Client, url: &str) -> Result<String, ScraperError> {
     Ok(response.text()?)
 }
 
+/// Detects if HTML is likely a JavaScript SPA that requires browser rendering.
+fn is_spa_html(html: &str) -> bool {
+    let lower = html.to_lowercase();
+
+    // Check for common SPA indicators
+    let has_noscript_js_required = lower.contains("you need to enable javascript")
+        || lower.contains("please enable javascript")
+        || lower.contains("javascript is required");
+
+    // Check for empty body with just a root div (React/Vue/Angular pattern)
+    let has_app_root_only = (lower.contains("<div id=\"root\">")
+        || lower.contains("<div id=\"app\">")
+        || lower.contains("<div id=\"__next\">")
+        || lower.contains("id=\"ramp-builders\""))
+        && !lower.contains("<article")
+        && !lower.contains("<main");
+
+    // Check body content - SPAs typically have very little content in body
+    if let Some(body_start) = lower.find("<body") {
+        if let Some(body_end) = lower.find("</body>") {
+            let body_content = &lower[body_start..body_end];
+            // If body has less than 500 chars of actual content (excluding scripts), likely SPA
+            let content_without_scripts: String = body_content
+                .split("<script")
+                .next()
+                .unwrap_or("")
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect();
+            if content_without_scripts.len() < 200 && has_app_root_only {
+                return true;
+            }
+        }
+    }
+
+    has_noscript_js_required || has_app_root_only
+}
+
+/// Fetches HTML content from a URL using a headless browser.
+/// This is used as a fallback for JavaScript SPAs that require rendering.
+pub fn fetch_html_via_browser(url: &str) -> Result<String, ScraperError> {
+    log::info!("Attempting to fetch page via browser (SPA fallback): {}", url);
+
+    let launch_options = LaunchOptions::default_builder()
+        .headless(true)
+        .sandbox(true)
+        .build()
+        .map_err(|e| ScraperError::BrowserError(format!("Failed to build launch options: {}", e)))?;
+
+    let browser = Browser::new(launch_options)
+        .map_err(|e| ScraperError::BrowserError(format!("Failed to launch browser: {}", e)))?;
+
+    let tab = browser
+        .new_tab()
+        .map_err(|e| ScraperError::BrowserError(format!("Failed to create tab: {}", e)))?;
+
+    // Navigate to the URL
+    tab.navigate_to(url)
+        .map_err(|e| ScraperError::BrowserError(format!("Failed to navigate: {}", e)))?;
+
+    // Wait for page to load
+    tab.wait_until_navigated()
+        .map_err(|e| ScraperError::BrowserError(format!("Navigation timeout: {}", e)))?;
+
+    // Wait a bit for JavaScript to render content
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Check for Cloudflare challenge and wait if needed
+    for _ in 0..10 {
+        if let Ok(content) = tab.get_content() {
+            let lower = content.to_lowercase();
+            if lower.contains("just a moment") || lower.contains("checking your browser") {
+                log::debug!("Cloudflare challenge detected, waiting...");
+                std::thread::sleep(Duration::from_secs(2));
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Additional wait for SPA content to render
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Get the rendered HTML
+    let html = tab
+        .get_content()
+        .map_err(|e| ScraperError::BrowserError(format!("Failed to get page content: {}", e)))?;
+
+    log::info!("Successfully fetched page via browser ({} bytes)", html.len());
+    Ok(html)
+}
+
 /// Extracts the hostname from a URL for use as a fallback author.
 fn extract_hostname(url: &str) -> String {
     Url::parse(url)
@@ -56,6 +154,11 @@ fn extract_hostname(url: &str) -> String {
 /// Check if URL is from LessWrong or related sites that use Apollo SSR.
 fn is_lesswrong_url(url: &str) -> bool {
     url.contains("lesswrong.com") || url.contains("alignmentforum.org")
+}
+
+/// Check if URL requires browser rendering (heavy JS sites that can't be scraped statically).
+fn requires_browser_rendering(url: &str) -> bool {
+    url.contains("x.com") || url.contains("twitter.com")
 }
 
 /// Unescape Unicode sequences like \u003c to actual characters.
@@ -114,6 +217,98 @@ fn extract_lesswrong_article(html: &str) -> Option<Article> {
     })
 }
 
+/// Checks if an image element looks like content (not a small icon/button image).
+fn is_content_image(img: &scraper::ElementRef) -> bool {
+    // Check width attribute
+    if let Some(width) = img.value().attr("width") {
+        // "100%" or large percentage = content
+        if width.ends_with('%') {
+            if let Ok(pct) = width.trim_end_matches('%').parse::<u32>() {
+                if pct >= 50 {
+                    return true;
+                }
+            }
+        }
+        // Explicit pixel width - icons are typically <= 48px
+        if let Ok(px) = width.parse::<u32>() {
+            return px > 48;
+        }
+    }
+
+    // Check height attribute for small icons
+    if let Some(height) = img.value().attr("height") {
+        if let Ok(px) = height.parse::<u32>() {
+            if px <= 48 {
+                return false;
+            }
+        }
+    }
+
+    // Check src - data URIs for tiny images, or icon-like paths
+    if let Some(src) = img.value().attr("src") {
+        let src_lower = src.to_lowercase();
+        // Skip obvious icons
+        if src_lower.contains("icon") || src_lower.contains("logo") || src_lower.contains("favicon") {
+            return false;
+        }
+        // Small inline SVGs are usually icons
+        if src.starts_with("data:image/svg") && src.len() < 500 {
+            return false;
+        }
+    }
+
+    // No explicit small size = assume content
+    true
+}
+
+/// Pre-processes HTML to unwrap content images from button/overlay containers.
+/// Uses regex to find button tags containing img tags and extract just the img.
+fn unwrap_images_from_buttons(html: &str) -> String {
+    let document = Html::parse_document(html);
+    let button_selector = Selector::parse("button").unwrap();
+    let img_selector = Selector::parse("img").unwrap();
+
+    let mut result = html.to_string();
+    let mut replacements = Vec::new();
+
+    // Collect image srcs that need unwrapping
+    for button in document.select(&button_selector) {
+        if let Some(img) = button.select(&img_selector).next() {
+            if is_content_image(&img) {
+                if let Some(src) = img.value().attr("src") {
+                    replacements.push(src.to_string());
+                }
+            }
+        }
+    }
+
+    // For each src, find the button containing it and replace with just the img
+    for src in replacements {
+        // Escape special regex characters in src
+        let escaped_src = regex::escape(&src);
+
+        // Pattern: <button ...> ... <img ... src="..."> ... </button>
+        // Using [\s\S]*? to match any character including newlines (non-greedy)
+        let pattern = format!(
+            r#"<button[^>]*>[\s\S]*?<img([^>]*src=["']{}["'][^>]*)>[\s\S]*?</button>"#,
+            escaped_src
+        );
+
+        if let Ok(re) = Regex::new(&pattern) {
+            if let Some(caps) = re.captures(&result) {
+                // Reconstruct the img tag from captured attributes
+                let img_attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                let img_tag = format!("<img{}>", img_attrs);
+                let full_match = caps.get(0).unwrap().as_str();
+                result = result.replace(full_match, &img_tag);
+                log::debug!("Unwrapped content image from button: {}", src);
+            }
+        }
+    }
+
+    result
+}
+
 /// Extracts article content from HTML using dom_smoothie (Mozilla Readability port).
 pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
     // Try LessWrong-specific extraction first for Apollo SSR sites
@@ -124,6 +319,9 @@ pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
         // Fall through to standard extraction if LessWrong-specific fails
     }
 
+    // Pre-process HTML to unwrap images from button containers
+    let preprocessed_html = unwrap_images_from_buttons(html);
+
     use dom_smoothie::{Config, Readability};
 
     let config = Config {
@@ -131,7 +329,7 @@ pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
         ..Default::default()
     };
 
-    let mut readability = Readability::new(html, Some(url), Some(config))
+    let mut readability = Readability::new(preprocessed_html, Some(url), Some(config))
         .map_err(|e| ScraperError::DomError(e.to_string()))?;
 
     let article = readability
@@ -164,7 +362,29 @@ pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
 }
 
 /// Fetches a URL and extracts article content in one step.
+/// Falls back to browser rendering for JavaScript SPAs.
 pub fn fetch_and_extract(client: &Client, url: &str) -> Result<Article, ScraperError> {
+    // Some sites always require browser rendering (heavy JS SPAs)
+    if requires_browser_rendering(url) {
+        log::info!("URL requires browser rendering: {}", url);
+        let rendered_html = fetch_html_via_browser(url)?;
+        return extract_article(&rendered_html, url);
+    }
+
     let html = fetch_html(client, url)?;
-    extract_article(&html, url)
+
+    // Try standard extraction first
+    match extract_article(&html, url) {
+        Ok(article) => Ok(article),
+        Err(e) => {
+            // Check if this looks like a SPA that needs browser rendering
+            if is_spa_html(&html) {
+                log::info!("Page appears to be a JavaScript SPA, trying browser fallback");
+                let rendered_html = fetch_html_via_browser(url)?;
+                extract_article(&rendered_html, url)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }

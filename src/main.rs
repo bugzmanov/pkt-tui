@@ -637,6 +637,7 @@ impl DocTypePopupState {
 enum LoadingType {
     Refresh,
     Download { force: bool }, // Download + open in bookokrat; force=true skips cache
+    YoutubeChannels,          // Building YouTube channel list
 }
 
 struct RefreshingPopup {
@@ -748,6 +749,97 @@ impl SummarizePopupState {
     fn scroll_half_page_up(&mut self) {
         let half_page = self.visible_height / 2;
         self.scroll_offset = self.scroll_offset.saturating_sub(half_page);
+    }
+}
+
+#[derive(Clone)]
+enum YoutubeListItem {
+    ChannelHeader { name: String, video_count: usize },
+    Video { title: String, url: String, channel: String },
+}
+
+struct YoutubeChannelPopupState {
+    items: Vec<YoutubeListItem>,
+    selected_index: usize,
+    scroll_offset: usize,
+    visible_items: usize,
+    total_videos: usize,
+}
+
+impl YoutubeChannelPopupState {
+    fn new(channels: Vec<(String, Vec<(String, String)>)>, visible_items: usize) -> Self {
+        let total_videos: usize = channels.iter().map(|(_, videos)| videos.len()).sum();
+
+        // Build flat list: channel headers followed by their videos
+        let mut items = Vec::new();
+        for (channel_name, videos) in channels {
+            items.push(YoutubeListItem::ChannelHeader {
+                name: channel_name.clone(),
+                video_count: videos.len(),
+            });
+            for (title, url) in videos {
+                items.push(YoutubeListItem::Video {
+                    title,
+                    url,
+                    channel: channel_name.clone(),
+                });
+            }
+        }
+
+        Self {
+            items,
+            selected_index: 0,
+            scroll_offset: 0,
+            visible_items,
+            total_videos,
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.items.is_empty() {
+            return;
+        }
+        let new_index = self.selected_index as isize + delta;
+        self.selected_index = new_index.clamp(0, self.items.len() as isize - 1) as usize;
+
+        // Adjust scroll if selection is out of view
+        if self.selected_index < self.scroll_offset {
+            self.scroll_offset = self.selected_index;
+        } else if self.selected_index >= self.scroll_offset + self.visible_items {
+            self.scroll_offset = self.selected_index - self.visible_items + 1;
+        }
+    }
+
+    fn page_down(&mut self) {
+        let half_page = self.visible_items / 2;
+        self.move_selection(half_page as isize);
+    }
+
+    fn page_up(&mut self) {
+        let half_page = self.visible_items / 2;
+        self.move_selection(-(half_page as isize));
+    }
+
+    fn selected_item(&self) -> Option<&YoutubeListItem> {
+        self.items.get(self.selected_index)
+    }
+
+    fn total_videos(&self) -> usize {
+        self.total_videos
+    }
+
+    fn jump_to_end(&mut self) {
+        if !self.items.is_empty() {
+            self.selected_index = self.items.len() - 1;
+            if self.selected_index >= self.visible_items {
+                self.scroll_offset = self.selected_index - self.visible_items + 1;
+            }
+        }
+    }
+
+    fn jump_to_start(&mut self) {
+        self.selected_index = 0;
+        self.scroll_offset = 0;
     }
 }
 
@@ -1109,6 +1201,14 @@ struct App {
     force_redraw: bool,
     /// Items marked for offline bundling
     marked_items: std::collections::HashSet<i64>,
+    /// YouTube channel filter
+    youtube_channel_filter: Option<String>,
+    /// YouTube channel popup state
+    youtube_channel_popup_state: Option<YoutubeChannelPopupState>,
+    /// YouTube channel cache (url -> channel name)
+    youtube_channel_cache: std::collections::HashMap<String, String>,
+    /// Cached grouped channels result (invalidated when filters change)
+    youtube_channels_grouped_cache: Option<Vec<(String, Vec<(String, String)>)>>,
 }
 
 impl App {
@@ -1165,6 +1265,10 @@ impl App {
             summarize_token: None,
             force_redraw: false,
             marked_items: std::collections::HashSet::new(),
+            youtube_channel_filter: None,
+            youtube_channel_popup_state: None,
+            youtube_channel_cache: utils::load_youtube_channel_cache(),
+            youtube_channels_grouped_cache: None,
         })
     }
 
@@ -1692,7 +1796,7 @@ impl App {
         let normalized_url = self.normalize_bugzarch_url(url);
         let epub_path = Path::new(EPUB_DIR).join(format!("{}.epub", cache_id));
         let mut downloaded = false;
-        let force_redownload = force || normalized_url != url;
+        let force_redownload = force;
         let temp_images_dir = Path::new("temp_images").join(cache_id);
 
         log::info!(
@@ -2226,6 +2330,113 @@ impl App {
         self.domain_stats_popup_state = Some(DomainStatsPopupState::new(stats, visible_items));
     }
 
+    /// Returns true if popup was opened from cache (or cache shows no videos),
+    /// false if loading is needed
+    fn show_youtube_channels(&mut self) -> bool {
+        // If we have a cached result, use it immediately
+        if let Some(ref channels) = self.youtube_channels_grouped_cache {
+            if channels.is_empty() {
+                // No YouTube videos, nothing to show
+                return true;
+            }
+            let visible_items = 20;
+            self.youtube_channel_popup_state =
+                Some(YoutubeChannelPopupState::new(channels.clone(), visible_items));
+            return true;
+        }
+        false // Need to build the list (show loading screen)
+    }
+
+    /// Build the YouTube channels list (expensive operation with HTTP calls)
+    fn build_youtube_channels(&mut self) {
+        use std::collections::HashMap;
+
+        // Collect all YouTube videos from current filtered items
+        let youtube_videos: Vec<(String, String)> = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.type_str() == "video" && utils::is_youtube_url(&item.link)
+            })
+            .map(|item| (item.display_title().to_string(), item.link.clone()))
+            .collect();
+
+        if youtube_videos.is_empty() {
+            self.youtube_channels_grouped_cache = Some(Vec::new());
+            return;
+        }
+
+        // Group videos by channel
+        let mut channels_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut cache_updated = false;
+
+        for (title, url) in youtube_videos {
+            // Try to get channel name from cache first
+            let channel_name = if let Some(name) = self.youtube_channel_cache.get(&url) {
+                name.clone()
+            } else {
+                // Fetch from oEmbed API
+                if let Some(name) = utils::fetch_youtube_channel(&self.download_client, &url) {
+                    self.youtube_channel_cache.insert(url.clone(), name.clone());
+                    cache_updated = true;
+                    name
+                } else {
+                    // Use "Unknown" for videos we couldn't fetch
+                    "Unknown".to_string()
+                }
+            };
+
+            channels_map
+                .entry(channel_name)
+                .or_insert_with(Vec::new)
+                .push((title, url));
+        }
+
+        // Save cache if updated
+        if cache_updated {
+            utils::save_youtube_channel_cache(&self.youtube_channel_cache);
+        }
+
+        // Convert to vector and sort by count (descending)
+        let mut channels: Vec<(String, Vec<(String, String)>)> = channels_map.into_iter().collect();
+        channels.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+
+        // Store in cache
+        self.youtube_channels_grouped_cache = Some(channels.clone());
+
+        // Show popup
+        let visible_items = 20;
+        self.youtube_channel_popup_state = Some(YoutubeChannelPopupState::new(channels, visible_items));
+    }
+
+    /// Handle Enter on youtube popup - opens video or filters by channel
+    fn handle_youtube_popup_select(&mut self) -> anyhow::Result<()> {
+        if let Some(popup_state) = &self.youtube_channel_popup_state {
+            if let Some(item) = popup_state.selected_item().cloned() {
+                match item {
+                    YoutubeListItem::Video { url, .. } => {
+                        // Open the video URL
+                        webbrowser::open(&url)?;
+                        self.youtube_channel_popup_state = None;
+                    }
+                    YoutubeListItem::ChannelHeader { name, .. } => {
+                        // Filter by this channel
+                        self.youtube_channel_filter = Some(name);
+                        self.apply_filter();
+                        self.youtube_channel_popup_state = None;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn clear_youtube_channel_filter(&mut self) {
+        self.youtube_channel_filter = None;
+        self.apply_filter();
+    }
+
     pub fn apply_filter(&mut self) {
         self.items.apply_filter(|item| {
             let title_matches = match &self.active_search_filter {
@@ -2267,10 +2478,27 @@ impl App {
                 None => true,
             };
 
-            title_matches && tag_matches && type_matches && domain_matches && not_archived
+            let youtube_channel_matches = match &self.youtube_channel_filter {
+                Some(channel_filter) => {
+                    // Only apply to YouTube videos
+                    if item.type_str() == "video" && utils::is_youtube_url(&item.link) {
+                        self.youtube_channel_cache
+                            .get(&item.link)
+                            .map(|channel| channel == channel_filter)
+                            .unwrap_or(false)
+                    } else {
+                        false // Non-YouTube videos don't match when filtering by channel
+                    }
+                }
+                None => true,
+            };
+
+            title_matches && tag_matches && type_matches && domain_matches && not_archived && youtube_channel_matches
         });
         self.virtual_state.select(Some(0));
         *self.virtual_state.offset_mut() = 0;
+        // Invalidate YouTube channels grouped cache when filters change
+        self.youtube_channels_grouped_cache = None;
     }
 
     fn show_doc_type_popup(&mut self) {
@@ -2327,6 +2555,7 @@ impl App {
         self.active_search_filter = None;
         self.selected_tag_filters.clear();
         self.domain_filter = None;
+        self.youtube_channel_filter = None;
         self.items.clear_filter();
     }
 
@@ -2368,7 +2597,6 @@ impl App {
             None => 0,
         };
         self.virtual_state.select(Some(i));
-        self.scroll_state = self.scroll_state.position(i * ITEM_HEIGHT);
     }
 
     pub fn previous(&mut self) {
@@ -2383,10 +2611,6 @@ impl App {
             None => 0,
         };
         self.virtual_state.select(Some(i));
-        if i < self.virtual_state.offset() {
-            *self.virtual_state.offset_mut() = i
-        }
-        self.scroll_state = self.scroll_state.position(i * ITEM_HEIGHT);
     }
 
     pub fn set_colors(&mut self) {
@@ -3266,6 +3490,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                                 Ok(())
                             }
                         }
+                        LoadingType::YoutubeChannels => {
+                            app.build_youtube_channels();
+                            Ok(())
+                        }
                     };
 
                     match refresh_result {
@@ -3749,6 +3977,34 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                         }
                         _ => { /*do nothing */ }
                     }
+                } else if let Some(ref mut yt_state) = &mut app.youtube_channel_popup_state {
+                    match key.code {
+                        Enter => {
+                            app.handle_youtube_popup_select()?;
+                        }
+                        Esc => {
+                            app.youtube_channel_popup_state = None;
+                        }
+                        Char('j') | Down => {
+                            yt_state.move_selection(1);
+                        }
+                        Char('k') | Up => {
+                            yt_state.move_selection(-1);
+                        }
+                        Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            yt_state.page_down();
+                        }
+                        Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            yt_state.page_up();
+                        }
+                        Char('G') => {
+                            yt_state.jump_to_end();
+                        }
+                        Char('g') => {
+                            yt_state.jump_to_start();
+                        }
+                        _ => { /*do nothing */ }
+                    }
                 } else if app.current_tab == CurrentTab::RssFeed {
                     // RSS Tab input handling
                     let popup_state = &mut app.rss_tab_state;
@@ -3990,6 +4246,15 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                         Char('S') => {
                             app.show_domain_stats();
                         }
+                        Char('Y') => {
+                            // Try to show from cache, otherwise show loading screen
+                            if !app.show_youtube_channels() {
+                                app.app_mode = AppMode::Refreshing(RefreshingPopup::new(
+                                    "Loading YouTube channels ⏳".to_string(),
+                                    LoadingType::YoutubeChannels,
+                                ));
+                            }
+                        }
                         Char('i') => app.show_doc_type_popup(),
                         Char('b') => {
                             match app.handle_neovim_edit() {
@@ -4065,6 +4330,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     // Overlays (only for Raindrops tab)
     if app.current_tab == CurrentTab::Raindrops {
         render_domain_stats_popup(f, app, rects[1]);
+        render_youtube_channel_popup(f, app, rects[1]);
         render_help_popup(f, app, rects[1]);
     }
 
@@ -5528,5 +5794,76 @@ fn render_domain_stats_popup(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_stateful_widget(scrollbar, popup_area, &mut scroll_state);
     }
 }
+
+fn render_youtube_channel_popup(f: &mut Frame, app: &mut App, area: Rect) {
+    if let Some(popup_state) = &mut app.youtube_channel_popup_state {
+        // Use full area
+        let popup_area = area;
+        f.render_widget(Clear, popup_area);
+
+        // Update visible_items based on actual height (minus 2 for borders)
+        popup_state.visible_items = popup_area.height.saturating_sub(2) as usize;
+
+        // Build list items from the flat list
+        let list_items: Vec<ListItem> = popup_state
+            .items
+            .iter()
+            .enumerate()
+            .skip(popup_state.scroll_offset)
+            .take(popup_state.visible_items)
+            .map(|(idx, item)| {
+                let is_selected = idx == popup_state.selected_index;
+                match item {
+                    YoutubeListItem::ChannelHeader { name, video_count } => {
+                        let text = format!("▸ {} ({})", name, video_count);
+                        let style = if is_selected {
+                            Style::default().fg(Color::Black).bg(Color::Yellow).bold()
+                        } else {
+                            Style::default().fg(Color::Cyan).bold()
+                        };
+                        ListItem::new(text).style(style)
+                    }
+                    YoutubeListItem::Video { title, .. } => {
+                        let max_width = popup_area.width.saturating_sub(8) as usize;
+                        let truncated: String = title.chars().take(max_width).collect();
+                        let text = format!("    {}", truncated);
+                        let style = if is_selected {
+                            Style::default().fg(Color::Black).bg(Color::White)
+                        } else {
+                            Style::default().fg(app.colors.row_fg)
+                        };
+                        ListItem::new(text).style(style)
+                    }
+                }
+            })
+            .collect();
+
+        let title = format!(
+            " YouTube Channels ({} videos) [Enter: open/filter, Esc: close] ",
+            popup_state.total_videos()
+        );
+        let channel_list = List::new(list_items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(Style::new().fg(app.colors.footer_border_color))
+                    .border_type(BorderType::Rounded),
+            )
+            .style(Style::new().bg(Color::Black));
+
+        f.render_widget(channel_list, popup_area);
+
+        // Scrollbar
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑".into()))
+            .end_symbol(Some("↓".into()));
+        let mut scroll_state = ScrollbarState::new(popup_state.items.len())
+            .position(popup_state.selected_index);
+        f.render_stateful_widget(scrollbar, popup_area, &mut scroll_state);
+    }
+}
+
 #[cfg(test)]
 mod tests {}
