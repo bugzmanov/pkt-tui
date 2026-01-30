@@ -7,9 +7,72 @@ pub struct PDFData {
     pub text: String,
 }
 
-pub fn extract_pdf_title(_path: &Path) -> anyhow::Result<Option<PDFData>> {
-    // Stub implementation as PDF support is removed
-    Ok(None)
+/// Extract PDF title from document metadata
+pub fn extract_pdf_title(path: &Path) -> anyhow::Result<Option<PDFData>> {
+    use lopdf::Document;
+
+    let doc = match Document::load(path) {
+        Ok(doc) => doc,
+        Err(e) => {
+            debug!("Failed to load PDF for title extraction: {}", e);
+            return Ok(None);
+        }
+    };
+
+    // Try to get title from PDF metadata (Info dictionary)
+    let title = doc
+        .trailer
+        .get(b"Info")
+        .ok()
+        .and_then(|info_ref| info_ref.as_reference().ok())
+        .and_then(|ref_id| doc.get_object(ref_id).ok())
+        .and_then(|info_obj| info_obj.as_dict().ok())
+        .and_then(|info_dict| info_dict.get(b"Title").ok())
+        .and_then(|title_obj| {
+            // Handle different string encodings in PDFs
+            match title_obj {
+                lopdf::Object::String(bytes, _) => {
+                    // Try UTF-16BE first (common for non-ASCII)
+                    if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+                        // UTF-16BE with BOM
+                        let utf16: Vec<u16> = bytes[2..]
+                            .chunks(2)
+                            .filter_map(|chunk| {
+                                if chunk.len() == 2 {
+                                    Some(u16::from_be_bytes([chunk[0], chunk[1]]))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        String::from_utf16(&utf16).ok()
+                    } else {
+                        // Try as UTF-8 or Latin-1
+                        String::from_utf8(bytes.clone())
+                            .or_else(|_| {
+                                // Fallback to Latin-1
+                                Ok::<String, std::string::FromUtf8Error>(
+                                    bytes.iter().map(|&b| b as char).collect(),
+                                )
+                            })
+                            .ok()
+                    }
+                }
+                _ => None,
+            }
+        })
+        .filter(|t| !t.trim().is_empty());
+
+    if let Some(ref t) = title {
+        debug!("Extracted PDF title: {}", t);
+    } else {
+        debug!("No title found in PDF metadata");
+    }
+
+    Ok(Some(PDFData {
+        title,
+        text: String::new(),
+    }))
 }
 
 pub fn normalize_acm_pdf_url(url: &str) -> String {
@@ -46,6 +109,34 @@ pub fn normalize_acm_pdf_url(url: &str) -> String {
 
 pub fn is_acm_pdf_url(url: &str) -> bool {
     url.contains("dl.acm.org/doi/epdf/") || url.contains("dl.acm.org/doi/pdf/")
+}
+
+/// Check if URL is an alphaxiv.org paper page (PDF wrapper)
+pub fn is_alphaxiv_url(url: &str) -> bool {
+    url.contains("alphaxiv.org/abs/")
+}
+
+/// Convert alphaxiv.org paper URL to direct PDF URL
+/// e.g., https://www.alphaxiv.org/abs/2601.10825 -> https://fetcher.alphaxiv.org/v2/pdf/2601.10825v1.pdf
+pub fn normalize_alphaxiv_pdf_url(url: &str) -> Option<String> {
+    if !is_alphaxiv_url(url) {
+        return None;
+    }
+
+    // Extract paper ID from URL like https://www.alphaxiv.org/abs/2601.10825
+    let paper_id = url.split("/abs/").nth(1)?.split(&['?', '#', '/'][..]).next()?;
+
+    // Default to v1 if no version specified
+    let versioned_id = if paper_id.contains('v') {
+        paper_id.to_string()
+    } else {
+        format!("{}v1", paper_id)
+    };
+
+    Some(format!(
+        "https://fetcher.alphaxiv.org/v2/pdf/{}.pdf",
+        versioned_id
+    ))
 }
 
 pub fn sanitize_filename(name: &str) -> String {

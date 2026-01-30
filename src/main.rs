@@ -17,7 +17,8 @@ use chrono::{DateTime, Local, Utc};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PushKeyboardEnhancementFlags,
+        KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -1312,7 +1313,7 @@ impl App {
 
         // Save terminal state and switch to normal mode for neovim
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), LeaveAlternateScreen, PopKeyboardEnhancementFlags)?;
 
         // Launch neovim
         let status = std::process::Command::new("nvim")
@@ -1358,7 +1359,7 @@ impl App {
         command: &mut std::process::Command,
     ) -> anyhow::Result<()> {
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen)?;
+        execute!(io::stdout(), LeaveAlternateScreen, PopKeyboardEnhancementFlags)?;
 
         let status_result = command.status();
 
@@ -1678,7 +1679,12 @@ impl App {
         if let Some(item) = item {
             fs::create_dir_all("pdfs")?;
 
-            let url = utils::normalize_acm_pdf_url(&item.link);
+            // Normalize URL for different PDF sources
+            let url = if let Some(alphaxiv_url) = utils::normalize_alphaxiv_pdf_url(&item.link) {
+                alphaxiv_url
+            } else {
+                utils::normalize_acm_pdf_url(&item.link)
+            };
             let mut filename = if !item.title.trim().is_empty() {
                 utils::sanitize_filename(&item.title)
             } else {
@@ -4948,19 +4954,29 @@ fn render_rss_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 .unwrap_or("No description available");
 
             let max_width = (desc_popup_area.width as usize).saturating_sub(4);
+            // Wrap each line individually to preserve newlines/paragraph structure
             let wrapped_text = description
-                .split_whitespace()
-                .fold((String::new(), 0), |(mut text, len), word| {
-                    if len + word.len() + 1 > max_width {
-                        text.push('\n');
-                        (text + word, word.len())
-                    } else if text.is_empty() {
-                        (word.to_string(), word.len())
+                .lines()
+                .map(|line| {
+                    if line.trim().is_empty() {
+                        String::new()
                     } else {
-                        (text + " " + word, len + word.len() + 1)
+                        line.split_whitespace()
+                            .fold((String::new(), 0), |(mut text, len), word| {
+                                if len + word.len() + 1 > max_width {
+                                    text.push('\n');
+                                    (text + word, word.len())
+                                } else if text.is_empty() {
+                                    (word.to_string(), word.len())
+                                } else {
+                                    (text + " " + word, len + word.len() + 1)
+                                }
+                            })
+                            .0
                     }
                 })
-                .0;
+                .collect::<Vec<_>>()
+                .join("\n");
 
             let text = Text::from(vec![
                 Line::from(vec![

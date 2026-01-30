@@ -36,6 +36,7 @@ image = "0.25"
 # Alternatives that are very hard to use:
 # pdf = "0.9.0"
 # pdf-extract = "0.8.0"
+lopdf = "0.34"
 anyhow = "1.0.81"
 thiserror = "1.0.58"
 color-eyre = "0.6.3"

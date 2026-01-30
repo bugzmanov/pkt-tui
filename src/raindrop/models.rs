@@ -175,7 +175,10 @@ impl Raindrop {
         match self.item_type {
             RaindropType::Video => "video",
             RaindropType::Article => {
-                if self.link.contains(".pdf") || crate::utils::is_acm_pdf_url(&self.link) {
+                if self.link.contains(".pdf")
+                    || crate::utils::is_acm_pdf_url(&self.link)
+                    || crate::utils::is_alphaxiv_url(&self.link)
+                {
                     "pdf"
                 } else {
                     "article"
@@ -190,7 +193,10 @@ impl Raindrop {
                 // Check URL for hints
                 if self.link.contains("youtube.com") || self.link.contains("youtu.be") {
                     "video"
-                } else if self.link.contains(".pdf") || crate::utils::is_acm_pdf_url(&self.link) {
+                } else if self.link.contains(".pdf")
+                    || crate::utils::is_acm_pdf_url(&self.link)
+                    || crate::utils::is_alphaxiv_url(&self.link)
+                {
                     "pdf"
                 } else {
                     "article"

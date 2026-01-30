@@ -261,6 +261,117 @@ fn is_content_image(img: &scraper::ElementRef) -> bool {
     true
 }
 
+/// Pre-processes HTML to convert custom "steps" components to ordered lists.
+/// Sites like code.claude.com use `<div role="list" class="steps">` with custom
+/// data-component-part attributes that Readability doesn't understand.
+fn convert_steps_to_list(html: &str) -> String {
+    let document = Html::parse_document(html);
+    // Match div with role="list" that has "steps" in its class attribute
+    let steps_selector = Selector::parse(r#"div[role="list"][class*="steps"]"#).unwrap();
+    // Match div with role="listitem" that has "step" in its class attribute
+    let step_selector = Selector::parse(r#"div[role="listitem"][class*="step"]"#).unwrap();
+    let title_selector = Selector::parse(r#"[data-component-part="step-title"]"#).unwrap();
+    let content_selector = Selector::parse(r#"[data-component-part="step-content"]"#).unwrap();
+
+    let mut result = html.to_string();
+    let mut replacements = Vec::new();
+
+    for steps_container in document.select(&steps_selector) {
+        let mut list_items = Vec::new();
+
+        for step in steps_container.select(&step_selector) {
+            let title = step
+                .select(&title_selector)
+                .next()
+                .map(|el| el.text().collect::<String>())
+                .unwrap_or_default();
+
+            let content = step
+                .select(&content_selector)
+                .next()
+                .map(|el| el.inner_html())
+                .unwrap_or_default();
+
+            if !title.is_empty() || !content.is_empty() {
+                let item = if !title.is_empty() && !content.is_empty() {
+                    format!("<li><strong>{}</strong>: {}</li>", title.trim(), content.trim())
+                } else if !title.is_empty() {
+                    format!("<li><strong>{}</strong></li>", title.trim())
+                } else {
+                    format!("<li>{}</li>", content.trim())
+                };
+                list_items.push(item);
+            }
+        }
+
+        if !list_items.is_empty() {
+            let ordered_list = format!("<ol>{}</ol>", list_items.join("\n"));
+            replacements.push((list_items.len(), ordered_list));
+        }
+    }
+
+    // Use regex to find and replace the steps containers
+    // Match: <div role="list" class="steps...">...</div> (the entire container)
+    if !replacements.is_empty() {
+        // Find opening tags of steps containers
+        let steps_pattern =
+            Regex::new(r#"<div[^>]*role="list"[^>]*class="[^"]*steps[^"]*"[^>]*>"#).unwrap();
+
+        for (item_count, replacement) in replacements {
+            if let Some(mat) = steps_pattern.find(&result) {
+                let start = mat.start();
+                // Find matching closing </div> - need to count nested divs
+                if let Some(end) = find_matching_close_tag(&result[start..], "div") {
+                    let full_end = start + end;
+                    log::debug!(
+                        "Converted steps component to ordered list with {} items",
+                        item_count
+                    );
+                    result = format!("{}{}{}", &result[..start], replacement, &result[full_end..]);
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Find the position after the matching closing tag, handling nested tags.
+fn find_matching_close_tag(html: &str, tag: &str) -> Option<usize> {
+    let open_tag = format!("<{}", tag);
+    let close_tag = format!("</{}>", tag);
+    let mut depth = 0;
+    let mut char_indices: Vec<(usize, char)> = html.char_indices().collect();
+    let mut i = 0;
+
+    while i < char_indices.len() {
+        let (byte_pos, _) = char_indices[i];
+        let remaining = &html[byte_pos..];
+
+        if remaining.starts_with(&open_tag) {
+            depth += 1;
+            // Skip past the open tag
+            let skip_bytes = open_tag.len();
+            while i < char_indices.len() && char_indices[i].0 < byte_pos + skip_bytes {
+                i += 1;
+            }
+        } else if remaining.starts_with(&close_tag) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(byte_pos + close_tag.len());
+            }
+            // Skip past the close tag
+            let skip_bytes = close_tag.len();
+            while i < char_indices.len() && char_indices[i].0 < byte_pos + skip_bytes {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 /// Pre-processes HTML to unwrap content images from button/overlay containers.
 /// Uses regex to find button tags containing img tags and extract just the img.
 fn unwrap_images_from_buttons(html: &str) -> String {
@@ -319,8 +430,9 @@ pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
         // Fall through to standard extraction if LessWrong-specific fails
     }
 
-    // Pre-process HTML to unwrap images from button containers
-    let preprocessed_html = unwrap_images_from_buttons(html);
+    // Pre-process HTML to convert custom components to standard HTML
+    let html_with_lists = convert_steps_to_list(html);
+    let preprocessed_html = unwrap_images_from_buttons(&html_with_lists);
 
     use dom_smoothie::{Config, Readability};
 

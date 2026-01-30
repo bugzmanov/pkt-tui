@@ -211,7 +211,12 @@ pub fn download_pdf(client: &Client, item: &BundleItem, bundle_path: &Path) -> R
     let pdf_path = bundle_path
         .join("pdfs")
         .join(format!("{}.pdf", filename));
-    let url = utils::normalize_acm_pdf_url(&item.link);
+    // Normalize URL for different PDF sources
+    let url = if let Some(alphaxiv_url) = utils::normalize_alphaxiv_pdf_url(&item.link) {
+        alphaxiv_url
+    } else {
+        utils::normalize_acm_pdf_url(&item.link)
+    };
 
     // First, try normal HTTP download
     let response = client
