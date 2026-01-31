@@ -1,5 +1,6 @@
 #![allow(clippy::enum_glob_use, clippy::wildcard_imports)]
 
+mod background_download;
 mod errors;
 mod logo;
 mod markdown;
@@ -9,6 +10,7 @@ mod readingstats;
 mod summarize;
 mod utils;
 
+use background_download::{BackgroundDownloadConfig, BackgroundDownloadState};
 use pkt_tui::bundle::{self, BundleItem, BundleItemType, BundlingPhase, BundlingState};
 use pkt_tui::web2epub;
 
@@ -654,6 +656,7 @@ impl DocTypePopupState {
     }
 }
 
+#[derive(Clone, Copy)]
 enum LoadingType {
     Refresh,
     Download { force: bool }, // Download + open in bookokrat; force=true skips cache
@@ -1238,6 +1241,12 @@ struct App {
     youtube_channel_cache: std::collections::HashMap<String, String>,
     /// Cached grouped channels result (invalidated when filters change)
     youtube_channels_grouped_cache: Option<Vec<(String, Vec<(String, String)>)>>,
+    /// Background download state
+    background_download_state: BackgroundDownloadState,
+    /// Background download config
+    background_download_config: BackgroundDownloadConfig,
+    /// Arc-wrapped async API for background thread
+    raindrop_api_arc: Arc<raindrop::RaindropAPI>,
 }
 
 impl App {
@@ -1246,6 +1255,7 @@ impl App {
         raindrop_client: raindrop::RaindropAPISync,
         stats: TotalStats,
         archive_collection_id: Option<i64>,
+        token: &str,
     ) -> anyhow::Result<App> {
         let cached_tags = data_vec
             .iter()
@@ -1255,6 +1265,8 @@ impl App {
             .collect();
         let metadata_store = load_shared_store()?;
         let raindrop_url_index = Arc::new(Self::build_raindrop_url_index(&data_vec));
+        let background_download_config = background_download::load_config().unwrap_or_default();
+        let raindrop_api_arc = Arc::new(raindrop::RaindropAPI::new(token)?);
         Ok(App {
             virtual_state: TableState::default().with_selected(0),
             state: TableState::default().with_selected(0),
@@ -1299,6 +1311,9 @@ impl App {
             youtube_channel_popup_state: None,
             youtube_channel_cache: utils::load_youtube_channel_cache(),
             youtube_channels_grouped_cache: None,
+            background_download_state: BackgroundDownloadState::new(),
+            background_download_config,
+            raindrop_api_arc,
         })
     }
 
@@ -2301,6 +2316,46 @@ impl App {
                 {
                     item.tags.push("archived".to_string());
                 }
+            }
+        }
+    }
+
+    /// Start background download of PDFs and articles
+    fn start_background_download(&self) {
+        log::info!(
+            "start_background_download called: enabled={}, lookback_days={}",
+            self.background_download_config.enabled,
+            self.background_download_config.lookback_days
+        );
+
+        if !self.background_download_config.enabled {
+            log::info!("Background download disabled in config");
+            return;
+        }
+
+        if self.background_download_state.is_running() {
+            log::info!("Background download already running");
+            return;
+        }
+
+        // Clone items for the background thread
+        let items: Vec<raindrop::Raindrop> = self.items.items.clone();
+        log::info!("Passing {} items to background download", items.len());
+
+        background_download::start_background_download(
+            self.raindrop_api_arc.clone(),
+            self.background_download_config.clone(),
+            self.background_download_state.clone(),
+            items,
+        );
+    }
+
+    /// Acknowledge background download completion and optionally refresh
+    fn acknowledge_background_download(&mut self, refresh: bool) {
+        self.background_download_state.acknowledge();
+        if refresh {
+            if let Err(e) = self.refresh_data() {
+                log::error!("Failed to refresh after background download: {}", e);
             }
         }
     }
@@ -3505,7 +3560,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     stats_items.extend(trash_items);
     let stats = TotalStats::from_items(&stats_items);
 
-    let mut app = App::new(items, raindrop_client, stats, archive_collection_id)?;
+    let mut app = App::new(items, raindrop_client, stats, archive_collection_id, &token)?;
     app.start_rss_feed_loading()?;
     let res = run_app(&mut terminal, app);
 
@@ -3540,6 +3595,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
                 if let Err(e) = app.refresh_data() {
                     log::error!("Failed to refresh on startup: {}", e);
                 }
+                // Start background download if enabled
+                app.start_background_download();
                 app.app_mode = AppMode::Normal;
             }
             AppMode::Normal => process_input_normal_mode(&mut app)?,
@@ -3562,7 +3619,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
             }
             AppMode::Refreshing(ref mut pop) => {
                 if pop.was_redered {
-                    let refresh_result = match pop.refresh_type {
+                    let refresh_type = pop.refresh_type.clone();
+                    let is_refresh = matches!(refresh_type, LoadingType::Refresh);
+                    let refresh_result = match refresh_type {
                         LoadingType::Refresh => app.refresh_data(),
                         LoadingType::Download { force } => {
                             if app.current_tab == CurrentTab::RssFeed {
@@ -3589,6 +3648,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow::Resu
 
                     match refresh_result {
                         Ok(_) => {
+                            // Start background download after successful refresh (Q key)
+                            if is_refresh {
+                                app.start_background_download();
+                            }
                             app.switch_to_normal_mode();
                         }
                         Err(err) => {
@@ -3980,7 +4043,21 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
     loop {
         let event = match pending_event.take() {
             Some(ev) => ev,
-            None => event::read()?,
+            None => {
+                // Use timeout-based polling when background download is active for UI updates
+                if app.background_download_state.is_running()
+                    || app.background_download_state.needs_refresh_prompt()
+                {
+                    if event::poll(Duration::from_millis(250))? {
+                        event::read()?
+                    } else {
+                        // Timeout - return to let main loop redraw
+                        return Ok(());
+                    }
+                } else {
+                    event::read()?
+                }
+            }
         };
 
         if let Event::Mouse(mouse_event) = event {
@@ -4275,7 +4352,14 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                             app.scroll_to_end();
                         }
                         Char('r') => app.switch_to_rename_mode(true),
-                        Char('R') => app.switch_to_rename_mode(false),
+                        Char('R') => {
+                            // Acknowledge background download if pending, otherwise rename
+                            if app.background_download_state.needs_refresh_prompt() {
+                                app.acknowledge_background_download(true);
+                            } else {
+                                app.switch_to_rename_mode(false);
+                            }
+                        }
                         Char('z') => {
                             if app.tag_popup_state.is_none() {
                                 app.show_tag_popup();
@@ -5766,6 +5850,37 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                         Span::styled(
                             " (B bundle, U clear)",
                             Style::default().fg(OCEANIC_NEXT.base_03),
+                        ),
+                    ]);
+                }
+                // Show background download progress
+                if app.background_download_state.is_running() {
+                    let (current, total) = app.background_download_state.progress();
+                    spans.extend_from_slice(&[
+                        Span::raw(" | "),
+                        Span::styled(
+                            format!(" ⟳ {}/{} ", current, total),
+                            Style::default()
+                                .bg(OCEANIC_NEXT.base_0c) // Cyan background
+                                .fg(OCEANIC_NEXT.base_00)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]);
+                } else if app.background_download_state.needs_refresh_prompt() {
+                    let failure_count = app.background_download_state.failure_count();
+                    let text = if failure_count > 0 {
+                        format!(" Downloads done ({} failed) - R to refresh ", failure_count)
+                    } else {
+                        " Downloads done - R to refresh ".to_string()
+                    };
+                    spans.extend_from_slice(&[
+                        Span::raw(" | "),
+                        Span::styled(
+                            text,
+                            Style::default()
+                                .bg(OCEANIC_NEXT.base_0b) // Green background
+                                .fg(OCEANIC_NEXT.base_00)
+                                .add_modifier(Modifier::BOLD),
                         ),
                     ]);
                 }
