@@ -214,6 +214,8 @@ pub fn download_pdf(client: &Client, item: &BundleItem, bundle_path: &Path) -> R
     // Normalize URL for different PDF sources
     let url = if let Some(alphaxiv_url) = utils::normalize_alphaxiv_pdf_url(&item.link) {
         alphaxiv_url
+    } else if let Some(arxiv_url) = utils::normalize_arxiv_pdf_url(&item.link) {
+        arxiv_url
     } else {
         utils::normalize_acm_pdf_url(&item.link)
     };

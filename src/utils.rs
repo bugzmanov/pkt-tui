@@ -139,6 +139,33 @@ pub fn normalize_alphaxiv_pdf_url(url: &str) -> Option<String> {
     ))
 }
 
+/// Check if URL is an arxiv.org paper page
+pub fn is_arxiv_url(url: &str) -> bool {
+    url.contains("arxiv.org/abs/") || url.contains("arxiv.org/pdf/")
+}
+
+/// Convert arxiv.org paper URL to direct PDF URL
+/// e.g., https://arxiv.org/abs/2301.12345 -> https://arxiv.org/pdf/2301.12345.pdf
+pub fn normalize_arxiv_pdf_url(url: &str) -> Option<String> {
+    if !is_arxiv_url(url) {
+        return None;
+    }
+
+    // Already a PDF URL
+    if url.contains("/pdf/") {
+        if url.ends_with(".pdf") {
+            return Some(url.to_string());
+        } else {
+            return Some(format!("{}.pdf", url.split(&['?', '#'][..]).next()?));
+        }
+    }
+
+    // Extract paper ID from URL like https://arxiv.org/abs/2301.12345 or https://arxiv.org/abs/2301.12345v2
+    let paper_id = url.split("/abs/").nth(1)?.split(&['?', '#', '/'][..]).next()?;
+
+    Some(format!("https://arxiv.org/pdf/{}.pdf", paper_id))
+}
+
 pub fn sanitize_filename(name: &str) -> String {
     name.chars()
         .map(|c| match c {

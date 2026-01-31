@@ -27,8 +27,9 @@ use reqwest::blocking::Client;
 use std::path::Path;
 use thiserror::Error;
 
-// Re-export the Article struct for external use
+// Re-export the Article struct and extract function for external use
 pub use scraper::Article;
+pub use scraper::extract_article as extract_article_from_html;
 
 #[derive(Debug, Error)]
 pub enum Web2EpubError {

@@ -261,28 +261,18 @@ fn main() {
     };
     println!("Page fetched: {} bytes\n", html.len());
 
-    // Extract article using dom_smoothie
+    // Extract article using library's extract_article (which includes preprocessing)
     println!("Extracting article content...");
     let (article_title, article_html) = {
-        use dom_smoothie::{Config, Readability};
-        let config = Config {
-            max_elements_to_parse: 0,
-            ..Default::default()
-        };
-        match Readability::new(html.clone(), Some(url), Some(config)) {
-            Ok(mut readability) => match readability.parse() {
-                Ok(article) => {
-                    println!("Title: {}", article.title);
-                    println!("Author: {:?}", article.byline);
-                    (article.title.clone(), article.content.to_string())
-                }
-                Err(e) => {
-                    eprintln!("Failed to parse article: {}", e);
-                    std::process::exit(1);
-                }
-            },
+        use pkt_tui::web2epub::extract_article_from_html;
+        match extract_article_from_html(&html, url) {
+            Ok(article) => {
+                println!("Title: {}", article.title);
+                println!("Author: {}", article.author);
+                (article.title.clone(), article.content_html.clone())
+            }
             Err(e) => {
-                eprintln!("Failed to create readability: {}", e);
+                eprintln!("Failed to extract article: {}", e);
                 std::process::exit(1);
             }
         }
@@ -439,9 +429,14 @@ fn main() {
     let debug_dir = Path::new("analyze_page_debug");
     fs::create_dir_all(debug_dir).ok();
 
+    // Also save raw HTML for debugging
+    let raw_path = debug_dir.join("raw_page.html");
+    fs::write(&raw_path, &html).ok();
+
     let extracted_path = debug_dir.join("extracted_content.html");
     fs::write(&extracted_path, &article_html).ok();
     println!("\nDebug files saved to {:?}", debug_dir);
+    println!("  - raw_page.html: Original HTML before extraction");
     println!("  - extracted_content.html: Article content from readability");
 
     // Optionally generate EPUB and verify
@@ -499,7 +494,7 @@ fn main() {
                         for i in 0..archive.len() {
                             if let Ok(file) = archive.by_index(i) {
                                 let name = file.name();
-                                if name.ends_with(".jpg") || name.ends_with(".png") || name.ends_with(".gif") || name.ends_with(".webp") {
+                                if name.ends_with(".jpg") || name.ends_with(".png") || name.ends_with(".gif") || name.ends_with(".webp") || name.ends_with(".svg") {
                                     epub_images += 1;
                                 }
                                 if name.contains("chapter.xhtml") {

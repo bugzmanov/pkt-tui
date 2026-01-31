@@ -528,17 +528,35 @@ fn collect_stats(items: &FilteredItems<raindrop::Raindrop>, start_idx: usize) ->
     stats
 }
 
+#[derive(Clone)]
+struct TagStats {
+    name: String,
+    article_count: usize,
+    video_count: usize,
+    pdf_count: usize,
+    article_top: usize,
+    video_top: usize,
+    pdf_top: usize,
+}
+
+impl TagStats {
+    fn total(&self) -> usize {
+        self.article_count + self.video_count + self.pdf_count
+    }
+}
+
 struct TagPopupState {
-    tags: Vec<(String, usize)>,
-    filtered_tags: Vec<(String, usize)>,
+    tags: Vec<TagStats>,
+    filtered_tags: Vec<TagStats>,
     selected_index: usize,
     scroll_offset: usize,
     visible_items: usize,
     filter: String,
+    time_filter: TimeFilter,
 }
 
 impl TagPopupState {
-    fn new(tags: Vec<(String, usize)>, visible_items: usize) -> Self {
+    fn new(tags: Vec<TagStats>, visible_items: usize, time_filter: TimeFilter) -> Self {
         Self {
             filtered_tags: tags.clone(),
             tags,
@@ -546,6 +564,7 @@ impl TagPopupState {
             scroll_offset: 0,
             visible_items,
             filter: String::new(),
+            time_filter,
         }
     }
 
@@ -581,14 +600,14 @@ impl TagPopupState {
     fn _selected_tag(&self) -> Option<String> {
         self.tags
             .get(self.selected_index)
-            .map(|(tag, _)| tag.clone())
+            .map(|stats| stats.name.clone())
     }
 
     fn apply_filter(&mut self) {
         self.filtered_tags = self
             .tags
             .iter()
-            .filter(|(tag, _)| tag.to_lowercase().contains(&self.filter.to_lowercase()))
+            .filter(|stats| stats.name.to_lowercase().contains(&self.filter.to_lowercase()))
             .cloned()
             .collect();
         self.selected_index = 0;
@@ -1107,6 +1126,14 @@ enum ItemTypeFilter {
     PDF,
 }
 
+#[derive(PartialEq, Clone, Copy, Default)]
+enum TimeFilter {
+    #[default]
+    All,
+    Last7Days,
+    Last30Days,
+}
+
 #[derive(PartialEq)]
 enum TagSelectionMode {
     Normal,
@@ -1182,6 +1209,7 @@ struct App {
     item_type_filter: ItemTypeFilter,
     domain_filter: Option<String>,
     tag_selection_mode: TagSelectionMode,
+    tag_time_filter: TimeFilter,
     scroll_accumulator: f32,
     mouse_tracker: MouseTracker,
     domain_stats_popup_state: Option<DomainStatsPopupState>,
@@ -1247,6 +1275,7 @@ impl App {
             item_type_filter: ItemTypeFilter::All,
             domain_filter: None,
             tag_selection_mode: TagSelectionMode::Normal,
+            tag_time_filter: TimeFilter::All,
             scroll_accumulator: 0.0,
             mouse_tracker: MouseTracker::new(),
             domain_stats_popup_state: None,
@@ -1359,17 +1388,12 @@ impl App {
         command: &mut std::process::Command,
     ) -> anyhow::Result<()> {
         disable_raw_mode()?;
-        execute!(io::stdout(), LeaveAlternateScreen, PopKeyboardEnhancementFlags)?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
 
         let status_result = command.status();
 
         enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
 
         crossterm::queue!(
             io::stdout(),
@@ -1682,6 +1706,8 @@ impl App {
             // Normalize URL for different PDF sources
             let url = if let Some(alphaxiv_url) = utils::normalize_alphaxiv_pdf_url(&item.link) {
                 alphaxiv_url
+            } else if let Some(arxiv_url) = utils::normalize_arxiv_pdf_url(&item.link) {
+                arxiv_url
             } else {
                 utils::normalize_acm_pdf_url(&item.link)
             };
@@ -2280,37 +2306,95 @@ impl App {
     }
 
     fn show_tag_popup(&mut self) {
-        // Count tags from ALL items (including archived) so "archived" tag appears
-        let mut tag_counts: std::collections::HashMap<String, usize> = self
+        use chrono::{DateTime, Utc};
+        use std::collections::HashMap;
+
+        let now = Utc::now();
+        let cutoff = match self.tag_time_filter {
+            TimeFilter::All => None,
+            TimeFilter::Last7Days => chrono::TimeDelta::try_days(7).map(|d| now - d),
+            TimeFilter::Last30Days => chrono::TimeDelta::try_days(30).map(|d| now - d),
+        };
+
+        // Filter items by time first (using created date), then exclude "read" items
+        let filtered_items: Vec<_> = self
             .items
-            .items // Access all items, not just filtered
+            .items
             .iter()
             .filter(|item| {
-                !item.tags.iter().any(|tag| tag == "read") // Exclude read items
+                if let Some(cutoff) = cutoff {
+                    DateTime::parse_from_rfc3339(&item.created)
+                        .map(|dt| dt.with_timezone(&Utc) > cutoff)
+                        .unwrap_or(false)
+                } else {
+                    true
+                }
             })
-            .flat_map(|item| item.tags.iter().cloned())
-            .fold(std::collections::HashMap::new(), |mut acc, tag| {
-                *acc.entry(tag).or_insert(0) += 1;
-                acc
-            });
+            .filter(|item| !item.tags.iter().any(|t| t == "read"))
+            .collect();
 
-        // Ensure "archived" tag is included if there are any archived items
-        let archived_count = self
-            .items
-            .items
-            .iter()
-            .filter(|item| item.tags.iter().any(|t| t == "archived"))
-            .count();
-        if archived_count > 0 {
-            tag_counts.insert("archived".to_string(), archived_count);
+        // Build tag stats with type breakdown
+        let mut tag_stats_map: HashMap<String, TagStats> = HashMap::new();
+        for item in &filtered_items {
+            let item_type = item.type_str();
+            let is_top = item.tags.iter().any(|t| t == "top");
+            for tag in &item.tags {
+                let stats = tag_stats_map.entry(tag.clone()).or_insert(TagStats {
+                    name: tag.clone(),
+                    article_count: 0,
+                    video_count: 0,
+                    pdf_count: 0,
+                    article_top: 0,
+                    video_top: 0,
+                    pdf_top: 0,
+                });
+                match item_type {
+                    "article" => {
+                        stats.article_count += 1;
+                        if is_top {
+                            stats.article_top += 1;
+                        }
+                    }
+                    "video" => {
+                        stats.video_count += 1;
+                        if is_top {
+                            stats.video_top += 1;
+                        }
+                    }
+                    "pdf" => {
+                        stats.pdf_count += 1;
+                        if is_top {
+                            stats.pdf_top += 1;
+                        }
+                    }
+                    _ => {
+                        stats.article_count += 1;
+                        if is_top {
+                            stats.article_top += 1;
+                        }
+                    }
+                }
+            }
         }
 
-        let mut sorted_tag_counts: Vec<(String, usize)> = tag_counts.into_iter().collect();
-        sorted_tag_counts.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1))); // sort by alphabet then by counts
+        let mut sorted_tags: Vec<TagStats> = tag_stats_map.into_values().collect();
+        sorted_tags.sort_by(|a, b| a.name.cmp(&b.name)); // sort alphabetically
 
-        let visible_items = 26; // Adjust this value based on your UI
-        self.tag_popup_state = Some(TagPopupState::new(sorted_tag_counts, visible_items));
+        let visible_items = 26;
+        self.tag_popup_state = Some(TagPopupState::new(sorted_tags, visible_items, self.tag_time_filter));
         self.tag_selection_mode = TagSelectionMode::Normal;
+    }
+
+    fn cycle_tag_time_filter(&mut self) {
+        self.tag_time_filter = match self.tag_time_filter {
+            TimeFilter::All => TimeFilter::Last7Days,
+            TimeFilter::Last7Days => TimeFilter::Last30Days,
+            TimeFilter::Last30Days => TimeFilter::All,
+        };
+    }
+
+    fn refresh_tag_popup(&mut self) {
+        self.show_tag_popup();
     }
 
     fn show_domain_stats(&mut self) {
@@ -2526,10 +2610,11 @@ impl App {
 
     fn select_tag(&mut self) {
         if let Some(tag_popup_state) = &self.tag_popup_state {
-            if let Some((selected_tag, _)) = tag_popup_state
+            if let Some(stats) = tag_popup_state
                 .filtered_tags
                 .get(tag_popup_state.selected_index)
             {
+                let selected_tag = &stats.name;
                 // Toggle tag: add if not present, remove if present
                 if self.selected_tag_filters.contains(selected_tag) {
                     self.selected_tag_filters.remove(selected_tag);
@@ -3733,7 +3818,7 @@ fn process_command_mode(app: &mut App, mut cur_state: CommandEnterMode) -> anyho
                                 &tag_popup_state
                                     .tags
                                     .iter()
-                                    .map(|x| x.0.clone())
+                                    .map(|x| x.name.clone())
                                     .collect::<Vec<String>>(),
                             );
                         }
@@ -3935,6 +4020,10 @@ fn process_input_normal_mode(app: &mut App) -> anyhow::Result<()> {
                             Esc => app.tag_popup_state = None,
                             Char('/') => {
                                 app.tag_selection_mode = TagSelectionMode::Filtering;
+                            }
+                            Char('t') => {
+                                app.cycle_tag_time_filter();
+                                app.refresh_tag_popup();
                             }
                             _ => {}
                         },
@@ -4393,10 +4482,29 @@ fn ui(f: &mut Frame, app: &mut App) {
             .skip(tag_popup_state.scroll_offset)
             .take(tag_popup_state.visible_items)
             .enumerate()
-            .map(|(i, (tag, count))| {
-                let is_selected = app.selected_tag_filters.contains(tag);
+            .map(|(i, stats)| {
+                let is_selected = app.selected_tag_filters.contains(&stats.name);
                 let marker = if is_selected { "[x] " } else { "[ ] " };
-                let content = format!("{}{:<30} {}", marker, tag, count);
+                // Format: "arts:6(2*)" or "arts:6" if no top items, fixed width columns
+                let fmt_count = |count: usize, top: usize, label: &str| -> String {
+                    if top > 0 {
+                        format!("{}:{}({}*)", label, count, top)
+                    } else {
+                        format!("{}:{}", label, count)
+                    }
+                };
+                let arts = fmt_count(stats.article_count, stats.article_top, "arts");
+                let vids = fmt_count(stats.video_count, stats.video_top, "vids");
+                let pdfs = fmt_count(stats.pdf_count, stats.pdf_top, "pdfs");
+                let content = format!(
+                    "{}{:<18} {:>4}   {:<14} {:<13} {}",
+                    marker,
+                    stats.name,
+                    stats.total(),
+                    arts,
+                    vids,
+                    pdfs
+                );
                 let style = if i + tag_popup_state.scroll_offset == tag_popup_state.selected_index {
                     Style::default().fg(Color::Black).bg(Color::White)
                 } else if is_selected {
@@ -4408,9 +4516,15 @@ fn ui(f: &mut Frame, app: &mut App) {
             })
             .collect();
 
+        let title = match tag_popup_state.time_filter {
+            TimeFilter::All => "Tags [t: All | 7d | 30d]",
+            TimeFilter::Last7Days => "Tags [t: All | *7d* | 30d]",
+            TimeFilter::Last30Days => "Tags [t: All | 7d | *30d*]",
+        };
+
         let mut block = Block::default()
             .borders(Borders::ALL)
-            .title("All Tags")
+            .title(title)
             .border_style(Style::new().fg(app.colors.footer_border_color))
             .border_type(BorderType::Rounded);
 
