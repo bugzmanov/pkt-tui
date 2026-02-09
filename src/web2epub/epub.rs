@@ -99,6 +99,17 @@ blockquote {
     padding-left: 1em;
     color: #666;
 }
+blockquote.pullquote {
+    background: #f8f9fa;
+    border-left: 4px solid #5c7cfa;
+    padding: 1em;
+    margin: 1em 0;
+    color: #333;
+    font-size: 0.95em;
+}
+blockquote.pullquote a {
+    color: #364fc7;
+}
 "#;
     builder
         .stylesheet(css.as_bytes())

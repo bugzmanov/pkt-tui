@@ -723,6 +723,49 @@ fn html_escape_basic(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Preserves aside/note elements that Readability would otherwise filter out.
+/// Converts <aside> tags and <div class="...aside..."> elements to <blockquote>
+/// with a special class, which Readability preserves and can be styled in EPUB.
+///
+/// Uses class="pullquote" instead of "aside" because dom_smoothie penalizes
+/// elements with "aside" in their class names.
+fn preserve_aside_elements(html: &str) -> String {
+    let mut result = html.to_string();
+
+    // Convert <aside ...>...</aside> to <blockquote class="pullquote">...</blockquote>
+    // Match opening aside tag with any attributes
+    let aside_open_re = Regex::new(r#"<aside([^>]*)>"#).unwrap();
+    result = aside_open_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            let attrs = &caps[1];
+            // Remove any existing class attribute and add our own
+            let class_re = Regex::new(r#"\s*class="[^"]*""#).unwrap();
+            let cleaned_attrs = class_re.replace(attrs, "");
+            format!("<blockquote class=\"pullquote\"{}>", cleaned_attrs)
+        })
+        .to_string();
+
+    // Replace closing </aside> tags
+    result = result.replace("</aside>", "</blockquote>");
+
+    // Convert <div class="...aside..."> or <div class="...note..."> patterns
+    // These are commonly used for callouts, tips, warnings, etc.
+    // Match the full div element and replace it entirely
+    let div_full_re = Regex::new(
+        r#"(?s)<div[^>]*class="[^"]*(?:post-aside|aside-note|callout|admonition)[^"]*"[^>]*>(.*?)</div>"#
+    ).unwrap();
+
+    result = div_full_re
+        .replace_all(&result, |caps: &regex::Captures| {
+            let content = &caps[1];
+            log::debug!("Preserving aside/note element as pullquote");
+            format!("<blockquote class=\"pullquote\">{}</blockquote>", content)
+        })
+        .to_string();
+
+    result
+}
+
 /// Removes CSS layout classes that confuse Readability's content detection.
 /// Classes like 'grid', 'flex', 'col-span' are for styling only and don't
 /// indicate whether content is article-relevant or not.
@@ -816,7 +859,8 @@ pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
 
     // Pre-process HTML to convert custom components to standard HTML
     log::debug!("Starting HTML preprocessing...");
-    let html_with_pictures = convert_picture_to_img(html);
+    let html_with_asides = preserve_aside_elements(html);
+    let html_with_pictures = convert_picture_to_img(&html_with_asides);
     let html_with_figures = simplify_figures(&html_with_pictures);
     let html_with_code = normalize_code_blocks(&html_with_figures);
     let html_stripped = strip_layout_classes(&html_with_code);

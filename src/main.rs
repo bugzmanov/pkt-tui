@@ -2210,6 +2210,17 @@ impl App {
         for id in &items_to_delete {
             log::info!("Appending delete for {} to delta file", id);
             raindrop::append_raindrop_delete(*id)?;
+
+            // Clean up downloaded EPUB file if it exists
+            let cache_id = self.make_epub_cache_id(&id.to_string());
+            let epub_path = Path::new(EPUB_DIR).join(format!("{}.epub", cache_id));
+            if epub_path.exists() {
+                if let Err(e) = fs::remove_file(&epub_path) {
+                    log::warn!("Failed to delete EPUB file {:?}: {}", epub_path, e);
+                } else {
+                    log::info!("Deleted EPUB file for trashed item: {:?}", epub_path);
+                }
+            }
         }
 
         // 6. Update last_sync in meta file (small, cheap write)
@@ -2781,7 +2792,19 @@ impl App {
     fn delete_article(&mut self) -> anyhow::Result<()> {
         if let Some(idx) = self.virtual_state.selected() {
             if let Some(item) = self.items.get(idx) {
+                // Delete from Raindrop API
                 self.raindrop_client.delete_raindrop(item.id)?;
+
+                // Clean up downloaded EPUB file if it exists
+                let cache_id = self.make_epub_cache_id(&item.id.to_string());
+                let epub_path = Path::new(EPUB_DIR).join(format!("{}.epub", cache_id));
+                if epub_path.exists() {
+                    if let Err(e) = fs::remove_file(&epub_path) {
+                        log::warn!("Failed to delete EPUB file {:?}: {}", epub_path, e);
+                    } else {
+                        log::info!("Deleted EPUB file: {:?}", epub_path);
+                    }
+                }
             }
             self.items.remove(idx);
             // Save to cache: item might be permanently gone (not in Trash)
