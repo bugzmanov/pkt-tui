@@ -161,6 +161,256 @@ fn requires_browser_rendering(url: &str) -> bool {
     url.contains("x.com") || url.contains("twitter.com")
 }
 
+/// Check if URL is from X/Twitter.
+fn is_twitter_url(url: &str) -> bool {
+    url.contains("x.com") || url.contains("twitter.com")
+}
+
+/// Extract article content from X/Twitter's rendered DOM.
+/// Handles both Twitter Articles (longform) and regular tweets.
+fn extract_twitter_article(html: &str) -> Option<Article> {
+    let document = Html::parse_document(html);
+
+    // Extract author from User-Name
+    let username_sel = Selector::parse("[data-testid=\"User-Name\"]").ok()?;
+    let username_el = document.select(&username_sel).next()?;
+    let author = username_el
+        .text()
+        .next()
+        .unwrap_or("Unknown")
+        .trim()
+        .to_string();
+
+    // Try Twitter Article (longform) first
+    let article_title_sel = Selector::parse("[data-testid=\"twitter-article-title\"]").ok()?;
+    let article_content_sel = Selector::parse("[data-testid=\"twitterArticleRichTextView\"]").ok()?;
+
+    if let Some(content_el) = document.select(&article_content_sel).next() {
+        // This is a Twitter Article
+        let title = document
+            .select(&article_title_sel)
+            .next()
+            .map(|el| el.text().collect::<String>().trim().to_string())
+            .unwrap_or_else(|| "Untitled".to_string());
+
+        let content_html = convert_twitter_article_html(content_el);
+
+        if !content_html.is_empty() {
+            log::info!("Extracted Twitter Article: {}", title);
+            return Some(Article {
+                title,
+                author,
+                content_html,
+            });
+        }
+    }
+
+    // Fall back to regular tweet extraction
+    let tweet_text_sel = Selector::parse("[data-testid=\"tweetText\"]").ok()?;
+    if let Some(tweet_el) = document.select(&tweet_text_sel).next() {
+        let text_content = tweet_el.text().collect::<String>();
+        let content_html = format!("<p>{}</p>", tweet_el.inner_html());
+
+        // Also try to get card links
+        let card_sel = Selector::parse("[data-testid=\"card.wrapper\"] a[href]").ok();
+        let mut links_html = String::new();
+        if let Some(sel) = &card_sel {
+            for card_link in document.select(sel) {
+                if let Some(href) = card_link.value().attr("href") {
+                    let link_text: String = card_link.text().collect();
+                    let display = if link_text.trim().is_empty() {
+                        href.to_string()
+                    } else {
+                        link_text.trim().to_string()
+                    };
+                    links_html.push_str(&format!("<p><a href=\"{}\">{}</a></p>\n", href, display));
+                }
+            }
+        }
+
+        let full_content = if links_html.is_empty() {
+            content_html
+        } else {
+            format!("{}\n{}", content_html, links_html)
+        };
+
+        let title = text_content.chars().take(80).collect::<String>();
+        let title = if title.len() < text_content.len() {
+            format!("{}...", title.trim())
+        } else {
+            title.trim().to_string()
+        };
+
+        log::info!("Extracted tweet from {}", author);
+        return Some(Article {
+            title,
+            author,
+            content_html: full_content,
+        });
+    }
+
+    None
+}
+
+/// Converts a Twitter Article's DraftJS DOM content into clean HTML.
+fn convert_twitter_article_html(content_el: scraper::ElementRef) -> String {
+    let mut html_parts: Vec<String> = Vec::new();
+
+    // Process each block in data-contents
+    let block_sel = Selector::parse("[data-block=\"true\"]").unwrap();
+    let img_sel = Selector::parse("img[src]").unwrap();
+    let link_sel = Selector::parse("a[href]").unwrap();
+
+    for block in content_el.select(&block_sel) {
+        let classes: Vec<&str> = block.value().classes().collect();
+        let class_str = classes.join(" ");
+
+        if class_str.contains("longform-header-two") {
+            let text = collect_block_html(&block, &link_sel);
+            html_parts.push(format!("<h2>{}</h2>", text));
+        } else if class_str.contains("longform-header-three") {
+            let text = collect_block_html(&block, &link_sel);
+            html_parts.push(format!("<h3>{}</h3>", text));
+        } else if class_str.contains("longform-blockquote") {
+            let text = collect_block_html(&block, &link_sel);
+            html_parts.push(format!("<blockquote>{}</blockquote>", text));
+        } else if class_str.contains("longform-unordered-list-item") {
+            // Collect consecutive list items
+            let text = collect_block_html(&block, &link_sel);
+            // Check if previous part is already a <ul>
+            if let Some(last) = html_parts.last_mut() {
+                if last.ends_with("</ul>") {
+                    // Append to existing list
+                    let insert_pos = last.len() - 5; // before </ul>
+                    last.insert_str(insert_pos, &format!("<li>{}</li>", text));
+                    continue;
+                }
+            }
+            html_parts.push(format!("<ul><li>{}</li></ul>", text));
+        } else if class_str.contains("longform-ordered-list-item") {
+            let text = collect_block_html(&block, &link_sel);
+            if let Some(last) = html_parts.last_mut() {
+                if last.ends_with("</ol>") {
+                    let insert_pos = last.len() - 5;
+                    last.insert_str(insert_pos, &format!("<li>{}</li>", text));
+                    continue;
+                }
+            }
+            html_parts.push(format!("<ol><li>{}</li></ol>", text));
+        } else {
+            // Check if this is an image section
+            let images: Vec<_> = block.select(&img_sel).collect();
+            let content_images: Vec<_> = images
+                .iter()
+                .filter(|img| {
+                    img.value()
+                        .attr("src")
+                        .map(|s| s.contains("twimg.com/media"))
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            if !content_images.is_empty() {
+                for img in content_images {
+                    if let Some(src) = img.value().attr("src") {
+                        // Upgrade to large format
+                        let large_src = upgrade_twimg_url(src);
+                        let alt = img.value().attr("alt").unwrap_or("Image");
+                        html_parts.push(format!("<figure><img src=\"{}\" alt=\"{}\"/></figure>", large_src, alt));
+                    }
+                }
+            } else {
+                // Regular paragraph
+                let text = collect_block_html(&block, &link_sel);
+                if !text.trim().is_empty() {
+                    html_parts.push(format!("<p>{}</p>", text));
+                }
+            }
+        }
+    }
+
+    html_parts.join("\n")
+}
+
+/// Collects the HTML content of a DraftJS block, preserving links and inline formatting.
+fn collect_block_html(block: &scraper::ElementRef, _link_sel: &Selector) -> String {
+    // Strategy: walk through child nodes, extracting text and links
+    // We need to handle: <span data-text="true">text</span> and <a href="...">text</a>
+    // Also bold (<span style="font-weight: bold">) and italic (<span style="font-style: italic">)
+    let inner = block.inner_html();
+
+    // Extract text and links in order using the raw inner HTML
+    // First, try to build content from data-offset-key spans
+    let mut result = String::new();
+    let fragment = Html::parse_fragment(&inner);
+    let root = fragment.root_element();
+
+    collect_node_html(&root, &mut result);
+
+    result.trim().to_string()
+}
+
+/// Recursively collects HTML from a node tree, preserving links and basic formatting.
+fn collect_node_html(node: &scraper::ElementRef, result: &mut String) {
+    for child in node.children() {
+        match child.value() {
+            scraper::node::Node::Text(text) => {
+                let t = text.text.as_ref();
+                if !t.is_empty() {
+                    result.push_str(t);
+                }
+            }
+            scraper::node::Node::Element(elem) => {
+                if let Some(child_ref) = scraper::ElementRef::wrap(child) {
+                    let tag = elem.name();
+
+                    if tag == "a" {
+                        if let Some(href) = elem.attr("href") {
+                            result.push_str(&format!("<a href=\"{}\">", href));
+                            collect_node_html(&child_ref, result);
+                            result.push_str("</a>");
+                            continue;
+                        }
+                    }
+
+                    // Check for bold/italic via style attribute
+                    let style = elem.attr("style").unwrap_or("");
+                    let is_bold = style.contains("font-weight: bold");
+                    let is_italic = style.contains("font-style: italic");
+
+                    if is_bold {
+                        result.push_str("<strong>");
+                    }
+                    if is_italic {
+                        result.push_str("<em>");
+                    }
+
+                    collect_node_html(&child_ref, result);
+
+                    if is_italic {
+                        result.push_str("</em>");
+                    }
+                    if is_bold {
+                        result.push_str("</strong>");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Upgrades a twimg.com media URL to use large format instead of small.
+fn upgrade_twimg_url(url: &str) -> String {
+    if url.contains("name=small") {
+        url.replace("name=small", "name=large")
+    } else if url.contains("name=medium") {
+        url.replace("name=medium", "name=large")
+    } else {
+        url.to_string()
+    }
+}
+
 /// Unescape Unicode sequences like \u003c to actual characters.
 fn unescape_unicode(s: &str) -> String {
     let re = Regex::new(r"\\u([0-9a-fA-F]{4})").unwrap();
@@ -849,6 +1099,14 @@ fn strip_layout_classes(html: &str) -> String {
 
 /// Extracts article content from HTML using dom_smoothie (Mozilla Readability port).
 pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
+    // Try Twitter/X-specific extraction for rendered tweet pages
+    if is_twitter_url(url) {
+        if let Some(article) = extract_twitter_article(html) {
+            return Ok(article);
+        }
+        // Fall through to standard extraction if Twitter-specific fails
+    }
+
     // Try LessWrong-specific extraction first for Apollo SSR sites
     if is_lesswrong_url(url) {
         if let Some(article) = extract_lesswrong_article(html) {
