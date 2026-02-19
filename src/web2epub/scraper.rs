@@ -143,6 +143,191 @@ pub fn fetch_html_via_browser(url: &str) -> Result<String, ScraperError> {
     Ok(html)
 }
 
+/// Attempts to fetch raw content from a URL that points to a hosted file (e.g. Markdown on GitHub).
+/// Returns `Some(Article)` if the URL is recognized and raw content can be fetched and rendered,
+/// or `None` if this URL doesn't have a known raw content source.
+fn try_fetch_raw_content(client: &Client, url: &str) -> Option<Article> {
+    let (raw_url, file_ext) = get_raw_content_url(url)?;
+
+    log::info!("Fetching raw content from: {}", raw_url);
+    let response = client
+        .get(&raw_url)
+        .header("User-Agent", "pkt-tui-web2epub/0.1")
+        .header("Accept", "text/plain, text/markdown, */*")
+        .send()
+        .ok()?;
+
+    if !response.status().is_success() {
+        log::warn!("Raw content fetch failed with status: {}", response.status());
+        return None;
+    }
+
+    let raw_text = response.text().ok()?;
+    if raw_text.trim().is_empty() {
+        return None;
+    }
+
+    // Extract a title from the file path
+    let title = extract_title_from_url(url).unwrap_or_else(|| "Untitled".to_string());
+    let author = extract_repo_owner(url).unwrap_or_else(|| extract_hostname(url));
+
+    let content_html = match file_ext.as_str() {
+        "md" | "markdown" | "mdown" | "mkd" => render_markdown_to_html(&raw_text),
+        "rst" | "txt" => {
+            // Plain text / reStructuredText: wrap in <pre> for now
+            format!("<pre>{}</pre>", html_escape_basic(&raw_text))
+        }
+        "org" => {
+            format!("<pre>{}</pre>", html_escape_basic(&raw_text))
+        }
+        _ => return None,
+    };
+
+    // Try to extract a better title from the first heading in the rendered content
+    let title = extract_first_heading(&content_html).unwrap_or(title);
+
+    log::info!("Successfully rendered raw {} content: '{}'", file_ext, title);
+    Some(Article {
+        title,
+        author,
+        content_html,
+    })
+}
+
+/// Maps a URL to its raw content equivalent and file extension.
+/// Returns `(raw_url, file_extension)` if recognized.
+fn get_raw_content_url(url: &str) -> Option<(String, String)> {
+    let parsed = Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let path = parsed.path();
+
+    // GitHub: github.com/{owner}/{repo}/blob/{ref}/{path} → raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}
+    if host == "github.com" || host == "www.github.com" {
+        if let Some(raw_path) = path.strip_prefix('/') {
+            let parts: Vec<&str> = raw_path.splitn(5, '/').collect();
+            // parts: [owner, repo, "blob", ref, file_path]
+            if parts.len() == 5 && parts[2] == "blob" {
+                let ext = get_file_extension(parts[4]);
+                if is_renderable_extension(&ext) {
+                    let raw_url = format!(
+                        "https://raw.githubusercontent.com/{}/{}/{}/{}",
+                        parts[0], parts[1], parts[3], parts[4]
+                    );
+                    return Some((raw_url, ext));
+                }
+            }
+        }
+    }
+
+    // GitLab: gitlab.com/{owner}/{repo}/-/blob/{ref}/{path} → gitlab.com/{owner}/{repo}/-/raw/{ref}/{path}
+    if host.contains("gitlab") {
+        if let Some(blob_pos) = path.find("/-/blob/") {
+            let prefix = &path[..blob_pos];
+            let rest = &path[blob_pos + "/-/blob/".len()..];
+            let ext = get_file_extension(rest);
+            if is_renderable_extension(&ext) {
+                let raw_url = format!("https://{}{}/-/raw/{}", host, prefix, rest);
+                return Some((raw_url, ext));
+            }
+        }
+    }
+
+    // Bitbucket: bitbucket.org/{owner}/{repo}/src/{ref}/{path} → bitbucket.org/{owner}/{repo}/raw/{ref}/{path}
+    if host == "bitbucket.org" || host == "www.bitbucket.org" {
+        if let Some(src_pos) = path.find("/src/") {
+            let prefix = &path[..src_pos];
+            let rest = &path[src_pos + "/src/".len()..];
+            let ext = get_file_extension(rest);
+            if is_renderable_extension(&ext) {
+                let raw_url = format!("https://{}{}//raw/{}", host, prefix, rest);
+                return Some((raw_url, ext));
+            }
+        }
+    }
+
+    None
+}
+
+/// Checks if a file extension is one we can render to HTML.
+fn is_renderable_extension(ext: &str) -> bool {
+    matches!(ext, "md" | "markdown" | "mdown" | "mkd" | "rst" | "txt" | "org")
+}
+
+/// Extracts file extension from a path.
+fn get_file_extension(path: &str) -> String {
+    // Strip query/fragment
+    let clean = path.split('?').next().unwrap_or(path);
+    let clean = clean.split('#').next().unwrap_or(clean);
+    clean
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+/// Renders Markdown text to HTML using pulldown-cmark.
+fn render_markdown_to_html(markdown: &str) -> String {
+    use pulldown_cmark::{html, Options, Parser};
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+
+    let parser = Parser::new_ext(markdown, options);
+    let mut html_output = String::new();
+    html::push_html(&mut html_output, parser);
+    html_output
+}
+
+/// Extracts a human-readable title from a URL path (last path component without extension).
+fn extract_title_from_url(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    let path = parsed.path();
+    let filename = path.rsplit('/').next()?;
+    let name = filename.split('.').next()?;
+    if name.is_empty() {
+        return None;
+    }
+    // Convert kebab-case/snake_case to title case
+    Some(
+        name.replace('-', " ")
+            .replace('_', " ")
+            .split_whitespace()
+            .map(|w| {
+                let mut c = w.chars();
+                match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().to_string() + c.as_str(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Extracts the repository owner/org from a GitHub/GitLab/Bitbucket URL.
+fn extract_repo_owner(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    let path = parsed.path();
+    let parts: Vec<&str> = path.trim_start_matches('/').splitn(3, '/').collect();
+    if parts.len() >= 2 {
+        Some(format!("{}/{}", parts[0], parts[1]))
+    } else {
+        None
+    }
+}
+
+/// Extracts the text of the first <h1> or <h2> from HTML content.
+fn extract_first_heading(html: &str) -> Option<String> {
+    let re = Regex::new(r"(?s)<h[12][^>]*>(.*?)</h[12]>").ok()?;
+    let caps = re.captures(html)?;
+    let inner = &caps[1];
+    let text = strip_tags(inner).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
 /// Extracts the hostname from a URL for use as a fallback author.
 fn extract_hostname(url: &str) -> String {
     Url::parse(url)
@@ -1016,6 +1201,46 @@ fn preserve_aside_elements(html: &str) -> String {
     result
 }
 
+/// Unwraps custom HTML elements (e.g. GitHub's `<markdown-accessiblity-table>`)
+/// that Readability doesn't understand and would strip.
+/// Replaces the custom element wrapper with a plain `<div>`, preserving inner content.
+fn unwrap_custom_elements(html: &str) -> String {
+    // Custom elements have a hyphen in their tag name (web components spec).
+    // GitHub uses: markdown-accessiblity-table, task-lists, turbo-frame, etc.
+    let custom_el_re =
+        Regex::new(r"(?s)<((?:markdown|task|turbo|tool|relative|auto|time|clipboard|include|qbsearch|modal|react|dialog|anchored|action|file|deferred|remote|details|summary|tab|scroll|sticky|theme|color|animated|batch|filter|image|text|virtual|github|gh|readme|blob|diff|code|commit|tree|repo|nav|header|footer|sidebar|slot|template)[a-z-]*)([^>]*)>").unwrap();
+
+    let mut result = html.to_string();
+
+    // Find all custom element tag names used in the document
+    let mut custom_tags: Vec<String> = Vec::new();
+    for caps in custom_el_re.captures_iter(html) {
+        let tag = caps.get(1).unwrap().as_str().to_string();
+        if !custom_tags.contains(&tag) {
+            custom_tags.push(tag);
+        }
+    }
+
+    for tag in &custom_tags {
+        // Replace opening tags with <div>
+        let open_re = Regex::new(&format!(r"<{}([^>]*)>", regex::escape(tag))).unwrap();
+        result = open_re.replace_all(&result, "<div>").to_string();
+
+        // Replace closing tags with </div>
+        result = result.replace(&format!("</{}>", tag), "</div>");
+    }
+
+    if !custom_tags.is_empty() {
+        log::debug!(
+            "Unwrapped {} custom element types: {:?}",
+            custom_tags.len(),
+            custom_tags
+        );
+    }
+
+    result
+}
+
 /// Removes CSS layout classes that confuse Readability's content detection.
 /// Classes like 'grid', 'flex', 'col-span' are for styling only and don't
 /// indicate whether content is article-relevant or not.
@@ -1117,7 +1342,8 @@ pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
 
     // Pre-process HTML to convert custom components to standard HTML
     log::debug!("Starting HTML preprocessing...");
-    let html_with_asides = preserve_aside_elements(html);
+    let html_unwrapped = unwrap_custom_elements(html);
+    let html_with_asides = preserve_aside_elements(&html_unwrapped);
     let html_with_pictures = convert_picture_to_img(&html_with_asides);
     let html_with_figures = simplify_figures(&html_with_pictures);
     let html_with_code = normalize_code_blocks(&html_with_figures);
@@ -1168,6 +1394,11 @@ pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
 /// Fetches a URL and extracts article content in one step.
 /// Falls back to browser rendering for JavaScript SPAs.
 pub fn fetch_and_extract(client: &Client, url: &str) -> Result<Article, ScraperError> {
+    // Try raw content fetch first (e.g. Markdown files on GitHub/GitLab/Bitbucket)
+    if let Some(article) = try_fetch_raw_content(client, url) {
+        return Ok(article);
+    }
+
     // Some sites always require browser rendering (heavy JS SPAs)
     if requires_browser_rendering(url) {
         log::info!("URL requires browser rendering: {}", url);
