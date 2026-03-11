@@ -199,22 +199,21 @@ fn html_to_xhtml(html: &str) -> String {
 
     for tag in void_elements {
         // Match <tag ...> (not already self-closing) and convert to <tag ... />
-        // This is a simple approach - handles most common cases
-
-        // Pattern: <tag followed by attributes, ending with > but not />
         let mut pos = 0;
         let mut new_result = String::new();
+        let open_pattern = format!("<{}", tag);
 
         while pos < result.len() {
             // Look for opening tag
-            if let Some(tag_start) = result[pos..].find(&format!("<{}", tag)) {
+            if let Some(tag_start) = result[pos..].find(&open_pattern) {
                 let absolute_start = pos + tag_start;
 
                 // Check if this is actually the tag (not e.g., <imgage)
+                // Use byte indexing since find() returns byte offsets
                 let after_tag = absolute_start + 1 + tag.len();
                 if after_tag < result.len() {
-                    let next_char = result.chars().nth(after_tag).unwrap_or('x');
-                    if next_char.is_alphanumeric() {
+                    let next_byte = result.as_bytes()[after_tag];
+                    if next_byte.is_ascii_alphanumeric() {
                         // Not our tag, continue
                         new_result.push_str(&result[pos..absolute_start + 1]);
                         pos = absolute_start + 1;
@@ -227,7 +226,7 @@ fn html_to_xhtml(html: &str) -> String {
                     let absolute_end = absolute_start + tag_end;
 
                     // Check if already self-closing
-                    if absolute_end > 0 && result.chars().nth(absolute_end - 1) == Some('/') {
+                    if absolute_end > 0 && result.as_bytes()[absolute_end - 1] == b'/' {
                         // Already self-closing, copy as-is
                         new_result.push_str(&result[pos..absolute_end + 1]);
                     } else {

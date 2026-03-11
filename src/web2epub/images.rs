@@ -83,17 +83,21 @@ fn parse_data_url(data_url: &str) -> Option<(Vec<u8>, &'static str)> {
 fn fetch_image_to_file(
     client: &Client,
     image_url: &str,
+    referer: Option<&str>,
     temp_dir: &Path,
     file_index: usize,
 ) -> Option<String> {
     log::debug!("Fetching image: {}", image_url);
 
-    let response = match client
+    let mut request = client
         .get(image_url)
         .header("User-Agent", "pkt-tui-web2epub/0.1")
-        .header("Accept", "image/*")
-        .send()
-    {
+        .header("Accept", "image/*,*/*;q=0.8");
+    if let Some(referer_value) = referer {
+        request = request.header("Referer", referer_value);
+    }
+
+    let response = match request.send() {
         Ok(r) => r,
         Err(e) => {
             log::warn!("Failed to fetch image {}: {}", image_url, e);
@@ -112,22 +116,60 @@ fn fetch_image_to_file(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let mime_type = content_type.split(';').next().unwrap_or("").trim();
-    let extension = match extension_from_mime(mime_type) {
+    let extension = match infer_image_extension(content_type, image_url) {
         Some(ext) => ext,
         None => {
-            log::warn!("Unknown image MIME type '{}' for {}", mime_type, image_url);
+            let mime_type = content_type.split(';').next().unwrap_or("").trim();
+            log::warn!(
+                "Could not infer image extension (mime='{}') for {}",
+                mime_type,
+                image_url
+            );
             return None;
         }
     };
 
     let bytes = response.bytes().ok()?;
-    let filename = format!("remote-image-{}.{}", file_index, extension);
+
+    // Convert EPUB-incompatible formats (webp, avif) to PNG
+    let (final_bytes, final_extension) = if extension == "webp" || extension == "avif" {
+        match convert_to_png(&bytes) {
+            Some(png_bytes) => {
+                log::debug!("Converted {} to PNG ({} -> {} bytes)", extension, bytes.len(), png_bytes.len());
+                (png_bytes, "png".to_string())
+            }
+            None => {
+                log::warn!("Failed to convert {} to PNG for {}", extension, image_url);
+                (bytes.to_vec(), extension)
+            }
+        }
+    } else {
+        (bytes.to_vec(), extension)
+    };
+
+    let filename = format!("remote-image-{}.{}", file_index, final_extension);
     let file_path = temp_dir.join(&filename);
 
-    fs::write(&file_path, &bytes).ok()?;
+    fs::write(&file_path, &final_bytes).ok()?;
 
     Some(filename)
+}
+
+/// Converts image bytes (webp, avif) to PNG format for EPUB compatibility.
+fn convert_to_png(image_bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(image_bytes).ok()?;
+    let mut png_buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png_buf, image::ImageFormat::Png).ok()?;
+    Some(png_buf.into_inner())
+}
+
+/// Infer image extension from response Content-Type, with URL-extension fallback.
+fn infer_image_extension(content_type: &str, image_url: &str) -> Option<String> {
+    let mime_type = content_type.split(';').next().unwrap_or("").trim().to_lowercase();
+    if let Some(ext) = extension_from_mime(&mime_type) {
+        return Some(ext.to_string());
+    }
+    get_url_image_extension(image_url)
 }
 
 /// Represents an image found in the HTML.
@@ -382,17 +424,18 @@ pub fn normalize_images(
             if url_ext.is_some() {
                 // Known extension - keep the URL as-is for epub-builder to handle
                 // Actually, we need to download it for EPUB embedding
-                fetch_image_to_file(client, &absolute_url, temp_dir, data_index)
+                fetch_image_to_file(client, &absolute_url, Some(base_url), temp_dir, data_index)
                     .map(|f| {
                         data_index += 1;
                         f
                     })
             } else {
                 // Unknown extension - try to fetch and determine type from response
-                fetch_image_to_file(client, &absolute_url, temp_dir, data_index).map(|f| {
-                    data_index += 1;
-                    f
-                })
+                fetch_image_to_file(client, &absolute_url, Some(base_url), temp_dir, data_index)
+                    .map(|f| {
+                        data_index += 1;
+                        f
+                    })
             }
         };
 
@@ -483,18 +526,32 @@ pub fn normalize_images(
         }
     }
 
-    // Remove srcset and sizes attributes from img tags only
-    // Use regex to ensure we only match attributes inside <img> tags
+    // Remove attributes from img tags that are not EPUB-compatible
+    // srcset, sizes: responsive image attributes (already resolved)
+    // loading, decoding: browser-specific lazy loading hints
+    // data-*: framework-specific attributes (e.g., data-nimg from Next.js)
+    // style: inline styles that may hide images (e.g., color:transparent)
     let attr_patterns = [
         r#"(<img[^>]*)\s+srcset="[^"]*""#,
         r#"(<img[^>]*)\s+srcset='[^']*'"#,
         r#"(<img[^>]*)\s+sizes="[^"]*""#,
         r#"(<img[^>]*)\s+sizes='[^']*'"#,
+        r#"(<img[^>]*)\s+loading="[^"]*""#,
+        r#"(<img[^>]*)\s+decoding="[^"]*""#,
+        r#"(<img[^>]*)\s+data-[\w-]+="[^"]*""#,
+        r#"(<img[^>]*)\s+style="[^"]*""#,
     ];
 
     for pattern in attr_patterns {
         if let Ok(re) = Regex::new(pattern) {
-            result = re.replace_all(&result, "$1").to_string();
+            // Some attributes may appear multiple times (e.g., multiple data-* attrs)
+            loop {
+                let new = re.replace_all(&result, "$1").to_string();
+                if new == result {
+                    break;
+                }
+                result = new;
+            }
         }
     }
 
@@ -605,5 +662,26 @@ mod tests {
 
         // Should pick the largest (1132w)
         assert!(url.contains("w_1132"));
+    }
+
+    #[test]
+    fn test_infer_image_extension_prefers_mime_type() {
+        let ext = infer_image_extension("image/webp; charset=binary", "https://e.com/x.jpg");
+        assert_eq!(ext, Some("webp".to_string()));
+    }
+
+    #[test]
+    fn test_infer_image_extension_falls_back_to_url() {
+        let ext = infer_image_extension(
+            "application/octet-stream",
+            "https://cdn.example.com/path/image.avif?token=abc",
+        );
+        assert_eq!(ext, Some("avif".to_string()));
+    }
+
+    #[test]
+    fn test_infer_image_extension_returns_none_when_unknown() {
+        let ext = infer_image_extension("application/octet-stream", "https://e.com/noext");
+        assert_eq!(ext, None);
     }
 }

@@ -235,6 +235,7 @@ fn main() {
 
     // Build HTTP client
     let client = Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(30))
         .build()
         .expect("Failed to build HTTP client");

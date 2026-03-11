@@ -4,6 +4,7 @@ use headless_chrome::{Browser, LaunchOptions};
 use regex::Regex;
 use reqwest::blocking::Client;
 use scraper::{Html, Selector};
+use serde_json::Value as JsonValue;
 use std::time::Duration;
 use thiserror::Error;
 use url::Url;
@@ -393,8 +394,14 @@ fn extract_twitter_article(html: &str) -> Option<Article> {
     // Fall back to regular tweet extraction
     let tweet_text_sel = Selector::parse("[data-testid=\"tweetText\"]").ok()?;
     if let Some(tweet_el) = document.select(&tweet_text_sel).next() {
-        let text_content = tweet_el.text().collect::<String>();
-        let content_html = format!("<p>{}</p>", tweet_el.inner_html());
+        let text_content = collect_text_with_newlines(&tweet_el);
+        let content_html = if is_twitter_code_fragment(&text_content) {
+            format!("<pre><code>{}</code></pre>", html_escape_basic(text_content.trim()))
+        } else if let Some(list_html) = try_format_numbered_twitter_list(&text_content) {
+            list_html
+        } else {
+            format!("<p>{}</p>", tweet_el.inner_html())
+        };
 
         // Also try to get card links
         let card_sel = Selector::parse("[data-testid=\"card.wrapper\"] a[href]").ok();
@@ -419,8 +426,9 @@ fn extract_twitter_article(html: &str) -> Option<Article> {
             format!("{}\n{}", content_html, links_html)
         };
 
-        let title = text_content.chars().take(80).collect::<String>();
-        let title = if title.len() < text_content.len() {
+        let title_source = text_content.split_whitespace().collect::<Vec<_>>().join(" ");
+        let title = title_source.chars().take(80).collect::<String>();
+        let title = if title.len() < title_source.len() {
             format!("{}...", title.trim())
         } else {
             title.trim().to_string()
@@ -437,9 +445,139 @@ fn extract_twitter_article(html: &str) -> Option<Article> {
     None
 }
 
+/// Collect text from an element while preserving visual line breaks represented by `<br>`.
+fn collect_text_with_newlines(node: &scraper::ElementRef<'_>) -> String {
+    fn walk(node: &scraper::ElementRef<'_>, out: &mut String) {
+        for child in node.children() {
+            match child.value() {
+                scraper::node::Node::Text(text) => out.push_str(text.text.as_ref()),
+                scraper::node::Node::Element(el) => {
+                    if el.name() == "br" {
+                        out.push('\n');
+                        continue;
+                    }
+                    if let Some(child_ref) = scraper::ElementRef::wrap(child) {
+                        walk(&child_ref, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = String::new();
+    walk(node, &mut out);
+    out
+}
+
+/// Heuristic for monospaced "code fragment" tweets (ASCII/box-drawing diagrams, snippets).
+fn is_twitter_code_fragment(text: &str) -> bool {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim_end())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    if lines.len() < 3 {
+        return false;
+    }
+
+    let has_box_drawing = text
+        .chars()
+        .any(|c| matches!(c as u32, 0x2500..=0x257F | 0x2580..=0x259F));
+
+    let pipe_lines = lines.iter().filter(|l| l.contains('|')).count();
+    let dash_lines = lines
+        .iter()
+        .filter(|l| l.contains("---") || l.contains("___") || l.contains("==="))
+        .count();
+
+    has_box_drawing || (pipe_lines >= 2 && dash_lines >= 1)
+}
+
+/// Heuristic for a single Twitter longform block that is likely part of an
+/// ASCII/box-drawing code fragment.
+fn looks_like_twitter_code_line(text: &str) -> bool {
+    let line = text.trim();
+    if line.is_empty() {
+        return false;
+    }
+
+    let has_box_drawing = line
+        .chars()
+        .any(|c| matches!(c as u32, 0x2500..=0x257F | 0x2580..=0x259F));
+    if has_box_drawing {
+        return true;
+    }
+
+    let pipe_count = line.matches('|').count();
+    let has_rule = line.contains("---") || line.contains("___") || line.contains("===");
+    pipe_count >= 2 || has_rule
+}
+
+/// Convert long numbered tweet text into readable HTML list/paragraphs.
+/// This handles X posts that flatten "1. ... 2. ... 3. ..." into one dense block.
+fn try_format_numbered_twitter_list(text: &str) -> Option<String> {
+    let re = Regex::new(r"\b(\d{1,3})\.\s").ok()?;
+    let matches: Vec<_> = re.captures_iter(text).collect();
+    if matches.len() < 4 {
+        return None;
+    }
+
+    // Require list to start at 1 to reduce false positives from versions/dates.
+    let first_num = matches
+        .first()
+        .and_then(|m| m.get(1))
+        .and_then(|m| m.as_str().parse::<u32>().ok())
+        .unwrap_or(0);
+    if first_num != 1 {
+        return None;
+    }
+
+    let first_start = matches.first()?.get(0)?.start();
+    let intro = text[..first_start].trim();
+
+    let mut items = Vec::new();
+    for (idx, m) in matches.iter().enumerate() {
+        let start = m.get(0)?.start();
+        let end = matches
+            .get(idx + 1)
+            .and_then(|next| next.get(0))
+            .map(|next| next.start())
+            .unwrap_or(text.len());
+        let segment = text[start..end].trim();
+        let item = re.replace(segment, "").trim().to_string();
+        if !item.is_empty() {
+            items.push(item);
+        }
+    }
+
+    if items.len() < 4 {
+        return None;
+    }
+
+    let mut html = String::new();
+    if !intro.is_empty() {
+        html.push_str(&format!("<p>{}</p>\n", render_twitter_plain_text(intro)));
+    }
+    html.push_str("<ol>");
+    for item in items {
+        html.push_str(&format!("<li>{}</li>", render_twitter_plain_text(&item)));
+    }
+    html.push_str("</ol>");
+    Some(html)
+}
+
+/// Render plain text to safe HTML while keeping lightweight visual separators.
+fn render_twitter_plain_text(text: &str) -> String {
+    let normalized = text.replace(" > ", "\n");
+    html_escape_basic(&normalized).replace('\n', "<br/>")
+}
+
 /// Converts a Twitter Article's DraftJS DOM content into clean HTML.
 fn convert_twitter_article_html(content_el: scraper::ElementRef) -> String {
     let mut html_parts: Vec<String> = Vec::new();
+    let mut pending_code_lines: Vec<String> = Vec::new();
 
     // Process each block in data-contents
     let block_sel = Selector::parse("[data-block=\"true\"]").unwrap();
@@ -449,6 +587,27 @@ fn convert_twitter_article_html(content_el: scraper::ElementRef) -> String {
     for block in content_el.select(&block_sel) {
         let classes: Vec<&str> = block.value().classes().collect();
         let class_str = classes.join(" ");
+        let plain_block_text = collect_text_with_newlines(&block);
+
+        if looks_like_twitter_code_line(&plain_block_text) {
+            pending_code_lines.push(plain_block_text);
+            continue;
+        }
+
+        if !pending_code_lines.is_empty() {
+            let code_text = pending_code_lines
+                .iter()
+                .map(|l| l.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !code_text.trim().is_empty() {
+                html_parts.push(format!(
+                    "<pre><code>{}</code></pre>",
+                    html_escape_basic(code_text.trim())
+                ));
+            }
+            pending_code_lines.clear();
+        }
 
         if class_str.contains("longform-header-two") {
             let text = collect_block_html(&block, &link_sel);
@@ -505,12 +664,30 @@ fn convert_twitter_article_html(content_el: scraper::ElementRef) -> String {
                     }
                 }
             } else {
+                if let Some(list_html) = try_format_numbered_twitter_list(&plain_block_text) {
+                    html_parts.push(list_html);
+                    continue;
+                }
                 // Regular paragraph
                 let text = collect_block_html(&block, &link_sel);
                 if !text.trim().is_empty() {
                     html_parts.push(format!("<p>{}</p>", text));
                 }
             }
+        }
+    }
+
+    if !pending_code_lines.is_empty() {
+        let code_text = pending_code_lines
+            .iter()
+            .map(|l| l.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !code_text.trim().is_empty() {
+            html_parts.push(format!(
+                "<pre><code>{}</code></pre>",
+                html_escape_basic(code_text.trim())
+            ));
         }
     }
 
@@ -776,7 +953,7 @@ fn find_matching_close_tag(html: &str, tag: &str) -> Option<usize> {
     let open_tag = format!("<{}", tag);
     let close_tag = format!("</{}>", tag);
     let mut depth = 0;
-    let mut char_indices: Vec<(usize, char)> = html.char_indices().collect();
+    let char_indices: Vec<(usize, char)> = html.char_indices().collect();
     let mut i = 0;
 
     while i < char_indices.len() {
@@ -1055,6 +1232,57 @@ fn strip_tags(html: &str) -> String {
     tag_re.replace_all(html, "").trim().to_string()
 }
 
+fn count_img_tags(html: &str) -> usize {
+    let img_re = Regex::new(r"(?i)<img\b").unwrap();
+    img_re.find_iter(html).count()
+}
+
+/// Fallback extractor for Squarespace image blocks that Readability may drop.
+/// Returns normalized `<figure><img/></figure>` HTML snippets.
+fn extract_squarespace_image_blocks(html: &str) -> Vec<String> {
+    let document = Html::parse_document(html);
+    let block_sel = Selector::parse("div.sqs-block-image, div.image-block").unwrap();
+    let img_sel = Selector::parse("img").unwrap();
+    let caption_sel = Selector::parse(".image-caption, figcaption").unwrap();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut figures = Vec::new();
+
+    for block in document.select(&block_sel) {
+        let src = block
+            .select(&img_sel)
+            .find_map(|img| {
+                img.value()
+                    .attr("data-src")
+                    .or_else(|| img.value().attr("src"))
+                    .map(|s| s.to_string())
+            });
+
+        let Some(src) = src else { continue };
+        if src.is_empty() || !seen.insert(src.clone()) {
+            continue;
+        }
+
+        let caption = block
+            .select(&caption_sel)
+            .next()
+            .map(|c| c.text().collect::<String>().trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let fig = match caption {
+            Some(c) => format!(
+                "<figure><img src=\"{}\" alt=\"\"/><figcaption>{}</figcaption></figure>",
+                src,
+                html_escape_basic(&c)
+            ),
+            None => format!("<figure><img src=\"{}\" alt=\"\"/></figure>", src),
+        };
+        figures.push(fig);
+    }
+
+    figures
+}
+
 /// Pre-processes HTML to normalize code blocks for Readability.
 /// Many sites use custom code block structures with line numbers, syntax highlighting,
 /// and non-standard nesting. This converts them to simple <pre><code> format.
@@ -1144,7 +1372,14 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&#39;", "'")
         .replace("&apos;", "'")
         .replace("&#x2F;", "/")
-        .replace("&nbsp;", " ")
+        .replace("&nbsp;", "\u{00A0}")
+        .replace("&mdash;", "\u{2014}")
+        .replace("&ndash;", "\u{2013}")
+        .replace("&rsquo;", "\u{2019}")
+        .replace("&lsquo;", "\u{2018}")
+        .replace("&rdquo;", "\u{201D}")
+        .replace("&ldquo;", "\u{201C}")
+        .replace("&hellip;", "\u{2026}")
 }
 
 /// HTML escaping for code content - decodes first to avoid double-encoding.
@@ -1322,6 +1557,119 @@ fn strip_layout_classes(html: &str) -> String {
     result.to_string()
 }
 
+/// Extracts article content from JSON-LD structured data (schema.org).
+/// Many sites—especially paywalled ones—include the full article text in their
+/// structured data for SEO/Google indexing, even when the rendered HTML is truncated.
+fn extract_jsonld_article(html: &str) -> Option<Article> {
+    let re =
+        Regex::new(r#"(?s)<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>"#).ok()?;
+
+    for caps in re.captures_iter(html) {
+        let json_str = &caps[1];
+        let value: JsonValue = serde_json::from_str(json_str).ok()?;
+
+        // JSON-LD can be a single object or an array of objects
+        let items: Vec<&JsonValue> = match &value {
+            JsonValue::Array(arr) => arr.iter().collect(),
+            obj @ JsonValue::Object(_) => vec![obj],
+            _ => continue,
+        };
+
+        for item in items {
+            let article_type = item.get("@type").and_then(|t| t.as_str()).unwrap_or("");
+            if !matches!(
+                article_type,
+                "Article"
+                    | "NewsArticle"
+                    | "BlogPosting"
+                    | "TechArticle"
+                    | "ScholarlyArticle"
+                    | "Report"
+                    | "AnalysisNewsArticle"
+                    | "OpinionNewsArticle"
+                    | "ReviewNewsArticle"
+            ) {
+                continue;
+            }
+
+            let body = item
+                .get("articleBody")
+                .and_then(|b| b.as_str())
+                .unwrap_or("");
+            if body.len() < 500 {
+                continue;
+            }
+
+            let title = decode_html_entities(
+                item.get("headline")
+                    .and_then(|h| h.as_str())
+                    .unwrap_or("Untitled"),
+            );
+
+            let author = jsonld_author(item);
+            let content_html = plain_text_to_html(body);
+
+            log::info!(
+                "Extracted article from JSON-LD: {} ({} chars)",
+                title,
+                body.len()
+            );
+            return Some(Article {
+                title,
+                author,
+                content_html,
+            });
+        }
+    }
+
+    None
+}
+
+/// Extracts author name(s) from a JSON-LD item.
+fn jsonld_author(item: &JsonValue) -> String {
+    match item.get("author") {
+        Some(JsonValue::String(s)) => s.clone(),
+        Some(JsonValue::Object(obj)) => obj
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("Unknown")
+            .to_string(),
+        Some(JsonValue::Array(arr)) => {
+            let names: Vec<&str> = arr
+                .iter()
+                .filter_map(|a| a.get("name").and_then(|n| n.as_str()))
+                .collect();
+            if names.is_empty() {
+                "Unknown".to_string()
+            } else {
+                names.join(", ")
+            }
+        }
+        _ => "Unknown".to_string(),
+    }
+}
+
+/// Converts plain text to HTML paragraphs.
+/// Splits on double newlines if present, otherwise on single newlines,
+/// otherwise wraps the entire text in a single `<p>` tag.
+fn plain_text_to_html(text: &str) -> String {
+    let paragraphs: Vec<&str> = if text.contains("\n\n") {
+        text.split("\n\n").collect()
+    } else if text.contains('\n') {
+        text.split('\n').collect()
+    } else {
+        vec![text]
+    };
+
+    paragraphs
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("<p>{}</p>", p))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Extracts article content from HTML using dom_smoothie (Mozilla Readability port).
 pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
     // Try Twitter/X-specific extraction for rendered tweet pages
@@ -1366,9 +1714,45 @@ pub fn extract_article(html: &str, url: &str) -> Result<Article, ScraperError> {
         .parse()
         .map_err(|e| ScraperError::DomError(e.to_string()))?;
 
-    let content = article.content.to_string();
+    let mut content = article.content.to_string();
+    let readability_text_len = strip_tags(&content).len();
+
+    // If Readability extracted very little, check JSON-LD for fuller content.
+    // Many paywalled sites include the full article in schema.org structured data.
+    if let Some(jsonld) = extract_jsonld_article(html) {
+        let jsonld_text_len = strip_tags(&jsonld.content_html).len();
+        if jsonld_text_len > readability_text_len * 2 && jsonld_text_len > 500 {
+            log::info!(
+                "JSON-LD has {}x more content than Readability ({} vs {} chars), using JSON-LD",
+                jsonld_text_len / readability_text_len.max(1),
+                jsonld_text_len,
+                readability_text_len
+            );
+            return Ok(jsonld);
+        }
+    }
+
     if content.is_empty() {
+        // Last resort: try JSON-LD even without the ratio check
+        if let Some(jsonld) = extract_jsonld_article(html) {
+            return Ok(jsonld);
+        }
         return Err(ScraperError::ExtractionFailed);
+    }
+
+    // Readability may drop Squarespace image blocks entirely.
+    // If no images survived but source contains recognizable Squarespace image blocks,
+    // append recovered figures so downstream image normalization can capture them.
+    if count_img_tags(&content) == 0 {
+        let recovered_figures = extract_squarespace_image_blocks(html);
+        if !recovered_figures.is_empty() {
+            log::info!(
+                "Recovered {} Squarespace image block(s) after Readability",
+                recovered_figures.len()
+            );
+            content.push('\n');
+            content.push_str(&recovered_figures.join("\n"));
+        }
     }
 
     // title is a String, check if empty
@@ -1421,5 +1805,84 @@ pub fn fetch_and_extract(client: &Client, url: &str) -> Result<Article, ScraperE
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_box_drawing_tweet_as_code_fragment() {
+        let sample = "The stack\n\n┌─────────────┐\n│ Your Agent. │\n└─────────────┘\n";
+        assert!(is_twitter_code_fragment(sample));
+    }
+
+    #[test]
+    fn detects_ascii_diagram_tweet_as_code_fragment() {
+        let sample = "The stack\n\n| layer | info |\n| ----- | ---- |\n| core  | loop |\n";
+        assert!(is_twitter_code_fragment(sample));
+    }
+
+    #[test]
+    fn does_not_mark_regular_tweet_as_code_fragment() {
+        let sample = "I shipped a new release today.\nIt has better startup time.\nThanks for testing!";
+        assert!(!is_twitter_code_fragment(sample));
+    }
+
+    #[test]
+    fn preserves_br_as_newlines_when_collecting_tweet_text() {
+        let fragment = Html::parse_fragment(
+            r#"<div data-testid="tweetText"><span>Hello</span><br/><span>world</span></div>"#,
+        );
+        let sel = Selector::parse(r#"[data-testid="tweetText"]"#).unwrap();
+        let el = fragment.select(&sel).next().unwrap();
+        let text = collect_text_with_newlines(&el);
+        assert_eq!(text, "Hello\nworld");
+    }
+
+    #[test]
+    fn detects_code_like_single_line_blocks() {
+        assert!(looks_like_twitter_code_line("│ box │ content │"));
+        assert!(looks_like_twitter_code_line("| col | value |"));
+        assert!(!looks_like_twitter_code_line("This is a normal prose sentence."));
+    }
+
+    #[test]
+    fn converts_longform_code_fragment_blocks_to_pre_code() {
+        let fragment = Html::parse_fragment(
+            r#"
+            <div data-testid="twitterArticleRichTextView">
+              <div data-block="true"><span>The stack</span></div>
+              <div data-block="true"><span>┌─────────────┐</span></div>
+              <div data-block="true"><span>│ Your Agent. │</span></div>
+              <div data-block="true"><span>└─────────────┘</span></div>
+              <div data-block="true"><span>Each layer adds capability.</span></div>
+            </div>
+            "#,
+        );
+        let sel = Selector::parse(r#"[data-testid="twitterArticleRichTextView"]"#).unwrap();
+        let content_el = fragment.select(&sel).next().unwrap();
+        let html = convert_twitter_article_html(content_el);
+
+        assert!(html.contains("<pre><code>"));
+        assert!(html.contains("Your Agent."));
+        assert!(html.contains("Each layer adds capability."));
+    }
+
+    #[test]
+    fn formats_flattened_numbered_tweet_as_ordered_list() {
+        let text = "Intro text. 1. First item > detail. 2. Second item > detail. 3. Third item > detail. 4. Fourth item.";
+        let html = try_format_numbered_twitter_list(text).expect("expected formatted list");
+        assert!(html.contains("<ol>"));
+        assert!(html.contains("<li>First item"));
+        assert!(html.contains("<br/>detail."));
+        assert!(html.contains("<p>Intro text.</p>"));
+    }
+
+    #[test]
+    fn does_not_format_non_list_text_as_numbered_list() {
+        let text = "Version 1.2.3 was released on 2026-02-20 with a few fixes.";
+        assert!(try_format_numbered_twitter_list(text).is_none());
     }
 }
